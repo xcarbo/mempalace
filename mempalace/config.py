@@ -16,7 +16,12 @@ from pathlib import Path
 # in file paths, SQLite, or ChromaDB metadata.
 
 MAX_NAME_LENGTH = 128
-_SAFE_NAME_RE = re.compile(r"^(?:[^\W_]|[^\W_][\w .'-]{0,126}[^\W_])$")
+# Allow leading dash/underscore for auto-mined transcript wings whose names
+# derive from filesystem paths (e.g. "-Volumes-codeXD-vlad-ozweb"). Trailing
+# character must still be alphanumeric to prevent "wing." / "wing-" artifacts.
+# Local patch — re-apply on `pip install --upgrade mempalace`. See drawer
+# wing=mempalace room=patches for context.
+_SAFE_NAME_RE = re.compile(r"^(?:[^\W_]|[\w-][\w .'-]{0,126}[^\W_])$")
 
 
 def sanitize_name(value: str, field_name: str = "name") -> str:
@@ -30,7 +35,9 @@ def sanitize_name(value: str, field_name: str = "name") -> str:
     value = value.strip()
 
     if len(value) > MAX_NAME_LENGTH:
-        raise ValueError(f"{field_name} exceeds maximum length of {MAX_NAME_LENGTH} characters")
+        raise ValueError(
+            f"{field_name} exceeds maximum length of {MAX_NAME_LENGTH} characters"
+        )
 
     # Block path traversal
     if ".." in value or "/" in value or "\\" in value:
@@ -63,7 +70,9 @@ def sanitize_kg_value(value: str, field_name: str = "value") -> str:
     value = value.strip()
 
     if len(value) > MAX_NAME_LENGTH:
-        raise ValueError(f"{field_name} exceeds maximum length of {MAX_NAME_LENGTH} characters")
+        raise ValueError(
+            f"{field_name} exceeds maximum length of {MAX_NAME_LENGTH} characters"
+        )
 
     if "\x00" in value:
         raise ValueError(f"{field_name} contains null bytes")
@@ -131,8 +140,26 @@ DEFAULT_HALL_KEYWORDS = {
         "server",
     ],
     "identity": ["identity", "name", "who am i", "persona", "self"],
-    "family": ["family", "kids", "children", "daughter", "son", "parent", "mother", "father"],
-    "creative": ["game", "gameplay", "player", "app", "design", "art", "music", "story"],
+    "family": [
+        "family",
+        "kids",
+        "children",
+        "daughter",
+        "son",
+        "parent",
+        "mother",
+        "father",
+    ],
+    "creative": [
+        "game",
+        "gameplay",
+        "player",
+        "app",
+        "design",
+        "art",
+        "music",
+        "story",
+    ],
 }
 
 
@@ -166,7 +193,9 @@ class MempalaceConfig:
     @property
     def palace_path(self):
         """Path to the memory palace data directory."""
-        env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
+        env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get(
+            "MEMPAL_PALACE_PATH"
+        )
         if env_val:
             # Normalize: expand ~ and collapse .. to match the CLI --palace
             # code path (mcp_server.py:62) and prevent surprise redirection
