@@ -98,7 +98,9 @@ _config = MempalaceConfig()
 # Only override KG path when --palace is explicitly provided; otherwise use
 # KnowledgeGraph's default (~/.mempalace/knowledge_graph.sqlite3).
 if _args.palace:
-    _kg = KnowledgeGraph(db_path=os.path.join(_config.palace_path, "knowledge_graph.sqlite3"))
+    _kg = KnowledgeGraph(
+        db_path=os.path.join(_config.palace_path, "knowledge_graph.sqlite3")
+    )
 else:
     _kg = KnowledgeGraph()
 
@@ -132,7 +134,15 @@ except (OSError, NotImplementedError):
 
 # Keys whose values should be redacted in WAL entries to avoid logging sensitive content
 _WAL_REDACT_KEYS = frozenset(
-    {"content", "content_preview", "document", "entry", "entry_preview", "query", "text"}
+    {
+        "content",
+        "content_preview",
+        "document",
+        "entry",
+        "entry_preview",
+        "query",
+        "text",
+    }
 )
 
 
@@ -142,7 +152,9 @@ def _wal_log(operation: str, params: dict, result: dict = None):
     safe_params = {}
     for k, v in params.items():
         if k in _WAL_REDACT_KEYS:
-            safe_params[k] = f"[REDACTED {len(v)} chars]" if isinstance(v, str) else "[REDACTED]"
+            safe_params[k] = (
+                f"[REDACTED {len(v)} chars]" if isinstance(v, str) else "[REDACTED]"
+            )
         else:
             safe_params[k] = v
     entry = {
@@ -199,7 +211,9 @@ def _get_client():
         # Fall through to normal reconnect which will handle missing DB
 
     inode_changed = current_inode != 0 and current_inode != _palace_db_inode
-    mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
+    mtime_changed = (
+        current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
+    )
 
     if _client_cache is None or inode_changed or mtime_changed:
         _client_cache = ChromaBackend.make_client(_config.palace_path)
@@ -225,7 +239,9 @@ def _get_collection(create=False):
             _metadata_cache = None
             _metadata_cache_time = 0
         elif _collection_cache is None:
-            _collection_cache = ChromaCollection(client.get_collection(_config.collection_name))
+            _collection_cache = ChromaCollection(
+                client.get_collection(_config.collection_name)
+            )
             _metadata_cache = None
             _metadata_cache_time = 0
         return _collection_cache
@@ -618,9 +634,7 @@ def tool_add_drawer(
     if not col:
         return _no_palace()
 
-    drawer_id = (
-        f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]}"
-    )
+    drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]}"
 
     _wal_log(
         "add_drawer",
@@ -675,8 +689,12 @@ def tool_delete_drawer(drawer_id: str):
         return {"success": False, "error": f"Drawer not found: {drawer_id}"}
 
     # Log the deletion with the content being removed for audit trail
-    deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
-    deleted_meta = existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
+    deleted_content = (
+        existing.get("documents", [""])[0] if existing.get("documents") else ""
+    )
+    deleted_meta = (
+        existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
+    )
     _wal_log(
         "delete_drawer",
         {
@@ -717,7 +735,9 @@ def tool_get_drawer(drawer_id: str):
         return {"error": str(e)}
 
 
-def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offset: int = 0):
+def tool_list_drawers(
+    wing: str = None, room: str = None, limit: int = 20, offset: int = 0
+):
     """List drawers with pagination. Optional wing/room filter."""
     limit = max(1, min(limit, _MAX_RESULTS))
     offset = max(0, offset)
@@ -741,7 +761,11 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
         elif len(conditions) > 1:
             where = {"$and": conditions}
 
-        kwargs = {"include": ["documents", "metadatas"], "limit": limit, "offset": offset}
+        kwargs = {
+            "include": ["documents", "metadatas"],
+            "limit": limit,
+            "offset": offset,
+        }
         if where:
             kwargs["where"] = where
         result = col.get(**kwargs)
@@ -768,7 +792,9 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
         return {"error": str(e)}
 
 
-def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, room: str = None):
+def tool_update_drawer(
+    drawer_id: str, content: str = None, wing: str = None, room: str = None
+):
     """Update an existing drawer's content and/or metadata."""
     global _metadata_cache
 
@@ -853,7 +879,11 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
 
 
 def tool_kg_add(
-    subject: str, predicate: str, object: str, valid_from: str = None, source_closet: str = None
+    subject: str,
+    predicate: str,
+    object: str,
+    valid_from: str = None,
+    source_closet: str = None,
 ):
     """Add a relationship to the knowledge graph."""
     try:
@@ -876,7 +906,11 @@ def tool_kg_add(
     triple_id = _kg.add_triple(
         subject, predicate, object, valid_from=valid_from, source_closet=source_closet
     )
-    return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
+    return {
+        "success": True,
+        "triple_id": triple_id,
+        "fact": f"{subject} → {predicate} → {object}",
+    }
 
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
@@ -918,13 +952,25 @@ def tool_kg_stats():
 # ==================== AGENT DIARY ====================
 
 
-def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: str = ""):
+def tool_diary_write(
+    agent_name: str, entry: str, topic: str = "general", wing: str = "", room: str = ""
+):
     """
     Write a diary entry for this agent. Entries are timestamped and
     accumulate over time in a diary room.
 
     This is the agent's personal journal — observations, thoughts,
     what it worked on, what it noticed, what it thinks matters.
+
+    Local patch (2026-04-27):
+    - Added `room` parameter (default 'diary' for backward compat). The
+      auto-save Stop hook passes room='checkpoints' to file project
+      checkpoints alongside curated content instead of mixing them with
+      agent journals.
+    - Defensive `wing_` prefix-strip on the default agent_name → wing
+      derivation. Prevents the historical double-prefix bug
+      (wing_wing_claude-opus-4-7) when a caller accidentally passes
+      agent_name='wing_<something>'.
     """
     try:
         agent_name = sanitize_name(agent_name, "agent_name")
@@ -935,8 +981,11 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     if wing:
         wing = sanitize_name(wing)
     else:
-        wing = f"wing_{agent_name.lower().replace(' ', '_')}"
-    room = "diary"
+        clean = agent_name.lower().replace(" ", "_")
+        if clean.startswith("wing_"):
+            clean = clean[len("wing_") :]
+        wing = f"wing_{clean}"
+    room = room.strip() or "diary"
     col = _get_collection(create=True)
     if not col:
         return _no_palace()
@@ -1027,7 +1076,11 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
         )
 
         if not results["ids"]:
-            return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
+            return {
+                "agent": agent_name,
+                "entries": [],
+                "message": "No diary entries yet.",
+            }
 
         # Combine and sort by timestamp
         entries = []
@@ -1151,7 +1204,11 @@ def tool_reconnect():
                 "message": "No palace found after reconnect",
                 "drawers": 0,
             }
-        return {"success": True, "message": "Reconnected to palace", "drawers": col.count()}
+        return {
+            "success": True,
+            "message": "Reconnected to palace",
+            "drawers": col.count(),
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1174,7 +1231,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
-                "wing": {"type": "string", "description": "Wing to list rooms for (optional)"},
+                "wing": {
+                    "type": "string",
+                    "description": "Wing to list rooms for (optional)",
+                },
             },
         },
         "handler": tool_list_rooms,
@@ -1216,12 +1276,18 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
-                "subject": {"type": "string", "description": "The entity doing/being something"},
+                "subject": {
+                    "type": "string",
+                    "description": "The entity doing/being something",
+                },
                 "predicate": {
                     "type": "string",
                     "description": "The relationship type (e.g. 'loves', 'works_on', 'daughter_of')",
                 },
-                "object": {"type": "string", "description": "The entity being connected to"},
+                "object": {
+                    "type": "string",
+                    "description": "The entity being connected to",
+                },
                 "valid_from": {
                     "type": "string",
                     "description": "When this became true (YYYY-MM-DD, optional)",
@@ -1310,10 +1376,19 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "source_wing": {"type": "string", "description": "Wing of the source"},
-                "source_room": {"type": "string", "description": "Room in the source wing"},
+                "source_room": {
+                    "type": "string",
+                    "description": "Room in the source wing",
+                },
                 "target_wing": {"type": "string", "description": "Wing of the target"},
-                "target_room": {"type": "string", "description": "Room in the target wing"},
-                "label": {"type": "string", "description": "Description of the connection"},
+                "target_room": {
+                    "type": "string",
+                    "description": "Room in the target wing",
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Description of the connection",
+                },
                 "source_drawer_id": {
                     "type": "string",
                     "description": "Optional specific drawer ID",
@@ -1357,7 +1432,10 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "wing": {"type": "string", "description": "Wing to start from"},
-                "room": {"type": "string", "description": "Room to follow tunnels from"},
+                "room": {
+                    "type": "string",
+                    "description": "Room to follow tunnels from",
+                },
             },
             "required": ["wing", "room"],
         },
@@ -1423,8 +1501,14 @@ TOOLS = {
                     "type": "string",
                     "description": "Verbatim content to store — exact words, never summarized",
                 },
-                "source_file": {"type": "string", "description": "Where this came from (optional)"},
-                "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
+                "source_file": {
+                    "type": "string",
+                    "description": "Where this came from (optional)",
+                },
+                "added_by": {
+                    "type": "string",
+                    "description": "Who is filing this (default: mcp)",
+                },
             },
             "required": ["wing", "room", "content"],
         },
@@ -1435,7 +1519,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
-                "drawer_id": {"type": "string", "description": "ID of the drawer to delete"},
+                "drawer_id": {
+                    "type": "string",
+                    "description": "ID of the drawer to delete",
+                },
             },
             "required": ["drawer_id"],
         },
@@ -1446,7 +1533,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
-                "drawer_id": {"type": "string", "description": "ID of the drawer to fetch"},
+                "drawer_id": {
+                    "type": "string",
+                    "description": "ID of the drawer to fetch",
+                },
             },
             "required": ["drawer_id"],
         },
@@ -1479,7 +1569,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
-                "drawer_id": {"type": "string", "description": "ID of the drawer to update"},
+                "drawer_id": {
+                    "type": "string",
+                    "description": "ID of the drawer to update",
+                },
                 "content": {
                     "type": "string",
                     "description": "New content (optional — omit to keep existing)",
@@ -1625,7 +1718,11 @@ def handle_request(request):
             "id": req_id,
             "result": {
                 "tools": [
-                    {"name": n, "description": t["description"], "inputSchema": t["input_schema"]}
+                    {
+                        "name": n,
+                        "description": t["description"],
+                        "inputSchema": t["input_schema"],
+                    }
                     for n, t in TOOLS.items()
                 ]
             },
@@ -1671,7 +1768,10 @@ def handle_request(request):
                 return {
                     "jsonrpc": "2.0",
                     "id": req_id,
-                    "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
+                    "error": {
+                        "code": -32602,
+                        "message": f"Invalid value for parameter '{key}'",
+                    },
                 }
         try:
             tool_args.pop("wait_for_previous", None)
@@ -1679,7 +1779,9 @@ def handle_request(request):
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "result": {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]},
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(result, indent=2)}]
+                },
             }
         except Exception:
             logger.exception(f"Tool error in {tool_name}")

@@ -117,7 +117,9 @@ def _count_human_messages(transcript_path: str) -> int:
                                 continue
                         elif isinstance(content, list):
                             text = " ".join(
-                                b.get("text", "") for b in content if isinstance(b, dict)
+                                b.get("text", "")
+                                for b in content
+                                if isinstance(b, dict)
                             )
                             if "<command-message>" in text:
                                 continue
@@ -126,9 +128,15 @@ def _count_human_messages(transcript_path: str) -> int:
                     # {"type": "event_msg", "payload": {"type": "user_message", "message": "..."}}
                     elif entry.get("type") == "event_msg":
                         payload = entry.get("payload", {})
-                        if isinstance(payload, dict) and payload.get("type") == "user_message":
+                        if (
+                            isinstance(payload, dict)
+                            and payload.get("type") == "user_message"
+                        ):
                             msg_text = payload.get("message", "")
-                            if isinstance(msg_text, str) and "<command-message>" not in msg_text:
+                            if (
+                                isinstance(msg_text, str)
+                                and "<command-message>" not in msg_text
+                            ):
                                 count += 1
                 except (json.JSONDecodeError, AttributeError):
                     pass
@@ -263,6 +271,27 @@ def _spawn_mine(cmd: list) -> None:
     _MINE_PID_FILE.write_text(str(proc.pid))
 
 
+def _mine_mode_args(mine_dir: str) -> list:
+    """Return CLI args to pick the right mining mode for a given directory.
+
+    Local patch (2026-04-27) — fix for raw-JSONL bloat. Hooks fire on Claude
+    Code session events so mine_dir is normally a `~/.claude/projects/<slug>/`
+    transcript dir. Without `--mode convos` the project miner reads JSONL files
+    raw and chunks them at 800 chars, producing tens of thousands of useless
+    drawers per session. Detect transcript dirs and route them to convo_miner.
+    See drawer wing=mempalace room=patches for context.
+    """
+    try:
+        from .convo_scanner import is_claude_projects_root
+    except Exception:
+        is_claude_projects_root = None  # type: ignore
+    p = Path(mine_dir)
+    looks_like_cc_transcripts = "/.claude/projects/" in mine_dir or (
+        is_claude_projects_root is not None and is_claude_projects_root(p.parent)
+    )
+    return ["--mode", "convos"] if looks_like_cc_transcripts else []
+
+
 def _maybe_auto_ingest(transcript_path: str = ""):
     """Run mempalace mine in background if a mine directory is available."""
     mine_dir = _get_mine_dir(transcript_path)
@@ -272,7 +301,10 @@ def _maybe_auto_ingest(transcript_path: str = ""):
         _log("Skipping auto-ingest: mine already running")
         return
     try:
-        _spawn_mine([sys.executable, "-m", "mempalace", "mine", mine_dir])
+        _spawn_mine(
+            [sys.executable, "-m", "mempalace", "mine", mine_dir]
+            + _mine_mode_args(mine_dir)
+        )
     except OSError:
         pass
 
@@ -287,7 +319,8 @@ def _mine_sync(transcript_path: str = ""):
         log_path = STATE_DIR / "hook.log"
         with open(log_path, "a") as log_f:
             subprocess.run(
-                [sys.executable, "-m", "mempalace", "mine", mine_dir],
+                [sys.executable, "-m", "mempalace", "mine", mine_dir]
+                + _mine_mode_args(mine_dir),
                 stdout=log_f,
                 stderr=log_f,
                 timeout=60,
@@ -308,7 +341,9 @@ def _desktop_toast(body: str, title: str = "MemPalace"):
         pass
 
 
-def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUNT) -> list[str]:
+def _extract_recent_messages(
+    transcript_path: str, count: int = _RECENT_MSG_COUNT
+) -> list[str]:
     """Extract the last N user messages from a JSONL transcript."""
     path = Path(transcript_path).expanduser()
     if not path.is_file():
@@ -325,17 +360,25 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
                         content = msg.get("content", "")
                         if isinstance(content, list):
                             content = " ".join(
-                                b.get("text", "") for b in content if isinstance(b, dict)
+                                b.get("text", "")
+                                for b in content
+                                if isinstance(b, dict)
                             )
                         if not isinstance(content, str) or not content.strip():
                             continue
-                        if "<command-message>" in content or "<system-reminder>" in content:
+                        if (
+                            "<command-message>" in content
+                            or "<system-reminder>" in content
+                        ):
                             continue
                         messages.append(content.strip()[:200])
                     # Codex CLI format
                     elif entry.get("type") == "event_msg":
                         payload = entry.get("payload", {})
-                        if isinstance(payload, dict) and payload.get("type") == "user_message":
+                        if (
+                            isinstance(payload, dict)
+                            and payload.get("type") == "user_message"
+                        ):
                             text = payload.get("message", "")
                             if isinstance(text, str) and text.strip():
                                 if "<command-message>" not in text:
@@ -408,11 +451,15 @@ def _save_diary_direct(
     try:
         from .mcp_server import tool_diary_write
 
+        # Local patch (2026-04-27): file checkpoints in room='checkpoints'
+        # alongside curated content in the project wing, instead of
+        # room='diary' which mixed agent journals with project state.
         result = tool_diary_write(
             agent_name="session-hook",
             entry=entry,
             topic="checkpoint",
             wing=wing,
+            room="checkpoints",
         )
         if result.get("success"):
             _log(f"Diary checkpoint saved: {result.get('entry_id', '?')}")
@@ -426,7 +473,9 @@ def _save_diary_direct(
             except OSError:
                 pass
             if toast:
-                _desktop_toast(f"Checkpoint saved \u2014 {len(messages)} messages archived")
+                _desktop_toast(
+                    f"Checkpoint saved \u2014 {len(messages)} messages archived"
+                )
             return {"count": len(messages), "themes": themes}
         else:
             _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")
@@ -448,6 +497,11 @@ def _ingest_transcript(transcript_path: str):
     except Exception:
         return
 
+    # Local patch (2026-04-28): derive canonical project wing from the
+    # transcript's cwd, instead of dumping everything into "sessions".
+    # See drawer wing=mempalace room=patches for context.
+    derived_wing = _wing_from_transcript_path(transcript_path)
+
     try:
         log_path = STATE_DIR / "hook.log"
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -462,12 +516,12 @@ def _ingest_transcript(transcript_path: str):
                     "--mode",
                     "convos",
                     "--wing",
-                    "sessions",
+                    derived_wing,
                 ],
                 stdout=log_f,
                 stderr=log_f,
             )
-        _log(f"Transcript ingest started: {path.name}")
+        _log(f"Transcript ingest started: {path.name} → wing={derived_wing}")
     except OSError:
         pass
 
@@ -487,37 +541,83 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
     }
 
 
-def _wing_from_transcript_path(transcript_path: str) -> str:
-    """Derive a project wing name from a Claude Code transcript path.
+# Local patch (2026-04-27): canonical wing names match user filesystem layout.
+# Code roots that get stripped before joining path with '-'. Order matters —
+# longer prefixes first to avoid partial matches.
+_CODE_ROOTS = (
+    "/Volumes/codeXD/",
+    "/Volumes/codeXD2/",
+    "/Users/xdev/code/",
+    "/Users/xdev/code2/",
+    "/Users/Chris/code/",
+    "/Users/Chris/code2/",
+)
 
-    Claude Code encodes the project's source directory by replacing path
-    separators with dashes, producing folders like:
-        ~/.claude/projects/-home-<user>-Projects-<project>/session.jsonl
-        ~/.claude/projects/-home-<user>-dev-<parent>-<project>/session.jsonl
-        ~/.claude/projects/-Users-<user>-<folder>-<project>/session.jsonl
 
-    The project directory name is the final dash-separated token of the
-    encoded folder. Returns ``wing_<project>`` (lowercased, spaces → ``_``).
-    Falls back to ``wing_sessions`` if the path does not match a Claude Code
-    project-folder layout.
+def _cwd_to_canonical_wing(cwd: str) -> str | None:
+    """Convert a project cwd into the user's canonical wing name.
+
+    Examples:
+        /Volumes/codeXD/vlad/yogo-biz  → vlad-yogo-biz
+        /Volumes/codeXD/cc             → cc
+        /Users/xdev/code/kaimeta/gold  → kaimeta-gold
+
+    Returns None if cwd is outside known code roots.
     """
-    # Normalize path separators for cross-platform (Windows backslashes)
-    normalized = transcript_path.replace("\\", "/")
-    # Primary: pull the encoded project folder out of ``.claude/projects/``
-    # and take its last dash-separated token.
-    match = re.search(r"/\.claude/projects/-([^/]+)", normalized)
-    if match:
-        encoded = match.group(1)
-        project = encoded.rsplit("-", 1)[-1]
-        if project:
-            return f"wing_{project.lower().replace(' ', '_')}"
-    # Legacy fallback: explicit ``-Projects-<name>`` segment, useful for
-    # transcripts not under the standard Claude Code projects dir.
-    match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
-    if match:
-        project = match.group(1).lower().replace(" ", "_")
-        return f"wing_{project}"
-    return "wing_sessions"
+    if not cwd:
+        return None
+    norm = cwd.rstrip("/")
+    for root in _CODE_ROOTS:
+        prefix = root.rstrip("/")
+        if norm == prefix:
+            return None  # working at code root itself, no project
+        if norm.startswith(prefix + "/"):
+            tail = norm[len(prefix) + 1 :]
+            return tail.replace("/", "-")
+    return None
+
+
+def _wing_from_transcript_path(transcript_path: str) -> str:
+    """Derive the canonical project wing for a Claude Code transcript.
+
+    Local patch (2026-04-27) — replaces the old leaf-token approach which
+    stripped path context (`/Volumes/codeXD/vlad/yogo-biz` → `wing_biz`) and
+    added a `wing_` prefix that prevented checkpoints from landing in the
+    same wing as curated content. New behavior:
+
+    1. Read the first JSONL record's `cwd` field for the true project path.
+    2. Strip a configured code root prefix (see `_CODE_ROOTS`).
+    3. Join remaining path components with `-` to produce the canonical wing.
+    4. NO `wing_` prefix — checkpoints land alongside curated drawers.
+
+    Falls back to `sessions` if cwd is unreadable or outside a known code
+    root. See drawer wing=mempalace room=patches for context.
+    """
+    # Try cwd-based derivation (the right way).
+    try:
+        path = Path(transcript_path).expanduser()
+        if path.is_file():
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for _ in range(20):  # scan first ~20 lines for a cwd field
+                    line = f.readline()
+                    if not line:
+                        break
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    cwd = rec.get("cwd") if isinstance(rec, dict) else None
+                    if cwd:
+                        wing = _cwd_to_canonical_wing(cwd)
+                        if wing:
+                            return wing
+                        break  # cwd found but outside code roots — stop scanning
+    except (OSError, ValueError):
+        pass
+
+    # Last-resort fallback: bucket into a single sessions wing rather than
+    # creating ad-hoc wing_<leaf> wings that pollute the namespace.
+    return "sessions"
 
 
 def hook_stop(data: dict, harness: str):
@@ -546,7 +646,9 @@ def hook_stop(data: dict, harness: str):
             try:
                 silent_guard = MempalaceConfig().hook_silent_save
             except AttributeError as exc:
-                _log(f"WARNING: could not read hook_silent_save: {exc}; defaulting to silent mode")
+                _log(
+                    f"WARNING: could not read hook_silent_save: {exc}; defaulting to silent mode"
+                )
         if not silent_guard:
             _output({})
             return
@@ -566,7 +668,9 @@ def hook_stop(data: dict, harness: str):
 
     since_last = exchange_count - last_save
 
-    _log(f"Session {session_id}: {exchange_count} exchanges, {since_last} since last save")
+    _log(
+        f"Session {session_id}: {exchange_count} exchanges, {since_last} since last save"
+    )
 
     if since_last >= SAVE_INTERVAL and exchange_count > 0:
         _log(f"TRIGGERING SAVE at exchange {exchange_count}")

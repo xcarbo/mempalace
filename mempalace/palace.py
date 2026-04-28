@@ -35,6 +35,11 @@ SKIP_DIRS = {
     ".eggs",
     "htmlcov",
     "target",
+    # Local patch (2026-04-28): CC project subdirectories that contain
+    # tool-output snapshots (URLs, search results, command output). They
+    # have no conversation structure and produce raw 800-char chunks.
+    # See drawer wing=mempalace room=patches.
+    "tool-results",
 }
 
 _DEFAULT_BACKEND = ChromaBackend()
@@ -65,11 +70,15 @@ def get_collection(
 
 def get_closets_collection(palace_path: str, create: bool = True):
     """Get the closets collection — the searchable index layer."""
-    return get_collection(palace_path, collection_name="mempalace_closets", create=create)
+    return get_collection(
+        palace_path, collection_name="mempalace_closets", create=create
+    )
 
 
 CLOSET_CHAR_LIMIT = 1500  # fill closet until ~1500 chars, then start a new one
-CLOSET_EXTRACT_WINDOW = 5000  # how many chars of source content to scan for entities/topics
+CLOSET_EXTRACT_WINDOW = (
+    5000  # how many chars of source content to scan for entities/topics
+)
 
 # Common capitalized words that look like proper nouns but are usually
 # sentence-starters or filler. Filtered out of entity extraction.
