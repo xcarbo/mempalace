@@ -57,7 +57,15 @@ from .config import (  # noqa: E402
     sanitize_content,
 )
 from .version import __version__  # noqa: E402
-from .backends.chroma import ChromaBackend, ChromaCollection  # noqa: E402
+from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
+
+from .backends.chroma import (  # noqa: E402
+    ChromaBackend,
+    ChromaCollection,
+    _HNSW_BLOAT_GUARD,
+    _pin_hnsw_threads,
+    hnsw_capacity_status,
+)
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import search_memories  # noqa: E402
 from .palace_graph import (  # noqa: E402
@@ -98,9 +106,7 @@ _config = MempalaceConfig()
 # Only override KG path when --palace is explicitly provided; otherwise use
 # KnowledgeGraph's default (~/.mempalace/knowledge_graph.sqlite3).
 if _args.palace:
-    _kg = KnowledgeGraph(
-        db_path=os.path.join(_config.palace_path, "knowledge_graph.sqlite3")
-    )
+    _kg = KnowledgeGraph(db_path=os.path.join(_config.palace_path, "knowledge_graph.sqlite3"))
 else:
     _kg = KnowledgeGraph()
 
@@ -109,6 +115,55 @@ _client_cache = None
 _collection_cache = None
 _palace_db_inode = 0  # inode of chroma.sqlite3 at cache time
 _palace_db_mtime = 0.0  # mtime of chroma.sqlite3 at cache time
+
+# ── Vector-search disabled flag (#1222) ──────────────────────────────────
+# Set when ``hnsw_capacity_status`` reports a divergence between sqlite
+# and the HNSW segment large enough that chromadb would segfault on
+# segment load. While this is set, vector-shaped tools (``search``,
+# ``check_duplicate``) route to the sqlite-only BM25 fallback in
+# :func:`mempalace.searcher._bm25_only_via_sqlite`. Cleared after a
+# successful repair via :func:`tool_reconnect` (which re-runs the probe).
+_vector_disabled = False
+_vector_disabled_reason = ""
+# Optional[dict] (not ``dict | None``) keeps Python 3.9 import-time
+# parsing happy — PEP 604 unions in annotations only became unconditional
+# at module-eval time in 3.10.
+_vector_capacity_status = None  # type: Optional[dict]
+
+
+def _refresh_vector_disabled_flag() -> None:
+    """Re-run the HNSW capacity probe and update the module-level flag.
+
+    Called from :func:`_get_client` whenever the client cache is rebuilt
+    (first open or palace replacement). Cheap — pure sqlite + pickle
+    read, no chromadb interaction. Never raises: a probe that crashes
+    would defeat the point.
+    """
+    global _vector_disabled, _vector_disabled_reason, _vector_capacity_status
+    try:
+        info = hnsw_capacity_status(_config.palace_path, "mempalace_drawers")
+    except Exception:
+        logger.debug("HNSW capacity probe raised", exc_info=True)
+        return
+    _vector_capacity_status = info
+    if info.get("diverged"):
+        if not _vector_disabled:
+            logger.warning(
+                "HNSW capacity divergence detected (%s) — routing search to "
+                "BM25-only sqlite fallback. Run `mempalace repair` to restore "
+                "vector search.",
+                info.get("message", "unknown"),
+            )
+        _vector_disabled = True
+        _vector_disabled_reason = info.get("message", "")
+    else:
+        if _vector_disabled:
+            logger.info(
+                "HNSW capacity within tolerance (%s) — vector search re-enabled",
+                info.get("message", ""),
+            )
+        _vector_disabled = False
+        _vector_disabled_reason = ""
 
 
 # ==================== WRITE-AHEAD LOG ====================
@@ -134,15 +189,7 @@ except (OSError, NotImplementedError):
 
 # Keys whose values should be redacted in WAL entries to avoid logging sensitive content
 _WAL_REDACT_KEYS = frozenset(
-    {
-        "content",
-        "content_preview",
-        "document",
-        "entry",
-        "entry_preview",
-        "query",
-        "text",
-    }
+    {"content", "content_preview", "document", "entry", "entry_preview", "query", "text"}
 )
 
 
@@ -152,9 +199,7 @@ def _wal_log(operation: str, params: dict, result: dict = None):
     safe_params = {}
     for k, v in params.items():
         if k in _WAL_REDACT_KEYS:
-            safe_params[k] = (
-                f"[REDACTED {len(v)} chars]" if isinstance(v, str) else "[REDACTED]"
-            )
+            safe_params[k] = f"[REDACTED {len(v)} chars]" if isinstance(v, str) else "[REDACTED]"
         else:
             safe_params[k] = v
     entry = {
@@ -211,11 +256,14 @@ def _get_client():
         # Fall through to normal reconnect which will handle missing DB
 
     inode_changed = current_inode != 0 and current_inode != _palace_db_inode
-    mtime_changed = (
-        current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
-    )
+    mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
 
     if _client_cache is None or inode_changed or mtime_changed:
+        # Run the HNSW capacity probe BEFORE chromadb opens the segment —
+        # if the index is severely undersized, segment load can segfault
+        # the whole MCP server (#1222). The probe is pure sqlite +
+        # metadata-pickle read; never touches the HNSW binary files.
+        _refresh_vector_disabled_flag()
         _client_cache = ChromaBackend.make_client(_config.palace_path)
         _collection_cache = None
         _metadata_cache = None
@@ -231,17 +279,37 @@ def _get_collection(create=False):
     try:
         client = _get_client()
         if create:
-            _collection_cache = ChromaCollection(
-                client.get_or_create_collection(
-                    _config.collection_name, metadata={"hnsw:space": "cosine"}
+            # hnsw:num_threads=1 disables ChromaDB's multi-threaded ParallelFor
+            # HNSW insert path, which has a race in repairConnectionsForUpdate /
+            # addPoint (see issues #974, #965). Set via metadata on fresh
+            # collections and re-applied via _pin_hnsw_threads() for legacy
+            # palaces whose collections were created before this fix (the
+            # runtime config does not persist cross-process in chromadb 1.5.x,
+            # so the retrofit runs every time _get_collection opens a cache).
+            #
+            # ChromaDB 1.5.x's Rust binding SIGSEGVs when get_or_create_collection
+            # is called with metadata that differs from what's stored. The split
+            # below skips the metadata-comparison codepath for existing
+            # collections, mirroring the backend-layer fix from #1262.
+            try:
+                raw = client.get_collection(_config.collection_name)
+            except _ChromaNotFoundError:
+                raw = client.create_collection(
+                    _config.collection_name,
+                    metadata={
+                        "hnsw:space": "cosine",
+                        "hnsw:num_threads": 1,
+                        **_HNSW_BLOAT_GUARD,
+                    },
                 )
-            )
+            _pin_hnsw_threads(raw)
+            _collection_cache = ChromaCollection(raw)
             _metadata_cache = None
             _metadata_cache_time = 0
         elif _collection_cache is None:
-            _collection_cache = ChromaCollection(
-                client.get_collection(_config.collection_name)
-            )
+            raw = client.get_collection(_config.collection_name)
+            _pin_hnsw_threads(raw)
+            _collection_cache = ChromaCollection(raw)
             _metadata_cache = None
             _metadata_cache_time = 0
         return _collection_cache
@@ -309,11 +377,91 @@ def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
 # ==================== READ TOOLS ====================
 
 
+def _tool_status_via_sqlite() -> dict:
+    """Pure-sqlite status reader for the #1222 fallback path.
+
+    When the HNSW capacity probe detects divergence, opening the chromadb
+    persistent client can segfault. This reader pulls the same wing/room
+    breakdown directly from ``embedding_metadata`` so the operator still
+    gets a working status response — and crucially the
+    ``vector_disabled`` flag — without us touching the vector segment.
+    """
+    import sqlite3 as _sqlite3
+
+    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return _no_palace()
+
+    wings: dict = {}
+    rooms: dict = {}
+    total = 0
+    try:
+        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                WHERE c.name = 'mempalace_drawers'
+                """
+            ).fetchone()
+            total = int(row[0]) if row and row[0] is not None else 0
+            for key, target in (("wing", wings), ("room", rooms)):
+                for value, count in conn.execute(
+                    """
+                    SELECT em.string_value, COUNT(*)
+                    FROM embedding_metadata em
+                    JOIN embeddings e ON em.id = e.id
+                    JOIN segments s ON e.segment_id = s.id
+                    JOIN collections c ON s.collection = c.id
+                    WHERE c.name = 'mempalace_drawers'
+                      AND em.key = ?
+                      AND em.string_value IS NOT NULL
+                    GROUP BY em.string_value
+                    """,
+                    (key,),
+                ):
+                    target[value] = count
+        finally:
+            conn.close()
+    except _sqlite3.Error:
+        logger.exception("tool_status sqlite fallback read failed")
+
+    result = {
+        "total_drawers": total,
+        "wings": wings,
+        "rooms": rooms,
+        "palace_path": _config.palace_path,
+        "protocol": PALACE_PROTOCOL,
+        "aaak_dialect": AAAK_SPEC,
+        "vector_disabled": True,
+        "vector_disabled_reason": _vector_disabled_reason,
+    }
+    if _vector_capacity_status:
+        result["hnsw_capacity"] = {
+            "sqlite_count": _vector_capacity_status.get("sqlite_count"),
+            "hnsw_count": _vector_capacity_status.get("hnsw_count"),
+            "divergence": _vector_capacity_status.get("divergence"),
+        }
+    return result
+
+
 def tool_status():
+    # Run the safe sqlite/pickle probe before we touch chromadb. In the
+    # #1222 failure mode, opening the persistent client to call .count()
+    # can segfault — short-circuit to a pure-sqlite path when divergence
+    # is detected so status stays reachable.
+    db_exists = os.path.isfile(os.path.join(_config.palace_path, "chroma.sqlite3"))
+    _refresh_vector_disabled_flag()
+
+    if _vector_disabled:
+        return _tool_status_via_sqlite()
+
     # Use create=True only when a palace DB already exists on disk -- this
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
     # accidentally creating a palace in a non-existent directory (#830).
-    db_exists = os.path.isfile(os.path.join(_config.palace_path, "chroma.sqlite3"))
     col = _get_collection(create=db_exists)
     if not col:
         return _no_palace()
@@ -462,6 +610,11 @@ def tool_search(
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
+    # Ensure the vector-disabled probe has been run via the safe
+    # sqlite/pickle path before we touch chromadb. Calling _get_client()
+    # here would defeat the fallback — it constructs a PersistentClient
+    # which can segfault on segment load in the #1222 failure mode.
+    _refresh_vector_disabled_flag()
     result = search_memories(
         sanitized["clean_query"],
         palace_path=_config.palace_path,
@@ -469,7 +622,11 @@ def tool_search(
         room=room,
         n_results=limit,
         max_distance=dist,
+        vector_disabled=_vector_disabled,
     )
+    if _vector_disabled:
+        result["vector_disabled"] = True
+        result["vector_disabled_reason"] = _vector_disabled_reason
     # Attach sanitizer metadata for transparency
     if sanitized["was_sanitized"]:
         result["query_sanitized"] = True
@@ -488,6 +645,20 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
     col = _get_collection()
     if not col:
         return _no_palace()
+    if _vector_disabled:
+        # Without a usable HNSW we can't compute cosine similarity for
+        # near-duplicate detection. Report the limitation rather than
+        # silently returning "not a duplicate" — false negatives here
+        # would let the AI re-file content the palace already holds.
+        return {
+            "is_duplicate": False,
+            "matches": [],
+            "vector_disabled": True,
+            "vector_disabled_reason": _vector_disabled_reason,
+            "hint": (
+                "duplicate detection requires vector search; run " "`mempalace repair` to restore"
+            ),
+        }
     try:
         results = col.query(
             query_texts=[content],
@@ -634,7 +805,9 @@ def tool_add_drawer(
     if not col:
         return _no_palace()
 
-    drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]}"
+    drawer_id = (
+        f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]}"
+    )
 
     _wal_log(
         "add_drawer",
@@ -689,12 +862,8 @@ def tool_delete_drawer(drawer_id: str):
         return {"success": False, "error": f"Drawer not found: {drawer_id}"}
 
     # Log the deletion with the content being removed for audit trail
-    deleted_content = (
-        existing.get("documents", [""])[0] if existing.get("documents") else ""
-    )
-    deleted_meta = (
-        existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
-    )
+    deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
+    deleted_meta = existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
     _wal_log(
         "delete_drawer",
         {
@@ -735,9 +904,7 @@ def tool_get_drawer(drawer_id: str):
         return {"error": str(e)}
 
 
-def tool_list_drawers(
-    wing: str = None, room: str = None, limit: int = 20, offset: int = 0
-):
+def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offset: int = 0):
     """List drawers with pagination. Optional wing/room filter."""
     limit = max(1, min(limit, _MAX_RESULTS))
     offset = max(0, offset)
@@ -761,11 +928,7 @@ def tool_list_drawers(
         elif len(conditions) > 1:
             where = {"$and": conditions}
 
-        kwargs = {
-            "include": ["documents", "metadatas"],
-            "limit": limit,
-            "offset": offset,
-        }
+        kwargs = {"include": ["documents", "metadatas"], "limit": limit, "offset": offset}
         if where:
             kwargs["where"] = where
         result = col.get(**kwargs)
@@ -792,9 +955,7 @@ def tool_list_drawers(
         return {"error": str(e)}
 
 
-def tool_update_drawer(
-    drawer_id: str, content: str = None, wing: str = None, room: str = None
-):
+def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, room: str = None):
     """Update an existing drawer's content and/or metadata."""
     global _metadata_cache
 
@@ -879,11 +1040,7 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
 
 
 def tool_kg_add(
-    subject: str,
-    predicate: str,
-    object: str,
-    valid_from: str = None,
-    source_closet: str = None,
+    subject: str, predicate: str, object: str, valid_from: str = None, source_closet: str = None
 ):
     """Add a relationship to the knowledge graph."""
     try:
@@ -906,11 +1063,7 @@ def tool_kg_add(
     triple_id = _kg.add_triple(
         subject, predicate, object, valid_from=valid_from, source_closet=source_closet
     )
-    return {
-        "success": True,
-        "triple_id": triple_id,
-        "fact": f"{subject} → {predicate} → {object}",
-    }
+    return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
 
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
@@ -952,40 +1105,26 @@ def tool_kg_stats():
 # ==================== AGENT DIARY ====================
 
 
-def tool_diary_write(
-    agent_name: str, entry: str, topic: str = "general", wing: str = "", room: str = ""
-):
+def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: str = ""):
     """
     Write a diary entry for this agent. Entries are timestamped and
     accumulate over time in a diary room.
 
     This is the agent's personal journal — observations, thoughts,
     what it worked on, what it noticed, what it thinks matters.
-
-    Local patch (2026-04-27):
-    - Added `room` parameter (default 'diary' for backward compat). The
-      auto-save Stop hook passes room='checkpoints' to file project
-      checkpoints alongside curated content instead of mixing them with
-      agent journals.
-    - Defensive `wing_` prefix-strip on the default agent_name → wing
-      derivation. Prevents the historical double-prefix bug
-      (wing_wing_claude-opus-4-7) when a caller accidentally passes
-      agent_name='wing_<something>'.
     """
     try:
         agent_name = sanitize_name(agent_name, "agent_name")
         entry = sanitize_content(entry)
+        topic = sanitize_name(topic, "topic")
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
     if wing:
         wing = sanitize_name(wing)
     else:
-        clean = agent_name.lower().replace(" ", "_")
-        if clean.startswith("wing_"):
-            clean = clean[len("wing_") :]
-        wing = f"wing_{clean}"
-    room = room.strip() or "diary"
+        wing = f"wing_{agent_name.lower().replace(' ', '_')}"
+    room = "diary"
     col = _get_collection(create=True)
     if not col:
         return _no_palace()
@@ -1076,11 +1215,7 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
         )
 
         if not results["ids"]:
-            return {
-                "agent": agent_name,
-                "entries": [],
-                "message": "No diary entries yet.",
-            }
+            return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
 
         # Combine and sort by timestamp
         entries = []
@@ -1192,10 +1327,22 @@ def tool_reconnect():
     Use after external scripts or CLI commands modify the palace database
     directly, which can leave the in-memory HNSW index stale.
     """
-    global _collection_cache, _palace_db_inode, _palace_db_mtime
+    global \
+        _client_cache, \
+        _collection_cache, \
+        _palace_db_inode, \
+        _palace_db_mtime, \
+        _vector_disabled, \
+        _vector_disabled_reason
+    _client_cache = None
     _collection_cache = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
+    # Force probe re-run on next _get_client by clearing the flag now;
+    # _refresh_vector_disabled_flag will re-set it if the divergence
+    # still applies after the reconnect.
+    _vector_disabled = False
+    _vector_disabled_reason = ""
     try:
         col = _get_collection()
         if col is None:
@@ -1203,11 +1350,14 @@ def tool_reconnect():
                 "success": False,
                 "message": "No palace found after reconnect",
                 "drawers": 0,
+                "vector_disabled": _vector_disabled,
             }
         return {
             "success": True,
             "message": "Reconnected to palace",
             "drawers": col.count(),
+            "vector_disabled": _vector_disabled,
+            "vector_disabled_reason": _vector_disabled_reason,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1231,10 +1381,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
-                "wing": {
-                    "type": "string",
-                    "description": "Wing to list rooms for (optional)",
-                },
+                "wing": {"type": "string", "description": "Wing to list rooms for (optional)"},
             },
         },
         "handler": tool_list_rooms,
@@ -1276,18 +1423,12 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
-                "subject": {
-                    "type": "string",
-                    "description": "The entity doing/being something",
-                },
+                "subject": {"type": "string", "description": "The entity doing/being something"},
                 "predicate": {
                     "type": "string",
                     "description": "The relationship type (e.g. 'loves', 'works_on', 'daughter_of')",
                 },
-                "object": {
-                    "type": "string",
-                    "description": "The entity being connected to",
-                },
+                "object": {"type": "string", "description": "The entity being connected to"},
                 "valid_from": {
                     "type": "string",
                     "description": "When this became true (YYYY-MM-DD, optional)",
@@ -1376,19 +1517,10 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "source_wing": {"type": "string", "description": "Wing of the source"},
-                "source_room": {
-                    "type": "string",
-                    "description": "Room in the source wing",
-                },
+                "source_room": {"type": "string", "description": "Room in the source wing"},
                 "target_wing": {"type": "string", "description": "Wing of the target"},
-                "target_room": {
-                    "type": "string",
-                    "description": "Room in the target wing",
-                },
-                "label": {
-                    "type": "string",
-                    "description": "Description of the connection",
-                },
+                "target_room": {"type": "string", "description": "Room in the target wing"},
+                "label": {"type": "string", "description": "Description of the connection"},
                 "source_drawer_id": {
                     "type": "string",
                     "description": "Optional specific drawer ID",
@@ -1432,10 +1564,7 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "wing": {"type": "string", "description": "Wing to start from"},
-                "room": {
-                    "type": "string",
-                    "description": "Room to follow tunnels from",
-                },
+                "room": {"type": "string", "description": "Room to follow tunnels from"},
             },
             "required": ["wing", "room"],
         },
@@ -1501,14 +1630,8 @@ TOOLS = {
                     "type": "string",
                     "description": "Verbatim content to store — exact words, never summarized",
                 },
-                "source_file": {
-                    "type": "string",
-                    "description": "Where this came from (optional)",
-                },
-                "added_by": {
-                    "type": "string",
-                    "description": "Who is filing this (default: mcp)",
-                },
+                "source_file": {"type": "string", "description": "Where this came from (optional)"},
+                "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
             },
             "required": ["wing", "room", "content"],
         },
@@ -1519,10 +1642,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
-                "drawer_id": {
-                    "type": "string",
-                    "description": "ID of the drawer to delete",
-                },
+                "drawer_id": {"type": "string", "description": "ID of the drawer to delete"},
             },
             "required": ["drawer_id"],
         },
@@ -1533,10 +1653,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
-                "drawer_id": {
-                    "type": "string",
-                    "description": "ID of the drawer to fetch",
-                },
+                "drawer_id": {"type": "string", "description": "ID of the drawer to fetch"},
             },
             "required": ["drawer_id"],
         },
@@ -1569,10 +1686,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
-                "drawer_id": {
-                    "type": "string",
-                    "description": "ID of the drawer to update",
-                },
+                "drawer_id": {"type": "string", "description": "ID of the drawer to update"},
                 "content": {
                     "type": "string",
                     "description": "New content (optional — omit to keep existing)",
@@ -1718,11 +1832,7 @@ def handle_request(request):
             "id": req_id,
             "result": {
                 "tools": [
-                    {
-                        "name": n,
-                        "description": t["description"],
-                        "inputSchema": t["input_schema"],
-                    }
+                    {"name": n, "description": t["description"], "inputSchema": t["input_schema"]}
                     for n, t in TOOLS.items()
                 ]
             },
@@ -1768,10 +1878,7 @@ def handle_request(request):
                 return {
                     "jsonrpc": "2.0",
                     "id": req_id,
-                    "error": {
-                        "code": -32602,
-                        "message": f"Invalid value for parameter '{key}'",
-                    },
+                    "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
                 }
         try:
             tool_args.pop("wait_for_previous", None)
@@ -1779,9 +1886,7 @@ def handle_request(request):
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "result": {
-                    "content": [{"type": "text", "text": json.dumps(result, indent=2)}]
-                },
+                "result": {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]},
             }
         except Exception:
             logger.exception(f"Tool error in {tool_name}")
@@ -1817,6 +1922,10 @@ def _restore_stdout():
 def main():
     _restore_stdout()
     logger.info("MemPalace MCP Server starting...")
+    # Pre-flight: probe HNSW capacity before any tool call so the warning
+    # is visible at startup rather than on first use (#1222). Pure
+    # filesystem read; never opens a chromadb client.
+    _refresh_vector_disabled_flag()
     while True:
         try:
             line = sys.stdin.readline()
