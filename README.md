@@ -1,21 +1,3 @@
-> [!CAUTION]
-> # 🚨 CRITICAL SECURITY WARNING: BEWARE OF SCAMS
-> **MemPalace has NO other official websites.**
-> 
-> The **ONLY** official sources are:
-> 1. This **[GitHub repository](https://github.com/MemPalace/mempalace)**
-> 2. The **[PyPI package](https://pypi.org/project/mempalace/)**
-> 3. The docs at **[mempalaceofficial.com](https://mempalaceofficial.com)**
-> 
-> **ANY other domain** (including `.tech`, `.net`, or other `.com` variants) is an **impostor** and may distribute **malware**. Do not download executables from untrusted sites. Details and timeline: [docs/HISTORY.md](docs/HISTORY.md).
-
-> [!IMPORTANT]
-> **🚨 Claude Code sessions expire in 30 days w/out auto-save hooks wired!** **[Read this →](https://github.com/MemPalace/mempalace/discussions/1388)**
->
-> Need the shortest recovery/setup path? Use the
-> [Claude Code retention setup checklist](https://mempalaceofficial.com/guide/claude-code-retention.html).
-
-
 <div align="center">
 
 <img src="assets/mempalace_logo.png" alt="MemPalace" width="240">
@@ -30,6 +12,14 @@ Local-first AI memory. Verbatim storage, pluggable backend, 96.6% R@5 raw on Lon
 [![][discord-shield]][discord-link]
 
 </div>
+
+> [!CAUTION]
+> **Beware of impostor sites.** MemPalace has no other official websites. The **only** official sources are this **[GitHub repository](https://github.com/MemPalace/mempalace)**, the **[PyPI package](https://pypi.org/project/mempalace/)**, and the docs at **[mempalaceofficial.com](https://mempalaceofficial.com)**. Any other domain (including `.tech`, `.net`, or other `.com` variants) is an impostor and may distribute malware. Details and timeline: [docs/HISTORY.md](docs/HISTORY.md).
+
+> [!IMPORTANT]
+> **Claude Code sessions expire in 30 days without auto-save hooks wired.** [Read this →](https://github.com/MemPalace/mempalace/discussions/1388)
+>
+> Need the shortest recovery/setup path? Use the [Claude Code retention setup checklist](https://mempalaceofficial.com/guide/claude-code-retention.html).
 
 ---
 
@@ -193,7 +183,7 @@ verbatim drawer per user/assistant message, idempotent and resume-safe.
 
 - Python 3.9+
 - A vector-store backend (ChromaDB by default)
-- ~300 MB disk for the default embedding model
+- ~300 MB disk for the embedding model. Onboarding (`python -m mempalace.onboarding`) offers `embeddinggemma-300m` (multilingual, 100+ languages, recommended) or `all-MiniLM-L6-v2` (English-only, ~30 MB). See the docstring at [`mempalace/embedding.py`](mempalace/embedding.py) for details and migration notes.
 
 No API key is required for the core benchmark path.
 
@@ -215,7 +205,7 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.3.5-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.3.6-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
 [python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/
