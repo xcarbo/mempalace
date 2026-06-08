@@ -87,11 +87,24 @@ def _corrupt_fts5_segment(sqlite_path: Path) -> None:
             pytest.skip("FTS5 segments empty: cannot fabricate FTS5-only corruption")
         target = next((r for r in rows if r[0] > 10), rows[0])
         garbage = b"\xde\xad\xbe\xef" * (len(target[1]) // 4)
-        conn.execute(
-            "UPDATE embedding_fulltext_search_data SET block=? WHERE id=?",
-            (garbage, target[0]),
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                "UPDATE embedding_fulltext_search_data SET block=? WHERE id=?",
+                (garbage, target[0]),
+            )
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            # Local patch: SQLite >= 3.51 protects FTS5 shadow tables from direct
+            # writes ("table ... may not be modified"); older SQLite (e.g. CI's
+            # Ubuntu runners) still allows it. Skip cleanly rather than fail on
+            # modern SQLite, mirroring the two schema/empty guards above.
+            if "may not be modified" in str(exc):
+                pytest.skip(
+                    "SQLite protects FTS5 shadow tables from direct writes "
+                    f"(sqlite {sqlite3.sqlite_version}); cannot fabricate "
+                    "FTS5-only corruption via UPDATE"
+                )
+            raise
 
 
 def _mine_args(
