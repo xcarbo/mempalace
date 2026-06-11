@@ -818,6 +818,17 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                 cwd_norm = cwd.replace("\\", "/").rstrip("/")
                 if not cwd_norm:
                     continue
+                # A .palace-wing file in the project root pins the wing
+                # explicitly (bare name, no wing_ prefix); it wins over
+                # leaf-segment derivation.
+                try:
+                    override = Path(cwd_norm) / ".palace-wing"
+                    if override.is_file():
+                        pinned = override.read_text(encoding="utf-8").strip()
+                        if pinned:
+                            return pinned.splitlines()[0].strip()
+                except OSError:
+                    pass
                 project = cwd_norm.rsplit("/", 1)[-1]
                 if project:
                     slug = project.lower().replace(" ", "_").replace("-", "_")
