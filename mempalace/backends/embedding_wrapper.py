@@ -57,6 +57,24 @@ class EmbeddingCollection(BaseCollection):
         # base "cosine" default and mask a wrapped non-cosine backend.
         return self._inner.distance_metric
 
+    # Same shadowing reason as ``distance_metric``: these are concrete methods
+    # on ``BaseCollection``, so ``__getattr__`` never delegates them. Forward
+    # explicitly to the wrapped backend collection's identity store.
+    def get_stored_embedder_identity(self):
+        return self._inner.get_stored_embedder_identity()
+
+    def set_embedder_identity(self, identity) -> None:
+        return self._inner.set_embedder_identity(identity)
+
+    def effective_embedder_identity(self):
+        return self._inner.effective_embedder_identity()
+
+    def maintenance_state(self) -> dict:
+        return self._inner.maintenance_state()
+
+    def run_maintenance(self, kind: str):
+        return self._inner.run_maintenance(kind)
+
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         documents = _as_list(documents)
         ids = _as_list(ids)
