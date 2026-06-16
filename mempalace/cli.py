@@ -1818,12 +1818,16 @@ def main():
             "  memp list-tools       full JSON list of every tool + its flags\n"
             "  memp <tool> --help    flags for one tool (e.g. memp get-drawer --help)"
         )
-    _cli_api = None
-    if _need_api:
-        from . import cli_api as _cli_api
+    # cli_api import is cheap — it does NOT pull in mcp_server (that stays lazy
+    # inside register_flat/run_tool). Always expose --json/--pretty on the
+    # json-routable colliders (search/status) so they appear in `memp <cmd> --help`;
+    # routing still happens lazily below only when --json is actually passed.
+    from . import cli_api as _cli_api
 
-        _cli_api.register_flat(sub, _known_cmds)
-        _cli_api.add_json_flags(sub, _cli_api.COLLIDERS_JSON)
+    _cli_api.add_json_flags(sub, _cli_api.COLLIDERS_JSON)
+
+    if _need_api:
+        _cli_api.register_flat(sub, _known_cmds)  # imports mcp_server (~0.36s) — only when needed
         # Importing mcp_server redirected stdout->stderr (issue #225). Undo it so
         # argparse --help and our JSON land on the real stdout.
         _cli_api._restore_real_stdout()
@@ -1860,7 +1864,7 @@ def main():
             p_palace.print_help()
         return
 
-    if _need_api and _cli_api is not None:
+    if _need_api:
         if getattr(args, "_api_list", False):
             raise SystemExit(_cli_api.print_tool_list(pretty=getattr(args, "pretty", False)))
         if getattr(args, "_api_tool", None):

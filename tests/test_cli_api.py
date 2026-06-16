@@ -377,6 +377,17 @@ def test_subprocess_top_level_help_points_to_list_tools():
     assert "list-tools" in r.stdout
 
 
+def test_subprocess_collider_help_shows_json_flag():
+    # search/status are json-routable colliders — `--json` must be visible in
+    # their --help (it's always registered, even though it routes lazily).
+    r = _memp_subprocess("search", "--help")
+    assert r.returncode == 0, r.stderr
+    assert "--json" in r.stdout
+    r2 = _memp_subprocess("status", "--help")
+    assert r2.returncode == 0, r2.stderr
+    assert "--json" in r2.stdout
+
+
 def test_subprocess_version_stays_fast_no_api(monkeypatch):
     # --version must not import the heavy api surface; just assert it works + exits 0.
     r = _memp_subprocess("--version")
