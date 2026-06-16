@@ -56,6 +56,7 @@ Repository = "https://github.com/MemPalace/mempalace"
 
 [project.scripts]
 mempalace = "mempalace.cli:main"
+memp = "mempalace.cli:main"
 mempalace-mcp = "mempalace.mcp_server:main"
 
 [project.entry-points."mempalace.backends"]
