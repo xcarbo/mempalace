@@ -1782,19 +1782,51 @@ def main():
     # requested. See docs/superpowers/plans/2026-06-16-memp-cli.md
     _known_cmds = set(sub.choices)
     _argv = sys.argv[1:]
-    _first_pos = next((t for t in _argv if not t.startswith("-")), None)
+    # Find the subcommand token, correctly skipping global options AND the values
+    # they consume (e.g. `--palace PATH status` — PATH is not the command).
+    _value_opts = {
+        opt
+        for a in parser._actions
+        if a.option_strings and a.nargs != 0
+        for opt in a.option_strings
+    }
+    _first_pos = None
+    _skip_next = False
+    for _tok in _argv:
+        if _skip_next:
+            _skip_next = False
+            continue
+        if _tok in _value_opts:
+            _skip_next = True
+            continue
+        if _tok.startswith("-"):
+            continue  # flag or --opt=value
+        _first_pos = _tok
+        break
     _json_req = ("--json" in _argv) or (
         os.environ.get("MEMP_JSON", "").lower() in {"1", "true", "yes", "on"}
     )
     _need_api = (_first_pos is not None and _first_pos not in _known_cmds) or (
         _first_pos in {"search", "status"} and _json_req
     )
+    # Point users/agents at the full memory-tool surface without paying the heavy
+    # mcp_server import on `--help` (the api tools are flat commands; list-tools
+    # dumps them all as JSON). Per-call parser, so this append is not cumulative.
+    if parser.epilog:
+        parser.epilog += (
+            "\n\nMemory tools (drawer CRUD, search, knowledge graph) are flat commands:\n"
+            "  memp list-tools       full JSON list of every tool + its flags\n"
+            "  memp <tool> --help    flags for one tool (e.g. memp get-drawer --help)"
+        )
     _cli_api = None
     if _need_api:
         from . import cli_api as _cli_api
 
         _cli_api.register_flat(sub, _known_cmds)
         _cli_api.add_json_flags(sub, _cli_api.COLLIDERS_JSON)
+        # Importing mcp_server redirected stdout->stderr (issue #225). Undo it so
+        # argparse --help and our JSON land on the real stdout.
+        _cli_api._restore_real_stdout()
     # -----------------------------------------------------------------------
 
     args = parser.parse_args()

@@ -281,6 +281,23 @@ def test_cli_core_command_does_not_import_mcp_server(monkeypatch):
     assert "mempalace.mcp_server" not in _sys.modules
 
 
+def test_cli_value_option_before_core_command_stays_lazy(monkeypatch):
+    """`memp --palace X status`: the option value X must not be read as the command."""
+    import sys as _sys
+
+    from mempalace import cli
+
+    monkeypatch.delitem(_sys.modules, "mempalace.mcp_server", raising=False)
+    monkeypatch.delitem(_sys.modules, "mempalace.cli_api", raising=False)
+    monkeypatch.setattr(cli, "cmd_status", lambda args: None)
+    monkeypatch.setattr("sys.argv", ["memp", "--palace", "/tmp/x", "status"])
+    try:
+        cli.main()
+    except SystemExit:
+        pass
+    assert "mempalace.mcp_server" not in _sys.modules
+
+
 # ── Task 6: parity guard + full CRUD round-trip ─────────────────────────────
 
 
@@ -328,3 +345,39 @@ def test_full_crud_round_trip(monkeypatch, config, kg):
 
     deleted = cli_api.dispatch_tool("mempalace_delete_drawer", {"drawer_id": drawer_id})
     assert deleted["ok"], deleted
+
+
+# ── Task 8: help discoverability (fresh-process / subprocess) ────────────────
+
+
+def _memp_subprocess(*args):
+    import subprocess
+    import sys as _sys
+
+    return subprocess.run(
+        [_sys.executable, "-m", "mempalace.cli", *args],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def test_subprocess_per_tool_help_shows_tool_flags_not_mcp_server_help():
+    r = _memp_subprocess("get-drawer", "--help")
+    assert r.returncode == 0, r.stderr
+    assert "--drawer-id" in r.stdout
+    assert "MemPalace MCP Server" not in r.stdout  # mcp_server's import-time parser must not hijack
+
+
+def test_subprocess_top_level_help_points_to_list_tools():
+    # Top-level help stays light (no heavy import) but tells the agent how to
+    # discover the full tool surface.
+    r = _memp_subprocess("--help")
+    assert r.returncode == 0, r.stderr
+    assert "list-tools" in r.stdout
+
+
+def test_subprocess_version_stays_fast_no_api(monkeypatch):
+    # --version must not import the heavy api surface; just assert it works + exits 0.
+    r = _memp_subprocess("--version")
+    assert r.returncode == 0, r.stderr

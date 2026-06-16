@@ -27,6 +27,28 @@ class _UsageError(Exception):
     """A CLI-level argument error (bad JSON flag, etc.) — exit 1, JSON to stderr."""
 
 
+def _mcp():
+    """Import ``mcp_server`` with the CLI's argv hidden from its parser.
+
+    ``mcp_server`` runs ``_parse_args()`` at MODULE IMPORT time (mcp_server.py
+    line ~200). That uses ``parse_known_args``, which still fires on ``-h`` /
+    ``--help`` — so importing it while the CLI's argv contains ``--help`` (or a
+    value that happens to be ``--help``) would print the MCP server's help and
+    ``sys.exit`` before our own argparse runs. Neutralize argv across the first
+    import. Cached thereafter.
+    """
+    mod = sys.modules.get("mempalace.mcp_server")
+    if mod is not None:
+        return mod
+    saved = sys.argv
+    sys.argv = [saved[0]] if saved else ["mempalace"]
+    try:
+        from . import mcp_server as mod
+    finally:
+        sys.argv = saved
+    return mod
+
+
 def tool_command_name(tool_name):
     """``mempalace_get_drawer`` -> ``get-drawer``."""
     base = tool_name[len("mempalace_") :] if tool_name.startswith("mempalace_") else tool_name
@@ -60,7 +82,7 @@ def dispatch_tool(tool_name, arguments):
     Returns ``{"ok": bool, "payload": <obj>|None, "error": {"message","code"}|None}``.
     Does NOT print — this is the pure, testable core.
     """
-    from .mcp_server import handle_request
+    handle_request = _mcp().handle_request
 
     resp = handle_request(
         {
@@ -146,7 +168,7 @@ def _args_for_tool(tool_name, args):
     server's defaults and required-param diagnostics still apply. String props
     support ``-`` (stdin); array/object props are parsed as JSON.
     """
-    from .mcp_server import TOOLS
+    TOOLS = _mcp().TOOLS
 
     props = TOOLS[tool_name].get("input_schema", {}).get("properties", {})
     out = {}
@@ -185,7 +207,7 @@ def wants_json(args):
 
 def build_tool_list():
     """The CLI analogue of MCP ``tools/list`` — registry as a list of dicts."""
-    from .mcp_server import TOOLS
+    TOOLS = _mcp().TOOLS
 
     return [
         {
@@ -254,7 +276,7 @@ def _add_schema_flags(parser, input_schema):
 
 def register_flat(subparsers, existing_names):
     """Add one flat subcommand per non-excluded, non-colliding tool, plus list-tools."""
-    from .mcp_server import TOOLS
+    TOOLS = _mcp().TOOLS
 
     for tool_name, spec in TOOLS.items():
         if tool_name in EXCLUDED:
