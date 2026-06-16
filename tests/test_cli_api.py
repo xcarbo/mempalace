@@ -279,3 +279,52 @@ def test_cli_core_command_does_not_import_mcp_server(monkeypatch):
     except SystemExit:
         pass
     assert "mempalace.mcp_server" not in _sys.modules
+
+
+# ── Task 6: parity guard + full CRUD round-trip ─────────────────────────────
+
+
+def test_parity_every_tool_is_reachable():
+    """Every TOOLS entry (minus exclusions) is reachable via a flat cmd or collider."""
+    import argparse
+
+    from mempalace.mcp_server import TOOLS
+
+    parser = argparse.ArgumentParser(prog="memp")
+    sub = parser.add_subparsers(dest="command")
+    core = {"search", "status", "sync", "mine"}  # existing colliding commands
+    for c in core:
+        sub.add_parser(c)
+    cli_api.register_flat(sub, set(sub.choices))
+    cli_api.add_json_flags(sub, cli_api.COLLIDERS_JSON)
+
+    for tool_name in TOOLS:
+        if tool_name in cli_api.EXCLUDED:
+            continue
+        cmd = cli_api.tool_command_name(tool_name)
+        assert cmd in sub.choices or cmd in core, f"{tool_name} ({cmd}) has no CLI path"
+
+
+def test_full_crud_round_trip(monkeypatch, config, kg):
+    _patch_mcp_server(monkeypatch, config, kg)
+
+    added = cli_api.dispatch_tool(
+        "mempalace_add_drawer", {"wing": "wing_crud", "room": "notes", "content": "crud body"}
+    )
+    assert added["ok"], added
+    drawer_id = added["payload"].get("drawer_id")
+    assert drawer_id
+
+    got = cli_api.dispatch_tool("mempalace_get_drawer", {"drawer_id": drawer_id})
+    assert got["ok"] and "crud body" in json.dumps(got["payload"])
+
+    listed = cli_api.dispatch_tool("mempalace_list_drawers", {"wing": "wing_crud"})
+    assert listed["ok"] and listed["payload"]
+
+    updated = cli_api.dispatch_tool(
+        "mempalace_update_drawer", {"drawer_id": drawer_id, "content": "crud body v2"}
+    )
+    assert updated["ok"], updated
+
+    deleted = cli_api.dispatch_tool("mempalace_delete_drawer", {"drawer_id": drawer_id})
+    assert deleted["ok"], deleted
