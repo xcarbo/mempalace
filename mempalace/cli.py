@@ -1775,6 +1775,28 @@ def main():
         help="Storage backend (default: config/env/detected/chroma)",
     )
 
+    # --- memp api surface (lazy) -------------------------------------------
+    # Importing mcp_server (chromadb) costs ~0.36s; core commands must stay
+    # ~0.03s (incl. `mempalace hook run`, <500ms budget). Only register the
+    # auto-generated api subcommands when an api/json command is actually
+    # requested. See docs/superpowers/plans/2026-06-16-memp-cli.md
+    _known_cmds = set(sub.choices)
+    _argv = sys.argv[1:]
+    _first_pos = next((t for t in _argv if not t.startswith("-")), None)
+    _json_req = ("--json" in _argv) or (
+        os.environ.get("MEMP_JSON", "").lower() in {"1", "true", "yes", "on"}
+    )
+    _need_api = (_first_pos is not None and _first_pos not in _known_cmds) or (
+        _first_pos in {"search", "status"} and _json_req
+    )
+    _cli_api = None
+    if _need_api:
+        from . import cli_api as _cli_api
+
+        _cli_api.register_flat(sub, _known_cmds)
+        _cli_api.add_json_flags(sub, _cli_api.COLLIDERS_JSON)
+    # -----------------------------------------------------------------------
+
     args = parser.parse_args()
     _apply_backend_arg(args)
 
@@ -1805,6 +1827,14 @@ def main():
         else:
             p_palace.print_help()
         return
+
+    if _need_api and _cli_api is not None:
+        if getattr(args, "_api_list", False):
+            raise SystemExit(_cli_api.print_tool_list(pretty=getattr(args, "pretty", False)))
+        if getattr(args, "_api_tool", None):
+            raise SystemExit(_cli_api.run_command(args))
+        if args.command in _cli_api.COLLIDERS_JSON and _cli_api.wants_json(args):
+            raise SystemExit(_cli_api.run_collider(args))
 
     dispatch = {
         "init": cmd_init,

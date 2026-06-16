@@ -197,3 +197,85 @@ def test_run_collider_search_maps_results_to_limit(monkeypatch):
     assert rc == 0
     assert captured["tool"] == "mempalace_search"
     assert captured["args"] == {"query": "hello", "wing": "w", "limit": 7}
+
+
+# ── Task 5: cli.py integration (lazy pre-scan + dispatch routing) ────────────
+
+
+def _run_cli(monkeypatch, argv):
+    monkeypatch.setattr("sys.argv", ["memp"] + argv)
+    from mempalace import cli
+
+    try:
+        cli.main()
+        return 0
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 0
+
+
+def test_cli_routes_unknown_command_to_run_command(monkeypatch):
+    from mempalace import cli_api
+
+    captured = {}
+
+    def fake_run_command(args):
+        captured["tool"] = args._api_tool
+        captured["drawer_id"] = getattr(args, "drawer_id", None)
+        return 0
+
+    monkeypatch.setattr(cli_api, "run_command", fake_run_command)
+    rc = _run_cli(monkeypatch, ["get-drawer", "--drawer-id", "X"])
+    assert rc == 0
+    assert captured["tool"] == "mempalace_get_drawer"
+    assert captured["drawer_id"] == "X"
+
+
+def test_cli_routes_list_tools(monkeypatch):
+    from mempalace import cli_api
+
+    called = {}
+    monkeypatch.setattr(
+        cli_api, "print_tool_list", lambda pretty=False: (called.setdefault("yes", True), 0)[1]
+    )
+    rc = _run_cli(monkeypatch, ["list-tools"])
+    assert rc == 0 and called.get("yes")
+
+
+def test_cli_collider_json_routes_to_run_collider(monkeypatch):
+    from mempalace import cli, cli_api
+
+    routed = {}
+    monkeypatch.setattr(
+        cli_api, "run_collider", lambda args: (routed.setdefault("json", True), 0)[1]
+    )
+    monkeypatch.setattr(cli, "cmd_search", lambda args: routed.setdefault("human", True))
+    _run_cli(monkeypatch, ["search", "q", "--json"])
+    assert routed.get("json") and not routed.get("human")
+
+
+def test_cli_search_without_json_calls_upstream(monkeypatch):
+    from mempalace import cli, cli_api
+
+    routed = {}
+    monkeypatch.setattr(
+        cli_api, "run_collider", lambda args: (routed.setdefault("json", True), 0)[1]
+    )
+    monkeypatch.setattr(cli, "cmd_search", lambda args: routed.setdefault("human", True))
+    _run_cli(monkeypatch, ["search", "q"])
+    assert routed.get("human") and not routed.get("json")
+
+
+def test_cli_core_command_does_not_import_mcp_server(monkeypatch):
+    import sys as _sys
+
+    from mempalace import cli
+
+    monkeypatch.delitem(_sys.modules, "mempalace.mcp_server", raising=False)
+    monkeypatch.delitem(_sys.modules, "mempalace.cli_api", raising=False)
+    monkeypatch.setattr(cli, "cmd_search", lambda args: None)
+    monkeypatch.setattr("sys.argv", ["memp", "search", "anything"])
+    try:
+        cli.main()
+    except SystemExit:
+        pass
+    assert "mempalace.mcp_server" not in _sys.modules
