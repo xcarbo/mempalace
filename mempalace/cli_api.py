@@ -204,3 +204,101 @@ def print_tool_list(pretty=False):
     _restore_real_stdout()
     print(_format_payload(build_tool_list(), pretty))
     return 0
+
+
+# ── argparse builders + collider routing ────────────────────────────────────
+
+# Map a collider command to the arguments for its MCP tool. Only search/status
+# are json-routed (sync/mine ingest arg-mapping is out of scope; left upstream).
+_COLLIDER_ARG_MAP = {
+    "search": lambda a: {
+        k: v
+        for k, v in {
+            "query": getattr(a, "query", None),
+            "wing": getattr(a, "wing", None),
+            "room": getattr(a, "room", None),
+            "limit": getattr(a, "results", None),
+        }.items()
+        if v is not None
+    },
+    "status": lambda a: {},
+}
+
+
+def _add_schema_flags(parser, input_schema):
+    """Add one ``--flag`` per schema property (dest = the schema property name)."""
+    import argparse
+
+    props = input_schema.get("properties", {})
+    required = set(input_schema.get("required", []))
+    for name, info in props.items():
+        flag = "--" + name.replace("_", "-")
+        ptype = info.get("type")
+        help_text = info.get("description", "")
+        is_req = name in required
+        if ptype == "boolean":
+            parser.add_argument(
+                flag, dest=name, action=argparse.BooleanOptionalAction, default=None, help=help_text
+            )
+        elif ptype == "integer":
+            parser.add_argument(
+                flag, dest=name, type=int, default=None, required=is_req, help=help_text
+            )
+        elif ptype == "number":
+            parser.add_argument(
+                flag, dest=name, type=float, default=None, required=is_req, help=help_text
+            )
+        else:  # string / array / object — array & object are parsed as JSON at dispatch
+            parser.add_argument(flag, dest=name, default=None, required=is_req, help=help_text)
+
+
+def register_flat(subparsers, existing_names):
+    """Add one flat subcommand per non-excluded, non-colliding tool, plus list-tools."""
+    from .mcp_server import TOOLS
+
+    for tool_name, spec in TOOLS.items():
+        if tool_name in EXCLUDED:
+            continue
+        cmd = tool_command_name(tool_name)
+        if cmd in existing_names:
+            continue  # collider — handled by add_json_flags + interception
+        desc = spec.get("description", "")
+        p = subparsers.add_parser(cmd, help=desc[:80], description=desc)
+        _add_schema_flags(p, spec.get("input_schema", {}))
+        p.add_argument("--json", dest="json", action="store_true", help="(default) emit JSON")
+        p.add_argument("--pretty", action="store_true", help="indent JSON output")
+        p.set_defaults(_api_tool=tool_name)
+
+    lt = subparsers.add_parser(
+        "list-tools", help="List every tool (name, description, schema) as JSON"
+    )
+    lt.add_argument("--pretty", action="store_true", help="indent JSON output")
+    lt.set_defaults(_api_list=True)
+
+
+def add_json_flags(subparsers, collider_names):
+    """Add ``--json`` / ``--pretty`` to existing collider subparsers (idempotent)."""
+    import argparse
+
+    for name in collider_names:
+        p = subparsers.choices.get(name)
+        if p is None:
+            continue
+        try:
+            p.add_argument(
+                "--json",
+                dest="json",
+                action="store_true",
+                help="emit JSON via the MCP handler instead of human text",
+            )
+            p.add_argument("--pretty", action="store_true", help="indent JSON output")
+        except argparse.ArgumentError:
+            pass  # already added
+
+
+def run_collider(args):
+    """Dispatch a collider command (search/status) to its MCP tool as JSON."""
+    cmd = args.command
+    tool_name = "mempalace_" + cmd
+    arguments = _COLLIDER_ARG_MAP[cmd](args)
+    return _run_tool(tool_name, arguments, pretty=getattr(args, "pretty", False))

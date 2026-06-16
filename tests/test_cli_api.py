@@ -126,3 +126,74 @@ def test_wants_json_flag_and_env(monkeypatch):
     assert cli_api.wants_json(argparse.Namespace(json=False)) is False
     monkeypatch.setenv("MEMP_JSON", "1")
     assert cli_api.wants_json(argparse.Namespace(json=False)) is True
+
+
+# ── Task 4: argparse builders + collider routing ────────────────────────────
+
+
+def _build_api_parser():
+    """A parser with only the api subcommands registered (no core commands)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="memp")
+    sub = parser.add_subparsers(dest="command")
+    cli_api.register_flat(sub, existing_names=set())
+    return parser, sub
+
+
+def test_register_flat_creates_subcommand_per_tool():
+    from mempalace.mcp_server import TOOLS
+
+    _, sub = _build_api_parser()
+    expected = {cli_api.tool_command_name(n) for n in TOOLS if n not in cli_api.EXCLUDED}
+    expected.add("list-tools")
+    assert expected.issubset(set(sub.choices))
+    assert "reconnect" not in sub.choices  # excluded
+
+
+def test_register_flat_skips_existing_names():
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="memp")
+    sub = parser.add_subparsers(dest="command")
+    cli_api.register_flat(sub, existing_names={"search", "status", "sync", "mine"})
+    assert "search" not in sub.choices  # collider not re-registered
+    assert "get-drawer" in sub.choices
+
+
+def test_generated_command_parses_schema_flags():
+    parser, _ = _build_api_parser()
+    ns = parser.parse_args(["get-drawer", "--drawer-id", "abc123"])
+    assert ns._api_tool == "mempalace_get_drawer"
+    assert ns.drawer_id == "abc123"
+
+
+def test_add_json_flags_lets_collider_accept_json():
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="memp")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("search").add_argument("query")
+    cli_api.add_json_flags(sub, {"search"})
+    ns = parser.parse_args(["search", "q", "--json"])
+    assert ns.json is True
+
+
+def test_run_collider_search_maps_results_to_limit(monkeypatch):
+    import argparse
+
+    captured = {}
+
+    def fake_run_tool(tool_name, arguments, pretty=False):
+        captured["tool"] = tool_name
+        captured["args"] = arguments
+        return 0
+
+    monkeypatch.setattr(cli_api, "_run_tool", fake_run_tool)
+    ns = argparse.Namespace(
+        command="search", query="hello", wing="w", room=None, results=7, json=True, pretty=False
+    )
+    rc = cli_api.run_collider(ns)
+    assert rc == 0
+    assert captured["tool"] == "mempalace_search"
+    assert captured["args"] == {"query": "hello", "wing": "w", "limit": 7}
