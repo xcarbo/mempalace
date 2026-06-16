@@ -58,3 +58,71 @@ def test_dispatch_tool_unknown_tool_error(monkeypatch, config, kg):
     result = cli_api.dispatch_tool("mempalace_does_not_exist", {})
     assert result["ok"] is False
     assert result["error"]["code"] == -32601
+
+
+# ── Task 3: arg-mapping, run_command, tool list, wants_json ──────────────────
+
+
+def test_coerce_json_value_parses_and_rejects():
+    assert cli_api._coerce_json_value("[1, 2]", "triples") == [1, 2]
+    with pytest.raises(cli_api._UsageError):
+        cli_api._coerce_json_value("not json", "triples")
+
+
+def test_args_for_tool_drops_none_and_keeps_set(monkeypatch, config, kg):
+    import argparse
+
+    _patch_mcp_server(monkeypatch, config, kg)
+    ns = argparse.Namespace(wing="wing_x", room=None, limit=10, offset=None)
+    args = cli_api._args_for_tool("mempalace_list_drawers", ns)
+    assert args == {"wing": "wing_x", "limit": 10}
+
+
+def test_args_for_tool_reads_stdin_for_string(monkeypatch, config, kg):
+    import argparse
+
+    _patch_mcp_server(monkeypatch, config, kg)
+    monkeypatch.setattr("sys.stdin", io.StringIO("from stdin"))
+    ns = argparse.Namespace(wing="w", room="r", content="-", source_file=None, added_by=None)
+    args = cli_api._args_for_tool("mempalace_add_drawer", ns)
+    assert args["content"] == "from stdin"
+
+
+def test_run_command_maps_args_and_dispatches(monkeypatch, config, kg):
+    import argparse
+
+    _patch_mcp_server(monkeypatch, config, kg)
+    captured = {}
+
+    def fake(tool, arguments, pretty=False):
+        captured.update(tool=tool, arguments=arguments, pretty=pretty)
+        return 0
+
+    monkeypatch.setattr(cli_api, "_run_tool", fake)
+    ns = argparse.Namespace(
+        _api_tool="mempalace_list_drawers", pretty=True, wing="w", room=None, limit=10, offset=None
+    )
+    rc = cli_api.run_command(ns)
+    assert rc == 0
+    assert captured["tool"] == "mempalace_list_drawers"
+    assert captured["arguments"] == {"wing": "w", "limit": 10}
+    assert captured["pretty"] is True
+
+
+def test_build_tool_list_excludes_reconnect():
+    tools = cli_api.build_tool_list()
+    names = {t["tool"] for t in tools}
+    assert "mempalace_get_drawer" in names
+    assert "mempalace_reconnect" not in names
+    sample = next(t for t in tools if t["tool"] == "mempalace_get_drawer")
+    assert sample["command"] == "get-drawer"
+    assert "input_schema" in sample
+
+
+def test_wants_json_flag_and_env(monkeypatch):
+    import argparse
+
+    assert cli_api.wants_json(argparse.Namespace(json=True)) is True
+    assert cli_api.wants_json(argparse.Namespace(json=False)) is False
+    monkeypatch.setenv("MEMP_JSON", "1")
+    assert cli_api.wants_json(argparse.Namespace(json=False)) is True

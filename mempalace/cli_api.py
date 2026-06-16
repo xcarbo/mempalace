@@ -129,3 +129,78 @@ def _run_tool(tool_name, arguments, pretty=False):
     else:
         print(_format_payload(payload, pretty))
     return 0
+
+
+def _coerce_json_value(raw, prop_name):
+    """Parse a JSON-valued flag (array/object props). Raises ``_UsageError``."""
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError) as e:
+        raise _UsageError(f"--{prop_name.replace('_', '-')} must be valid JSON: {e}")
+
+
+def _args_for_tool(tool_name, args):
+    """Build the MCP ``arguments`` dict from an argparse Namespace via the schema.
+
+    Only schema properties that were actually set (non-None) are included, so the
+    server's defaults and required-param diagnostics still apply. String props
+    support ``-`` (stdin); array/object props are parsed as JSON.
+    """
+    from .mcp_server import TOOLS
+
+    props = TOOLS[tool_name].get("input_schema", {}).get("properties", {})
+    out = {}
+    for name, info in props.items():
+        val = getattr(args, name, None)
+        if val is None:
+            continue
+        ptype = info.get("type")
+        if ptype in ("array", "object"):
+            out[name] = _coerce_json_value(_resolve_stdin(val), name)
+        elif ptype == "string":
+            out[name] = _resolve_stdin(val)
+        else:
+            out[name] = val
+    return out
+
+
+def run_command(args):
+    """Dispatch a generated api subcommand (``args._api_tool`` set)."""
+    tool_name = args._api_tool
+    try:
+        arguments = _args_for_tool(tool_name, args)
+    except _UsageError as e:
+        _restore_real_stdout()
+        print(_format_error({"message": str(e), "code": -32602}), file=sys.stderr)
+        return 1
+    return _run_tool(tool_name, arguments, pretty=getattr(args, "pretty", False))
+
+
+def wants_json(args):
+    """True if the caller asked for JSON via ``--json`` or ``MEMP_JSON``."""
+    if getattr(args, "json", False):
+        return True
+    return os.environ.get("MEMP_JSON", "").lower() in {"1", "true", "yes", "on"}
+
+
+def build_tool_list():
+    """The CLI analogue of MCP ``tools/list`` — registry as a list of dicts."""
+    from .mcp_server import TOOLS
+
+    return [
+        {
+            "command": tool_command_name(name),
+            "tool": name,
+            "description": spec.get("description", ""),
+            "input_schema": spec.get("input_schema", {}),
+        }
+        for name, spec in TOOLS.items()
+        if name not in EXCLUDED
+    ]
+
+
+def print_tool_list(pretty=False):
+    """Emit the tool registry as JSON to stdout. Returns exit code 0."""
+    _restore_real_stdout()
+    print(_format_payload(build_tool_list(), pretty))
+    return 0
