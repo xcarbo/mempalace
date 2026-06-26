@@ -1975,6 +1975,114 @@ def test_vacuum_and_rebuild_fts5_missing_sqlite(tmp_path):
     repair._vacuum_and_rebuild_fts5(str(tmp_path))  # no file — must not raise
 
 
+# ── FTS5 inverted-index auto-heal (#1596) ─────────────────────────────
+
+
+def _make_fts5_palace(tmp_path, *, corrupt: bool) -> str:
+    """Build a palace whose embedding_fulltext_search index is optionally
+    corrupted to the malformed-inverted-index quick_check state #1596 hits."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute(
+            "CREATE VIRTUAL TABLE embedding_fulltext_search"
+            " USING fts5(string_value, tokenize='unicode61')"
+        )
+        for i in range(200):
+            conn.execute(
+                "INSERT INTO embedding_fulltext_search(string_value) VALUES(?)",
+                (f"alpha beta gamma row{i} delta epsilon",),
+            )
+        conn.commit()
+        if corrupt:
+            # Zero the last index segment leaf: quick_check then reports
+            # "malformed inverted index" while the content table stays intact.
+            conn.execute(
+                "UPDATE embedding_fulltext_search_data SET block=zeroblob(length(block)) "
+                "WHERE id=(SELECT max(id) FROM embedding_fulltext_search_data)"
+            )
+            conn.commit()
+    return str(tmp_path)
+
+
+def test_errors_are_isolated_fts5_classification():
+    fts = "malformed inverted index for FTS5 table main.embedding_fulltext_search"
+    page = "Page 4 of B-tree 12345: database disk image is malformed"
+    assert repair._errors_are_isolated_fts5([fts])
+    assert repair._errors_are_isolated_fts5([fts, fts])
+    assert not repair._errors_are_isolated_fts5([])
+    assert not repair._errors_are_isolated_fts5([page])
+    # Any non-FTS5 error in the set means the data itself may be damaged.
+    assert not repair._errors_are_isolated_fts5([fts, page])
+
+
+def test_maybe_autoheal_fts5_index_heals_isolated_corruption(tmp_path):
+    palace = _make_fts5_palace(tmp_path, corrupt=True)
+    errors = repair.sqlite_integrity_errors(palace)
+    assert errors and repair._errors_are_isolated_fts5(errors)
+
+    remaining = repair.maybe_autoheal_fts5_index(palace, errors, progress=lambda *_: None)
+
+    assert remaining == []
+    # quick_check is clean and full-text search works again.
+    assert repair.sqlite_integrity_errors(palace) == []
+    with closing(sqlite3.connect(str(tmp_path / "chroma.sqlite3"))) as conn:
+        hits = conn.execute(
+            "SELECT count(*) FROM embedding_fulltext_search "
+            "WHERE embedding_fulltext_search MATCH 'gamma'"
+        ).fetchone()[0]
+    assert hits == 200
+
+
+def test_maybe_autoheal_fts5_index_leaves_non_fts5_errors_untouched(tmp_path):
+    palace = _make_fts5_palace(tmp_path, corrupt=False)
+    page_errors = ["Page 4 of B-tree 12345: database disk image is malformed"]
+
+    # Not isolated FTS5: returned unchanged and the rebuild is never attempted.
+    with patch("mempalace.palace.mine_palace_lock") as lock:
+        remaining = repair.maybe_autoheal_fts5_index(palace, page_errors, progress=lambda *_: None)
+    assert remaining == page_errors
+    lock.assert_not_called()
+
+
+def test_maybe_autoheal_fts5_index_skips_when_palace_is_being_mined(tmp_path):
+    from mempalace.palace import MineAlreadyRunning
+
+    palace = _make_fts5_palace(tmp_path, corrupt=True)
+    errors = repair.sqlite_integrity_errors(palace)
+
+    def _raise(_path):
+        raise MineAlreadyRunning("held by pid 999")
+
+    # A live mine holds the lock: do not race the rebuild — surface and abort.
+    with patch("mempalace.palace.mine_palace_lock", side_effect=_raise):
+        remaining = repair.maybe_autoheal_fts5_index(palace, errors, progress=lambda *_: None)
+
+    assert remaining == errors
+    # The FTS index is still corrupt because we refused to rebuild under contention.
+    assert repair.sqlite_integrity_errors(palace) == errors
+
+
+def test_rebuild_index_preflight_autoheals_isolated_fts5_then_proceeds(tmp_path, monkeypatch):
+    """The preflight no longer hard-aborts on isolated FTS5 corruption (#1596):
+    it rebuilds the index, then continues into the rebuild path."""
+    palace = _make_fts5_palace(tmp_path, corrupt=True)
+
+    called = {}
+
+    def _fake_max_seq(_palace_path, **_kwargs):
+        # Reached only if the preflight did NOT abort — record and stop early
+        # so the test doesn't need a real chromadb collection.
+        called["reached"] = True
+        return {"stopped": True}
+
+    monkeypatch.setattr(repair, "maybe_repair_poisoned_max_seq_id_before_rebuild", _fake_max_seq)
+
+    repair.rebuild_index(palace_path=palace, progress=lambda *_: None)
+
+    assert called.get("reached") is True
+    assert repair.sqlite_integrity_errors(palace) == []
+
+
 @patch("mempalace.repair.shutil")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_calls_vacuum(mock_backend_cls, mock_shutil, tmp_path):
