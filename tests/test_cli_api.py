@@ -199,6 +199,40 @@ def test_run_collider_search_maps_results_to_limit(monkeypatch):
     assert captured["args"] == {"query": "hello", "wing": "w", "limit": 7}
 
 
+def test_run_collider_search_passes_source_file_and_max_distance(monkeypatch):
+    """v3.5.0 filters (#1815/#1817) must reach the MCP arguments dict."""
+    import argparse
+
+    captured = {}
+
+    def fake_run_tool(tool_name, arguments, pretty=False):
+        captured["tool"] = tool_name
+        captured["args"] = arguments
+        return 0
+
+    monkeypatch.setattr(cli_api, "_run_tool", fake_run_tool)
+    ns = argparse.Namespace(
+        command="search",
+        query="hello",
+        wing=None,
+        room=None,
+        results=5,
+        source_file="/abs/notes.md",
+        max_distance=0.8,
+        json=True,
+        pretty=False,
+    )
+    rc = cli_api.run_collider(ns)
+    assert rc == 0
+    assert captured["tool"] == "mempalace_search"
+    assert captured["args"] == {
+        "query": "hello",
+        "limit": 5,
+        "source_file": "/abs/notes.md",
+        "max_distance": 0.8,
+    }
+
+
 # ── Task 5: cli.py integration (lazy pre-scan + dispatch routing) ────────────
 
 
@@ -322,6 +356,55 @@ def test_parity_every_tool_is_reachable():
         assert cmd in sub.choices or cmd in core, f"{tool_name} ({cmd}) has no CLI path"
 
 
+@pytest.mark.parametrize("cmd", sorted(cli_api.COLLIDERS_JSON))
+def test_collider_arg_map_covers_tool_schema(cmd):
+    """Every schema property of a collider's tool is mapped or documented-excluded.
+
+    Colliders bypass the schema-driven ``register_flat``/``_args_for_tool`` path,
+    so a new upstream schema property would otherwise go silently unreachable
+    from ``memp <cmd> --json``. This test fails loudly instead: wire the new
+    property into ``_COLLIDER_ARG_MAP[cmd]`` (and the human subparser in cli.py)
+    or add it to ``COLLIDER_UNMAPPED[cmd]`` with a reason.
+    """
+    from mempalace.mcp_server import TOOLS
+
+    props = set(TOOLS["mempalace_" + cmd]["input_schema"].get("properties", {}))
+    mapped = set(cli_api._COLLIDER_ARG_MAP[cmd])
+    excluded = cli_api.COLLIDER_UNMAPPED[cmd]
+
+    assert mapped.isdisjoint(excluded), f"{cmd}: props both mapped and excluded"
+    missing = props - mapped - excluded
+    assert not missing, (
+        f"mempalace_{cmd} schema properties {sorted(missing)} are neither mapped in "
+        f"_COLLIDER_ARG_MAP[{cmd!r}] nor documented in COLLIDER_UNMAPPED[{cmd!r}]"
+    )
+    # No stale entries pointing at properties the schema no longer has.
+    assert mapped <= props, f"{cmd}: stale mapped props {sorted(mapped - props)}"
+    assert excluded <= props, f"{cmd}: stale excluded props {sorted(excluded - props)}"
+
+
+def test_new_v350_tools_are_flat_commands_not_colliders():
+    """checkpoint / delete-by-source auto-appear via register_flat with real flags."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="memp")
+    sub = parser.add_subparsers(dest="command")
+    for c in ("search", "status", "sync", "mine"):  # existing colliding commands
+        sub.add_parser(c)
+    cli_api.register_flat(sub, set(sub.choices))
+
+    assert "checkpoint" in sub.choices
+    assert "delete-by-source" in sub.choices
+
+    ns = parser.parse_args(["delete-by-source", "--source-file", "/x/bench.md"])
+    assert ns._api_tool == "mempalace_delete_by_source"
+    assert ns.source_file == "/x/bench.md"
+
+    ns2 = parser.parse_args(["checkpoint", "--items", '[{"wing":"w","room":"r","content":"c"}]'])
+    assert ns2._api_tool == "mempalace_checkpoint"
+    assert json.loads(ns2.items) == [{"wing": "w", "room": "r", "content": "c"}]
+
+
 def test_full_crud_round_trip(monkeypatch, config, kg):
     _patch_mcp_server(monkeypatch, config, kg)
 
@@ -392,3 +475,34 @@ def test_subprocess_version_stays_fast_no_api(monkeypatch):
     # --version must not import the heavy api surface; just assert it works + exits 0.
     r = _memp_subprocess("--version")
     assert r.returncode == 0, r.stderr
+
+
+def test_subprocess_search_help_shows_v350_filters():
+    # The human search subparser must advertise the JSON-path filters so they
+    # are discoverable from `memp search --help` alongside --json.
+    r = _memp_subprocess("search", "--help")
+    assert r.returncode == 0, r.stderr
+    assert "--source-file" in r.stdout
+    assert "--max-distance" in r.stdout
+
+
+def test_cmd_search_rejects_json_only_filters_without_json():
+    # Fail fast: the human search path cannot honor these filters — returning
+    # unfiltered results silently would be worse than an error.
+    import argparse
+
+    from mempalace import cli
+
+    ns = argparse.Namespace(
+        query="q",
+        palace=None,
+        wing=None,
+        room=None,
+        results=5,
+        source_file="/x/notes.md",
+        max_distance=None,
+        json=False,
+    )
+    with pytest.raises(SystemExit) as ei:
+        cli.cmd_search(ns)
+    assert ei.value.code == 2

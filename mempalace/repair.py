@@ -43,6 +43,7 @@ from typing import Callable, Iterator, Optional
 from chromadb.errors import NotFoundError as ChromaNotFoundError
 
 from .backends.chroma import ChromaBackend, hnsw_capacity_status
+from .config import sqlite_read_uri
 
 
 COLLECTION_NAME = "mempalace_drawers"
@@ -476,7 +477,7 @@ def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None)
     try:
         import sqlite3
 
-        conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_read_uri(sqlite_path), uri=True)
         try:
             row = conn.execute(
                 """
@@ -516,7 +517,7 @@ def sqlite_integrity_errors(palace_path: str) -> list[str]:
         return []
 
     try:
-        with sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True) as conn:
+        with sqlite3.connect(sqlite_read_uri(sqlite_path), uri=True) as conn:
             rows = conn.execute("PRAGMA quick_check").fetchall()
     except sqlite3.Error as e:
         return [f"PRAGMA quick_check failed: {e}"]
@@ -561,6 +562,116 @@ def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
     print("    4. Recreate the FTS5 virtual table from intact embedding_metadata rows.")
     print("    5. Verify `PRAGMA integrity_check` returns `ok`.")
     print("    6. Re-run `mempalace repair --yes`.")
+
+
+# quick_check labels a corrupt FTS5 inverted index like:
+#   "malformed inverted index for FTS5 table main.embedding_fulltext_search"
+# That specific failure is recoverable in place: the index is derived from the
+# intact ``embedding_fulltext_search_content`` shadow table, so rebuilding it
+# restores full-text search without touching any drawer rows. Concurrent
+# killed-mid-write mines are the usual cause (#1596).
+_FTS5_MALFORMED_RE = re.compile(r"malformed inverted index for FTS5 table", re.IGNORECASE)
+
+
+def _errors_are_isolated_fts5(errors: list[str]) -> bool:
+    """True when every quick_check error is a malformed FTS5 inverted index.
+
+    Only an isolated FTS5 failure is safe to auto-heal: the inverted index is
+    derived data that ``rebuild`` regenerates from the content shadow table. If
+    quick_check also reports page/row corruption, the data itself may be damaged
+    and rebuilding the index over it would mask real loss — that still aborts.
+    """
+    return bool(errors) and all(_FTS5_MALFORMED_RE.search(e) for e in errors)
+
+
+def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=print) -> list[str]:
+    """Rebuild a malformed FTS5 inverted index in place; return remaining errors.
+
+    The repair preflight aborts when ``PRAGMA quick_check`` reports SQLite-layer
+    corruption. After concurrent killed-mid-write mines (#1596) the common
+    failure is an isolated ``malformed inverted index for FTS5 table``, which is
+    fully recoverable: the index rebuilds from the intact
+    ``embedding_fulltext_search_content`` table without touching drawer rows.
+
+    When the errors are isolated to FTS5, rebuild the index under the palace
+    write lock (so a live mine cannot race the rebuild) and re-run quick_check.
+    Returns the remaining quick_check errors — empty when the heal succeeded.
+    Broader corruption, a lock held by another writer, or a rebuild failure
+    leaves ``errors`` unchanged so the caller still aborts with the banner.
+    """
+    if not _errors_are_isolated_fts5(errors):
+        return errors
+
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.exists(sqlite_path):
+        return errors
+
+    # Lazy import: palace.py is heavier and importing it at module load would
+    # widen repair.py's import graph for callers that never hit this path.
+    from .palace import MineAlreadyRunning, mine_palace_lock
+
+    progress(
+        "\n  Isolated FTS5 inverted-index corruption detected; attempting an\n"
+        "  in-place rebuild from the intact content table before aborting."
+    )
+    try:
+        with mine_palace_lock(palace_path):
+            with closing(sqlite3.connect(sqlite_path, isolation_level=None)) as conn:
+                conn.execute(
+                    "INSERT INTO embedding_fulltext_search"
+                    "(embedding_fulltext_search) VALUES('rebuild')"
+                )
+                conn.commit()
+    except MineAlreadyRunning as exc:
+        progress(
+            f"  Skipped FTS5 rebuild: palace is being written by another process ({exc}). "
+            "Stop it and re-run."
+        )
+        return errors
+    except Exception as exc:
+        progress(f"  FTS5 rebuild failed (leaving palace untouched): {exc}")
+        return errors
+
+    remaining = sqlite_integrity_errors(palace_path)
+    if remaining:
+        progress("  FTS5 rebuild did not clear quick_check; aborting for safety.")
+    else:
+        progress("  FTS5 index rebuilt from intact content; quick_check is clean.")
+    return remaining
+
+
+def index_read_recovery_guidance() -> str:
+    """Recovery guidance for a failed drawer-index read in the legacy paths.
+
+    Both ``cmd_repair`` (cli.py) and :func:`rebuild_index` read the drawers
+    collection via ``Collection.count()`` as their first step. The common
+    reason that read raises is the chromadb compactor failing to apply the
+    WAL into the HNSW segment (``InternalError: Failed to apply logs to the
+    hnsw segment writer``, issues #1308 / #1843): the on-disk HNSW index is
+    corrupt while the rows stay intact in ``chroma.sqlite3``, so
+    :func:`rebuild_from_sqlite` (``repair --mode from-sqlite``) recovers them
+    and re-mining would needlessly drop drawers added through the MCP server
+    and diary entries that have no source file.
+
+    The other thing that strands this read is a live MemPalace server or
+    mine still holding the palace open, so the guidance says to stop it and
+    retry before assuming corruption. Worded conditionally because the bare
+    ``except Exception`` cannot prove which case it caught. Returned as a
+    pre-indented block so the ``print``-based CLI path and the
+    ``progress``-callable rebuild path emit it unchanged.
+    """
+    return (
+        "  If a MemPalace server or mine is still running against this palace,\n"
+        "  stop it and retry. Otherwise the drawer index is likely corrupt\n"
+        "  (for example a failed chromadb HNSW compaction) while your drawer\n"
+        "  rows remain in chroma.sqlite3. Rebuild the index from SQLite rather\n"
+        "  than re-mining:\n"
+        "\n"
+        "      mempalace repair --mode from-sqlite --archive-existing\n"
+        "\n"
+        "  (Re-mining from source files would drop drawers added via the MCP\n"
+        "  server and diary entries, which have no source file.)"
+    )
 
 
 def maybe_repair_poisoned_max_seq_id_before_rebuild(
@@ -775,6 +886,8 @@ def rebuild_index(
     # exit cleanly before chromadb's compactor touches the disk.
     sqlite_errors = sqlite_integrity_errors(palace_path)
     if sqlite_errors:
+        sqlite_errors = maybe_autoheal_fts5_index(palace_path, sqlite_errors, progress=progress)
+    if sqlite_errors:
         print_sqlite_integrity_abort(palace_path, sqlite_errors)
         return
 
@@ -791,7 +904,7 @@ def rebuild_index(
         total = col.count()
     except Exception as e:
         progress(f"  Error reading palace: {e}")
-        progress("  Palace may need to be re-mined from source files.")
+        progress(index_read_recovery_guidance())
         return
 
     progress(f"  Drawers found: {total}")
@@ -1013,7 +1126,7 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
     if not os.path.isfile(sqlite_path):
         return
 
-    conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(sqlite_read_uri(sqlite_path), uri=True)
     try:
         seg_row = conn.execute(
             """
@@ -1057,6 +1170,37 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
             yield emb_id, doc, kv
     finally:
         conn.close()
+
+
+def _preserve_knowledge_graph_sqlite(source_palace: str, dest_palace: str) -> list[str]:
+    """Copy KG SQLite sidecars when rebuilding a palace from chroma.sqlite3.
+
+    rebuild_from_sqlite reconstructs Chroma collections into a fresh
+    destination directory. The knowledge graph is a separate SQLite database,
+    so it must be copied explicitly or the repair succeeds while silently
+    dropping KG state (#1816).
+    """
+
+    copied: list[str] = []
+
+    for suffix in ("", "-wal", "-shm"):
+        filename = f"knowledge_graph.sqlite3{suffix}"
+        src = os.path.join(source_palace, filename)
+        dst = os.path.join(dest_palace, filename)
+
+        if not os.path.isfile(src):
+            continue
+        if os.path.abspath(src) == os.path.abspath(dst):
+            continue
+
+        os.makedirs(dest_palace, exist_ok=True)
+        shutil.copy2(src, dst)
+        copied.append(filename)
+
+    if copied:
+        print(" Preserved knowledge graph: " + ", ".join(copied))
+
+    return copied
 
 
 def rebuild_from_sqlite(
@@ -1205,6 +1349,7 @@ def rebuild_from_sqlite(
             )
 
     os.makedirs(dest_palace, exist_ok=True)
+    _preserve_knowledge_graph_sqlite(source_palace, dest_palace)
 
     # Backend lifetime is wrapped in try/finally so the dest palace's
     # PersistentClient handle (opened lazily inside ``create_collection``
@@ -1236,6 +1381,20 @@ def rebuild_from_sqlite(
                 print(f"    done: {upserted} rows in {cname}")
 
         print(f"\n  Rebuild complete. {sum(counts.values())} total rows.")
+
+        # The bulk upsert can leave the destination's FTS5 inverted index
+        # malformed (observed at ~90k rows), which the MCP startup
+        # integrity gate then refuses. Heal it here, from the intact
+        # content table, so a completed rebuild never strands the palace.
+        dest_errors = sqlite_integrity_errors(dest_palace)
+        if dest_errors:
+            remaining = maybe_autoheal_fts5_index(dest_palace, dest_errors)
+            if remaining:
+                print(
+                    "  WARNING: destination integrity errors persist after "
+                    f"FTS5 heal: {remaining[:3]}"
+                )
+
         if archive_path is not None:
             print(f"  Original palace archived at: {archive_path}")
         print(f"{'=' * 55}\n")
@@ -1308,7 +1467,15 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
             print(f"    note:           {info['message']}")
 
     if drawers["diverged"] or closets["diverged"]:
-        print("\n  Recommended: run `mempalace repair` to rebuild the index.")
+        print(
+            "\n  Recommended: rebuild the index from SQLite rather than re-mining:\n"
+            "\n      mempalace repair --mode from-sqlite --archive-existing\n"
+            "\n  A diverged index usually means the HNSW segment is out of sync with\n"
+            "  chroma.sqlite3 (for example a failed chromadb HNSW compaction). The\n"
+            "  drawer rows are intact in SQLite, so --mode from-sqlite recovers them.\n"
+            "  Do not re-mine from source files: that would drop drawers added via\n"
+            "  the MCP server and diary entries, which have no source file (#1843)."
+        )
     print()
     return {"drawers": drawers, "closets": closets}
 
