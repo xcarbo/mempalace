@@ -2067,6 +2067,13 @@ def _make_fts5_palace(tmp_path, *, corrupt: bool) -> str:
             )
         conn.commit()
         if corrupt:
+            # SQLite >=3.51 refuses direct shadow-table writes unless
+            # defensive mode is off; without this the corruption setup (and
+            # therefore the #1596 heal coverage) silently skips on modern
+            # builds. setconfig needs Python >=3.12 — older interpreters
+            # keep the skip fallback below.
+            if hasattr(conn, "setconfig") and hasattr(sqlite3, "SQLITE_DBCONFIG_DEFENSIVE"):
+                conn.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, False)
             # Zero the last index segment leaf: quick_check then reports
             # "malformed inverted index" while the content table stays intact.
             try:

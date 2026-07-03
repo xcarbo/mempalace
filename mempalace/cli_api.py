@@ -18,6 +18,12 @@ import sys
 # Tools that make no sense as a one-shot CLI process (MCP-transport-only).
 EXCLUDED = {"mempalace_reconnect"}
 
+# Tools whose natural command name collides with a legacy ingest subcommand
+# (`mempalace mine` / `mempalace sync`). Unlike search/status they are not
+# json-routed colliders, so without an alt name they were simply unreachable
+# from the CLI json surface. Registered and listed under these names instead.
+ALT_NAMES = {"mempalace_mine": "api-mine", "mempalace_sync": "api-sync"}
+
 # Existing top-level commands that overlap an MCP tool. These keep their upstream
 # (human) behavior by default; --json / MEMP_JSON routes them to the MCP handler.
 COLLIDERS_JSON = {"search", "status"}
@@ -211,7 +217,7 @@ def build_tool_list():
 
     return [
         {
-            "command": tool_command_name(name),
+            "command": ALT_NAMES.get(name, tool_command_name(name)),
             "tool": name,
             "description": spec.get("description", ""),
             "input_schema": spec.get("input_schema", {}),
@@ -302,7 +308,9 @@ def register_flat(subparsers, existing_names):
             continue
         cmd = tool_command_name(tool_name)
         if cmd in existing_names:
-            continue  # collider — handled by add_json_flags + interception
+            cmd = ALT_NAMES.get(tool_name)
+            if cmd is None or cmd in existing_names:
+                continue  # collider — handled by add_json_flags + interception
         desc = spec.get("description", "")
         p = subparsers.add_parser(cmd, help=desc[:80], description=desc)
         _add_schema_flags(p, spec.get("input_schema", {}))
@@ -340,6 +348,17 @@ def add_json_flags(subparsers, collider_names):
 def run_collider(args):
     """Dispatch a collider command (search/status) to its MCP tool as JSON."""
     cmd = args.command
+    # The MCP status tool takes no arguments, so a --backend override cannot
+    # be forwarded — fail fast instead of silently reporting the default
+    # backend's numbers as if they were the requested one's.
+    if cmd == "status" and getattr(args, "backend", None):
+        print(
+            "error: --backend is not supported with --json "
+            "(the MCP status tool always reports the configured backend); "
+            "drop --json to use --backend",
+            file=sys.stderr,
+        )
+        return 2
     tool_name = "mempalace_" + cmd
     arguments = _collider_arguments(cmd, args)
     return _run_tool(tool_name, arguments, pretty=getattr(args, "pretty", False))

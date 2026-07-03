@@ -161,6 +161,30 @@ def test_register_flat_skips_existing_names():
     assert "get-drawer" in sub.choices
 
 
+def test_register_flat_exposes_colliding_ingest_tools_under_alt_names():
+    """mempalace_mine / mempalace_sync collide with the legacy `mine`/`sync`
+    ingest subcommands, which made them CLI-unreachable on the json surface.
+    They must register under their alt names instead of being dropped."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="memp")
+    sub = parser.add_subparsers(dest="command")
+    cli_api.register_flat(sub, existing_names={"search", "status", "sync", "mine"})
+
+    assert "api-mine" in sub.choices
+    assert "api-sync" in sub.choices
+    ns = parser.parse_args(["api-mine", "--source", "/some/dir"])
+    assert ns._api_tool == "mempalace_mine"
+    assert ns.source == "/some/dir"
+
+
+def test_build_tool_list_reports_alt_names_for_colliding_ingest_tools():
+    tools = cli_api.build_tool_list()
+    by_tool = {t["tool"]: t["command"] for t in tools}
+    assert by_tool["mempalace_mine"] == "api-mine"
+    assert by_tool["mempalace_sync"] == "api-sync"
+
+
 def test_generated_command_parses_schema_flags():
     parser, _ = _build_api_parser()
     ns = parser.parse_args(["get-drawer", "--drawer-id", "abc123"])
@@ -231,6 +255,46 @@ def test_run_collider_search_passes_source_file_and_max_distance(monkeypatch):
         "source_file": "/abs/notes.md",
         "max_distance": 0.8,
     }
+
+
+def test_run_collider_status_rejects_backend_flag(monkeypatch, capsys):
+    """``memp status --backend X --json`` must fail fast, not silently ignore
+    --backend: the MCP status tool takes no arguments, so the collider cannot
+    honor a backend override and pretending otherwise reports the wrong
+    palace's numbers."""
+    import argparse
+
+    called = {}
+    monkeypatch.setattr(cli_api, "_run_tool", lambda *a, **k: called.setdefault("ran", True) or 0)
+    ns = argparse.Namespace(command="status", backend="lance", json=True, pretty=False)
+
+    rc = cli_api.run_collider(ns)
+
+    assert rc != 0
+    assert "ran" not in called
+    err = capsys.readouterr().err
+    assert "--backend" in err and "--json" in err
+
+
+def test_run_collider_status_without_backend_routes_normally(monkeypatch):
+    """No --backend → status collider dispatches as before."""
+    import argparse
+
+    captured = {}
+
+    def fake_run_tool(tool_name, arguments, pretty=False):
+        captured["tool"] = tool_name
+        captured["args"] = arguments
+        return 0
+
+    monkeypatch.setattr(cli_api, "_run_tool", fake_run_tool)
+    ns = argparse.Namespace(command="status", backend=None, json=True, pretty=False)
+
+    rc = cli_api.run_collider(ns)
+
+    assert rc == 0
+    assert captured["tool"] == "mempalace_status"
+    assert captured["args"] == {}
 
 
 # ── Task 5: cli.py integration (lazy pre-scan + dispatch routing) ────────────
