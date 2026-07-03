@@ -1229,6 +1229,19 @@ def test_write_palace_format_stamp_writes_and_never_downgrades(tmp_path):
     assert stamp["format_version"] == PALACE_FORMAT_VERSION + 5
 
 
+def test_write_palace_format_stamp_swallows_unwritable_path(tmp_path):
+    """Stamping is best-effort: an unwritable palace path must not raise —
+    the stamp guard degrades to the pre-stamp behavior, never blocks an open."""
+    from mempalace.backends.chroma import write_palace_format_stamp
+
+    not_a_dir = tmp_path / "actually-a-file"
+    not_a_dir.write_text("")
+
+    write_palace_format_stamp(str(not_a_dir))  # must not raise
+
+    assert not_a_dir.is_file()
+
+
 def test_prepare_palace_for_open_writes_format_stamp(tmp_path):
     """Every palace open funnels through ``_prepare_palace_for_open``; it must
     leave the format stamp so any LATER older reader defers instead of
