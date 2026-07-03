@@ -230,21 +230,40 @@ def print_tool_list(pretty=False):
 
 # ── argparse builders + collider routing ────────────────────────────────────
 
-# Map a collider command to the arguments for its MCP tool. Only search/status
+# Map a collider command to {schema_property: argparse_dest}. Only search/status
 # are json-routed (sync/mine ingest arg-mapping is out of scope; left upstream).
+# Colliders bypass the schema-driven flag generation, so every property in the
+# tool's input_schema MUST appear here or in COLLIDER_UNMAPPED — the parity test
+# (tests/test_cli_api.py::test_collider_arg_map_covers_tool_schema) fails loudly
+# when upstream adds a schema property that is neither.
 _COLLIDER_ARG_MAP = {
-    "search": lambda a: {
-        k: v
-        for k, v in {
-            "query": getattr(a, "query", None),
-            "wing": getattr(a, "wing", None),
-            "room": getattr(a, "room", None),
-            "limit": getattr(a, "results", None),
-        }.items()
-        if v is not None
+    "search": {
+        "query": "query",
+        "wing": "wing",
+        "room": "room",
+        "limit": "results",  # human flag is --results
+        "source_file": "source_file",
+        "max_distance": "max_distance",
     },
-    "status": lambda a: {},
+    "status": {},
 }
+
+# Schema properties deliberately NOT exposed on the collider path, with reasons.
+COLLIDER_UNMAPPED = {
+    # context: re-ranking hint only ("NOT used for embedding") — no CLI use case.
+    "search": {"context"},
+    "status": set(),
+}
+
+
+def _collider_arguments(cmd, args):
+    """Build the MCP arguments dict for a collider from its argparse Namespace."""
+    out = {}
+    for prop, dest in _COLLIDER_ARG_MAP[cmd].items():
+        val = getattr(args, dest, None)
+        if val is not None:
+            out[prop] = val
+    return out
 
 
 def _add_schema_flags(parser, input_schema):
@@ -322,5 +341,5 @@ def run_collider(args):
     """Dispatch a collider command (search/status) to its MCP tool as JSON."""
     cmd = args.command
     tool_name = "mempalace_" + cmd
-    arguments = _COLLIDER_ARG_MAP[cmd](args)
+    arguments = _collider_arguments(cmd, args)
     return _run_tool(tool_name, arguments, pretty=getattr(args, "pretty", False))

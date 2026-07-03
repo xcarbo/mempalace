@@ -914,6 +914,18 @@ def cmd_daemon(args):
 
 
 def cmd_search(args):
+    # The human search path (searcher.search) does not support these filters;
+    # fail fast rather than silently return unfiltered results.
+    if (
+        getattr(args, "source_file", None) is not None
+        or getattr(args, "max_distance", None) is not None
+    ):
+        print(
+            "mempalace: --source-file/--max-distance apply to the JSON path only — add --json",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     from .searcher import search, SearchError
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
@@ -1750,6 +1762,19 @@ def main():
     p_search.add_argument("--wing", default=None, help="Limit to one project")
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
+    p_search.add_argument(
+        "--source-file",
+        dest="source_file",
+        default=None,
+        help="Filter to one exact stored source_file path (JSON path only — requires --json)",
+    )
+    p_search.add_argument(
+        "--max-distance",
+        dest="max_distance",
+        type=float,
+        default=None,
+        help="Max cosine distance 0-2; drop farther results (JSON path only — requires --json)",
+    )
 
     # compress
     p_compress = sub.add_parser(
