@@ -1126,6 +1126,130 @@ def test_quarantine_stale_hnsw_renames_missing_metadata_with_nontrivial_data(tmp
     assert (drift_dirs[0] / "data_level0.bin").exists()
 
 
+# ── palace format stamp (stale-consumer guard) ───────────────────────────
+#
+# Incident 2026-07-03: a consumer running mempalace 3.3.5 opened a palace
+# freshly rebuilt by 3.5.0 and quarantined both valid vector segments —
+# its older heuristics read the newer on-disk shape as corruption. The
+# stamp lets newer writers mark the palace so older readers (>= the
+# version introducing the stamp) warn and refuse to quarantine instead
+# of renaming segments they cannot judge.
+
+
+def _stamp_newer_format(palace):
+    import json
+
+    from mempalace.backends.chroma import PALACE_FORMAT_VERSION
+
+    (palace / "palace_format.json").write_text(
+        json.dumps({"format_version": PALACE_FORMAT_VERSION + 1, "written_by": "future"})
+    )
+
+
+def test_quarantine_invalid_hnsw_metadata_defers_to_newer_palace_format(tmp_path):
+    """A palace stamped by a NEWER mempalace must not have segments
+    quarantined by older quarantine heuristics — even when the metadata
+    looks invalid to this version."""
+    import pickle
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "index_metadata.pickle").write_bytes(pickle.dumps(["not", "a", "metadata", "shape"]))
+    _stamp_newer_format(palace)
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_stale_hnsw_defers_to_newer_palace_format(tmp_path):
+    """Same deferral for the stale/drift quarantine path."""
+    now = 1_700_000_000.0
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 7200,
+        sqlite_mtime=now,
+        meta_bytes=_CORRUPT_META,
+    )
+    _stamp_newer_format(palace)
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_proceeds_when_stamp_is_current_or_absent(tmp_path):
+    """A stamp at our own format version (or none at all) must not disable
+    the quarantine — only a NEWER stamp defers."""
+    import json
+
+    from mempalace.backends.chroma import PALACE_FORMAT_VERSION
+
+    now = 1_700_000_000.0
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 7200,
+        sqlite_mtime=now,
+        meta_bytes=_CORRUPT_META,
+    )
+    (palace / "palace_format.json").write_text(
+        json.dumps({"format_version": PALACE_FORMAT_VERSION, "written_by": "test"})
+    )
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+
+    assert len(moved) == 1
+    assert not seg.exists()
+
+
+def test_write_palace_format_stamp_writes_and_never_downgrades(tmp_path):
+    """The stamp records our format version, and re-stamping from an older
+    version must not lower an existing higher stamp."""
+    import json
+
+    from mempalace.backends.chroma import PALACE_FORMAT_VERSION, write_palace_format_stamp
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    write_palace_format_stamp(str(palace))
+    stamp = json.loads((palace / "palace_format.json").read_text())
+    assert stamp["format_version"] == PALACE_FORMAT_VERSION
+
+    (palace / "palace_format.json").write_text(
+        json.dumps({"format_version": PALACE_FORMAT_VERSION + 5, "written_by": "future"})
+    )
+    write_palace_format_stamp(str(palace))
+    stamp = json.loads((palace / "palace_format.json").read_text())
+    assert stamp["format_version"] == PALACE_FORMAT_VERSION + 5
+
+
+def test_prepare_palace_for_open_writes_format_stamp(tmp_path):
+    """Every palace open funnels through ``_prepare_palace_for_open``; it must
+    leave the format stamp so any LATER older reader defers instead of
+    quarantining shapes it postdates."""
+    import json
+
+    from mempalace.backends.chroma import PALACE_FORMAT_VERSION
+
+    palace = tmp_path / "palace"
+    backend = ChromaBackend()
+    try:
+        backend.create_collection(str(palace), "mempalace_drawers")
+    finally:
+        backend.close()
+
+    stamp_path = palace / "palace_format.json"
+    assert stamp_path.exists()
+    stamp = json.loads(stamp_path.read_text())
+    assert stamp["format_version"] == PALACE_FORMAT_VERSION
+
+
 def test_quarantine_stale_hnsw_renames_truncated_metadata(tmp_path):
     """Segment with a truncated (under-floor-size) metadata file is
     quarantined — shape of a partial-flush during process kill."""

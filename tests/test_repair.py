@@ -1749,6 +1749,28 @@ def test_rebuild_from_sqlite_roundtrips_via_real_chromadb(tmp_path):
     assert closet_row["metadatas"][0] == {"wing": "alpha"}
 
 
+def test_rebuild_from_sqlite_dest_carries_format_stamp(tmp_path):
+    """Tripwire for the 2026-07-03 incident: a freshly rebuilt palace must
+    carry the format stamp from its very first open, so a consumer running
+    older mempalace defers instead of quarantining the new segments. Guards
+    against a refactor that writes the dest without going through
+    ``_prepare_palace_for_open``."""
+    import json
+
+    from mempalace.backends.chroma import PALACE_FORMAT_VERSION
+
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    rows = [(f"d{i}", f"body {i}", {"wing": "w", "room": "r"}) for i in range(5)]
+    _seed_palace(source, "mempalace_drawers", rows)
+
+    counts = repair.rebuild_from_sqlite(str(source), str(dest))
+    assert counts["mempalace_drawers"] == 5
+
+    stamp = json.loads((dest / "palace_format.json").read_text())
+    assert stamp["format_version"] == PALACE_FORMAT_VERSION
+
+
 def test_rebuild_from_sqlite_refuses_existing_dest(tmp_path):
     """Refuse to write into a directory that already exists when source
     and dest differ. Without this, an unattended re-run would silently

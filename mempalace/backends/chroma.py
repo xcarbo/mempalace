@@ -403,6 +403,8 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
     The original directory is renamed, not deleted, so recovery remains
     possible if the heuristic ever misfires.
     """
+    if _defer_quarantine_to_newer_writer(palace_path, "quarantine_stale_hnsw"):
+        return []
 
     db_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
@@ -1053,6 +1055,75 @@ def _missing_dimensionality_appears_recoverable(
         return False
 
 
+# ── Palace format stamp (stale-consumer guard) ───────────────────────────
+#
+# Incident 2026-07-03: a consumer running mempalace 3.3.5 opened a palace
+# freshly rebuilt by 3.5.0 and quarantined both valid vector segments —
+# its older quarantine heuristics read the newer on-disk shape (dim-None
+# metadata, chromadb 1.5.x Rust layout) as corruption. The quarantine
+# heuristics are version-coupled judgments about untrusted disk state, so
+# a reader must not destroy segments written under rules it postdates.
+#
+# Writers stamp ``palace_format.json`` with the format version they wrote.
+# Bump PALACE_FORMAT_VERSION whenever a change makes previously-invalid
+# on-disk shapes valid (new metadata shapes, new segment layouts). Readers
+# whose PALACE_FORMAT_VERSION is lower than the stamp warn and skip
+# quarantine entirely — vector search may degrade (the capacity probe
+# still routes to BM25), but nothing is renamed out from under the newer
+# writer. Older mempalace versions without this guard are unprotected;
+# the stamp protects every version from here forward.
+
+PALACE_FORMAT_VERSION = 1
+_PALACE_FORMAT_STAMP = "palace_format.json"
+
+
+def _stamped_palace_format_version(palace_path: str) -> Optional[int]:
+    """Return the stamped format version, or None when absent/unreadable."""
+    try:
+        with open(os.path.join(palace_path, _PALACE_FORMAT_STAMP), encoding="utf-8") as f:
+            stamp = json.load(f)
+        version = stamp.get("format_version")
+        return version if isinstance(version, int) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _palace_format_is_newer(palace_path: str) -> bool:
+    stamped = _stamped_palace_format_version(palace_path)
+    return stamped is not None and stamped > PALACE_FORMAT_VERSION
+
+
+def write_palace_format_stamp(palace_path: str) -> None:
+    """Record our format version in the palace. Never downgrades a higher
+    stamp — a palace already written by newer code keeps its newer stamp
+    so every older reader keeps deferring."""
+    stamped = _stamped_palace_format_version(palace_path)
+    if stamped is not None and stamped >= PALACE_FORMAT_VERSION:
+        return
+    from ..version import __version__
+
+    try:
+        with open(os.path.join(palace_path, _PALACE_FORMAT_STAMP), "w", encoding="utf-8") as f:
+            json.dump({"format_version": PALACE_FORMAT_VERSION, "written_by": __version__}, f)
+    except OSError:
+        logger.debug("Failed to write palace format stamp in %s", palace_path, exc_info=True)
+
+
+def _defer_quarantine_to_newer_writer(palace_path: str, caller: str) -> bool:
+    if not _palace_format_is_newer(palace_path):
+        return False
+    logger.warning(
+        "Palace %s was written by a newer mempalace (format %s > %s) — "
+        "%s is skipping quarantine; upgrade this consumer instead of "
+        "letting it judge segments it cannot read.",
+        palace_path,
+        _stamped_palace_format_version(palace_path),
+        PALACE_FORMAT_VERSION,
+        caller,
+    )
+    return True
+
+
 def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
     """Quarantine segment dirs whose ``index_metadata.pickle`` is unreadable or invalid.
 
@@ -1062,6 +1133,8 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
     out of the way before ``PersistentClient`` opens so Chroma can rebuild
     cleanly instead of touching known-bad metadata.
     """
+    if _defer_quarantine_to_newer_writer(palace_path, "quarantine_invalid_hnsw_metadata"):
+        return []
     try:
         entries = os.listdir(palace_path)
     except OSError:
@@ -2107,6 +2180,14 @@ class ChromaBackend(BaseBackend):
             quarantine_invalid_hnsw_metadata(palace_path)
             quarantine_stale_hnsw(palace_path)
             ChromaBackend._quarantined_paths.add(palace_path)
+        # Stamp after the quarantine pass so a stale consumer opening this
+        # palace later defers instead of quarantining shapes it postdates.
+        # PersistentClient creates the dir itself for a fresh palace, but the
+        # stamp must exist from the very first open (a freshly rebuilt palace
+        # is exactly the one a stale consumer destroys), so create it here.
+        with contextlib.suppress(OSError):
+            os.makedirs(palace_path, exist_ok=True)
+        write_palace_format_stamp(palace_path)
 
     @staticmethod
     def make_client(palace_path: str):
