@@ -1381,6 +1381,20 @@ def rebuild_from_sqlite(
                 print(f"    done: {upserted} rows in {cname}")
 
         print(f"\n  Rebuild complete. {sum(counts.values())} total rows.")
+
+        # The bulk upsert can leave the destination's FTS5 inverted index
+        # malformed (observed at ~90k rows), which the MCP startup
+        # integrity gate then refuses. Heal it here, from the intact
+        # content table, so a completed rebuild never strands the palace.
+        dest_errors = sqlite_integrity_errors(dest_palace)
+        if dest_errors:
+            remaining = maybe_autoheal_fts5_index(dest_palace, dest_errors)
+            if remaining:
+                print(
+                    "  WARNING: destination integrity errors persist after "
+                    f"FTS5 heal: {remaining[:3]}"
+                )
+
         if archive_path is not None:
             print(f"  Original palace archived at: {archive_path}")
         print(f"{'=' * 55}\n")
