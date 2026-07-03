@@ -1996,10 +1996,15 @@ def _make_fts5_palace(tmp_path, *, corrupt: bool) -> str:
         if corrupt:
             # Zero the last index segment leaf: quick_check then reports
             # "malformed inverted index" while the content table stays intact.
-            conn.execute(
-                "UPDATE embedding_fulltext_search_data SET block=zeroblob(length(block)) "
-                "WHERE id=(SELECT max(id) FROM embedding_fulltext_search_data)"
-            )
+            try:
+                conn.execute(
+                    "UPDATE embedding_fulltext_search_data SET block=zeroblob(length(block)) "
+                    "WHERE id=(SELECT max(id) FROM embedding_fulltext_search_data)"
+                )
+            except sqlite3.OperationalError as exc:
+                if "may not be modified" in str(exc):
+                    pytest.skip("this SQLite build refuses direct FTS5 shadow-table writes")
+                raise
             conn.commit()
     return str(tmp_path)
 
