@@ -1075,6 +1075,50 @@ def test_cmd_repair_error_reading_points_to_from_sqlite_not_remine(
 
 
 @patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_rebuild_index_dry_run_leaves_palace_untouched(
+    mock_config_cls, tmp_path, capsys
+):
+    """``repair rebuild-index --dry-run`` must not archive or rebuild anything.
+
+    Observed live 2026-07-03: the ``rebuild-index`` alias maps to
+    ``--mode from-sqlite --archive-existing`` but that branch never consulted
+    ``--dry-run``, so a dry run renamed the live palace to
+    ``palace.pre-rebuild-<ts>`` and started a real re-embed."""
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, repair_action="rebuild-index", dry_run=True, yes=True)
+    with patch("mempalace.repair.rebuild_from_sqlite") as mock_rebuild:
+        cmd_repair(args)
+    mock_rebuild.assert_not_called()
+    assert palace_dir.exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith("palace.pre-rebuild-")]
+    out = capsys.readouterr().out
+    assert "dry run" in out.lower()
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_from_sqlite_dry_run_leaves_palace_untouched(mock_config_cls, tmp_path, capsys):
+    """``repair --mode from-sqlite --dry-run`` takes the same guarded exit."""
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(
+        palace=None, mode="from-sqlite", archive_existing=True, dry_run=True, yes=True
+    )
+    with patch("mempalace.repair.rebuild_from_sqlite") as mock_rebuild:
+        cmd_repair(args)
+    mock_rebuild.assert_not_called()
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith("palace.pre-rebuild-")]
+    out = capsys.readouterr().out
+    assert "dry run" in out.lower()
+
+
+@patch("mempalace.cli.MempalaceConfig")
 def test_cmd_repair_zero_drawers(mock_config_cls, tmp_path, capsys):
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()

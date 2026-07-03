@@ -1137,6 +1137,14 @@ def cmd_repair(args):
         # No prompt when source != dest AND dest does not exist (pure
         # extract-into-fresh-dir case is non-destructive to existing
         # palaces).
+        if getattr(args, "dry_run", False):
+            print("\n  DRY RUN — no changes made.")
+            print(f"  Would rebuild from SQLite: {source_path}")
+            print(f"  Into palace: {palace_path}")
+            if archive_existing:
+                print(f"  Would archive existing palace to: {palace_path}.pre-rebuild-<timestamp>")
+            return
+
         is_destructive_to_dest = source_path == palace_path or os.path.exists(palace_path)
         if is_destructive_to_dest and not confirm_destructive_action(
             "Rebuild from SQLite", palace_path, assume_yes=getattr(args, "yes", False)
