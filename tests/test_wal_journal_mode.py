@@ -17,11 +17,14 @@ control, that ``delete`` mode *does* block under the same conditions).
 
 import os
 import sqlite3
+import subprocess
+import sys
 from contextlib import closing
 
 import chromadb
 
 from mempalace.backends.chroma import ChromaBackend, enable_wal_journal
+from mempalace.repair import sqlite_integrity_errors
 
 
 def _journal_mode(db_path: str) -> str:
@@ -109,6 +112,43 @@ def test_mode_ro_read_works_after_backend_close_on_wal_palace(tmp_path):
         assert os.path.getsize(db + "-wal") == 0
     with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
         assert conn.execute("PRAGMA quick_check").fetchone()[0].lower() == "ok"
+
+
+def test_repair_preflight_recovers_orphaned_wal(tmp_path):
+    """A mine aborted by the write-watchdog force-exits (``os._exit``) without
+    checkpointing, which can leave an orphaned ``-wal``. repair's
+    ``sqlite_integrity_errors`` preflight must fold that WAL back rather than let
+    the read-only (mode=ro) open fail and be misreported as SQLite corruption —
+    which would abort the very repair meant to recover the palace.
+    """
+    palace = tmp_path / "palace"
+    backend = ChromaBackend()
+    col = backend.get_collection(str(palace), "mempalace_drawers", create=True)
+    col.upsert(documents=["hello"], ids=["a"], metadatas=[{"wing": "w"}])
+    backend.close()
+    db = _db(palace)
+
+    # Simulate the hard-killed writer: commit a WAL frame with auto-checkpoint
+    # disabled, then os._exit without a clean close -> a populated, orphaned -wal.
+    child = (
+        "import sqlite3, os;"
+        f"c = sqlite3.connect({db!r});"
+        "c.execute('PRAGMA journal_mode=WAL');"
+        "c.execute('PRAGMA wal_autocheckpoint=0');"
+        "c.execute('CREATE TABLE IF NOT EXISTS _wd_probe(x)');"
+        "c.execute('INSERT INTO _wd_probe VALUES (1)');"
+        "c.commit();"
+        "os._exit(0)"
+    )
+    subprocess.run([sys.executable, "-c", child], check=True)
+    assert os.path.exists(db + "-wal") and os.path.getsize(db + "-wal") > 0, (
+        "precondition: an orphaned -wal must be present"
+    )
+
+    # Preflight recovers the WAL and finds an intact db (no false corruption).
+    assert sqlite_integrity_errors(str(palace)) == []
+    # And the orphaned -wal was folded back.
+    assert (not os.path.exists(db + "-wal")) or os.path.getsize(db + "-wal") == 0
 
 
 def test_status_reports_journal_mode_after_migration(tmp_path):

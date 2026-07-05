@@ -42,7 +42,7 @@ from typing import Callable, Iterator, Optional
 
 from chromadb.errors import NotFoundError as ChromaNotFoundError
 
-from .backends.chroma import ChromaBackend, hnsw_capacity_status
+from .backends.chroma import ChromaBackend, checkpoint_wal, hnsw_capacity_status
 from .config import sqlite_read_uri
 
 
@@ -536,6 +536,15 @@ def sqlite_integrity_errors(palace_path: str) -> list[str]:
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.exists(sqlite_path):
         return []
+
+    # A mine aborted by the write-watchdog force-exits via os._exit and cannot
+    # checkpoint, so it can leave an orphaned -wal. A read-only (mode=ro) open of
+    # a WAL database with an orphaned -wal fails with "unable to open database
+    # file", which this preflight would otherwise misreport as SQLite corruption
+    # and abort the very repair meant to recover things. Fold the WAL back first,
+    # best-effort: a no-op when there's no WAL, and genuine corruption still
+    # surfaces in the quick_check below.
+    checkpoint_wal(palace_path)
 
     try:
         with sqlite3.connect(sqlite_read_uri(sqlite_path), uri=True) as conn:
