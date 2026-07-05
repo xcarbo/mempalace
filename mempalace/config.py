@@ -485,6 +485,25 @@ class MempalaceConfig:
         """Mapping of hall names to keyword lists."""
         return self._file_config.get("hall_keywords", DEFAULT_HALL_KEYWORDS)
 
+    @property
+    def outbox(self) -> dict:
+        """Outbox config for the drawer-event webhook (xc-tracker push sync).
+
+        Empty/missing config disables the outbox. Env vars override the
+        file config per-field: MEMPALACE_OUTBOX_URL / _SECRET / _WINGS
+        (comma-separated).
+        """
+        block = dict(self._file_config.get("outbox", {}) or {})
+        if os.environ.get("MEMPALACE_OUTBOX_URL"):
+            block["url"] = os.environ["MEMPALACE_OUTBOX_URL"]
+        if os.environ.get("MEMPALACE_OUTBOX_SECRET"):
+            block["secret"] = os.environ["MEMPALACE_OUTBOX_SECRET"]
+        if os.environ.get("MEMPALACE_OUTBOX_WINGS"):
+            block["wings"] = [
+                w.strip() for w in os.environ["MEMPALACE_OUTBOX_WINGS"].split(",") if w.strip()
+            ]
+        return block
+
     @staticmethod
     def _try_coerce_int(value, minimum=None):
         """Coerce a raw config value to int, or ``None`` if it cannot be a

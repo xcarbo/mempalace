@@ -2303,6 +2303,12 @@ def tool_add_drawer(
                 )
             _metadata_cache = None
             logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
+            try:
+                from mempalace.outbox import emit as _outbox_emit
+
+                _outbox_emit(_config, wing, drawer_id, "added")
+            except Exception:
+                pass
             return {
                 "success": True,
                 "drawer_id": drawer_id,
@@ -2338,6 +2344,12 @@ def tool_add_drawer(
             )
         _metadata_cache = None
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
+        try:
+            from mempalace.outbox import emit as _outbox_emit
+
+            _outbox_emit(_config, wing, drawer_id, "added")
+        except Exception:
+            pass
         return {
             "success": True,
             "drawer_id": drawer_id,
@@ -2952,6 +2964,13 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
             logger.info("Updated drawer: %s (%s rows)", drawer_id, len(chunk_ids))
 
+            try:
+                from mempalace.outbox import emit as _outbox_emit
+
+                _outbox_emit(_config, new_meta.get("wing", ""), drawer_id, "updated")
+            except Exception:
+                pass
+
             return {
                 "success": True,
                 "drawer_id": drawer_id,
@@ -2970,6 +2989,13 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         _metadata_cache = None
 
         logger.info("Updated drawer: %s", drawer_id)
+
+        try:
+            from mempalace.outbox import emit as _outbox_emit
+
+            _outbox_emit(_config, new_meta.get("wing", ""), drawer_id, "updated")
+        except Exception:
+            pass
 
         return {
             "success": True,
