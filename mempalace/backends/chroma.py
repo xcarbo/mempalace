@@ -10,6 +10,8 @@ import pickle
 import re
 import shlex
 import sqlite3
+import sys
+import threading
 import time
 from collections import defaultdict
 from numbers import Integral
@@ -1498,6 +1500,114 @@ def _close_client(client) -> None:
         logger.debug("client.close() unavailable or failed", exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# Write watchdog — hard blast-radius bound on palace-mutating backend calls
+# ---------------------------------------------------------------------------
+#
+# A real incident: a ``mempalace mine --mode convos`` process hung for 4h45m
+# *inside* a native ChromaDB ``upsert`` — the Rust core (tokio workers + main
+# thread) all parked on a condition variable, the segment write never flushed
+# (chroma.sqlite3 mtime frozen for minutes), while the process still held
+# ``mine_palace_lock``. That lock is also ChromaDB's exclusive SQLite writer,
+# so every ``memp`` read across every project was jammed for the whole 4h45m.
+#
+# The native deadlock lives below the Python boundary and cannot be unwound
+# from here (raising into a wedged pthread_cond_wait does nothing). The only
+# guaranteed way to release the lock is to let the OS reclaim it — i.e. exit
+# the process. This watchdog arms a timer around each palace-mutating backend
+# call and, if the call has not returned within the configured budget,
+# force-exits via ``os._exit``. On process death the OS immediately releases
+# both the flock and the SQLite lock. Because ingest is append-only, the
+# in-flight (uncommitted) batch is discarded and the existing palace is
+# untouched — honouring the "a crash mid-write leaves the palace intact"
+# design principle.
+#
+# Bound is per backend write call (add/upsert/update/delete). A single convo
+# batch is <= 1000 chunks and completes in seconds-to-minutes; the default
+# budget is deliberately generous so it can only fire on a genuine wedge.
+
+_WRITE_WATCHDOG_ENV = "MEMPALACE_WRITE_WATCHDOG_SECONDS"
+_WRITE_WATCHDOG_DEFAULT_SECONDS = 600.0
+_WATCHDOG_EXIT_CODE = 75  # EX_TEMPFAIL — distinctive, non-zero
+
+
+def _write_watchdog_seconds() -> float:
+    """Per-write timeout budget in seconds.
+
+    Read from ``MEMPALACE_WRITE_WATCHDOG_SECONDS`` when set, else the default.
+    A value <= 0 (or unparseable-to-a-positive-number that is explicitly 0)
+    disables the watchdog entirely. Garbage falls back to the default so a
+    typo can never silently remove the guard.
+    """
+    raw = os.environ.get(_WRITE_WATCHDOG_ENV)
+    if raw is None:
+        return _WRITE_WATCHDOG_DEFAULT_SECONDS
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return _WRITE_WATCHDOG_DEFAULT_SECONDS
+    return val if val > 0 else 0.0
+
+
+def _watchdog_abort(op: str, palace_path: str, elapsed: float) -> None:
+    """Log loudly and force-exit the process to release the palace lock.
+
+    Module-level so tests can monkeypatch it. ``os._exit`` is deliberate: a
+    normal ``sys.exit`` would unwind Python but cannot interrupt the wedged
+    native call that is still holding the lock, so the interpreter would never
+    actually reach exit. ``os._exit`` hands control straight to the OS, which
+    reclaims the flock and the SQLite lock immediately.
+    """
+    msg = (
+        f"MemPalace write watchdog: backend '{op}' on palace {palace_path} "
+        f"exceeded {elapsed:.0f}s while holding the palace write lock — "
+        f"aborting the process to release the lock. Ingest is append-only, so "
+        f"the in-flight batch is discarded and the existing palace is intact. "
+        f"Re-run the mine to continue; raise {_WRITE_WATCHDOG_ENV} if this was "
+        f"a legitimately slow write."
+    )
+    logger.critical(msg)
+    try:
+        sys.stderr.write("\n" + msg + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(_WATCHDOG_EXIT_CODE)
+
+
+@contextlib.contextmanager
+def _write_watchdog(palace_path: str, op: str):
+    """Arm a force-exit timer around a palace-mutating backend call.
+
+    No-op when the budget is disabled (<= 0). The timer runs on a daemon
+    thread; on normal completion it is cancelled before it can fire. The
+    ``fired`` guard closes the tiny race where the timer and the finally
+    block run concurrently at the deadline.
+    """
+    timeout = _write_watchdog_seconds()
+    if timeout <= 0:
+        yield
+        return
+
+    fired = threading.Event()
+    started = time.monotonic()
+
+    def _on_expire():
+        if fired.is_set():
+            return
+        fired.set()
+        _watchdog_abort(op, palace_path, time.monotonic() - started)
+
+    timer = threading.Timer(timeout, _on_expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        fired.set()
+        timer.cancel()
+
+
 class ChromaCollection(BaseCollection):
     """Thin adapter translating ChromaDB dict returns into typed results.
 
@@ -1523,10 +1633,13 @@ class ChromaCollection(BaseCollection):
         self._palace_path = palace_path
 
     @contextlib.contextmanager
-    def _write_lock(self):
-        """Acquire ``mine_palace_lock`` for the configured palace, if any.
+    def _write_lock(self, op: str = "write"):
+        """Acquire ``mine_palace_lock`` for the configured palace, if any, and
+        arm the write watchdog around the underlying backend call.
 
-        No-op (yields immediately) when ``self._palace_path`` is None.
+        No-op (yields immediately) when ``self._palace_path`` is None: a
+        palace-less adapter holds no lock, so there is no cross-process blast
+        radius to bound. ``op`` names the operation for the watchdog's log.
         """
         if self._palace_path is None:
             yield
@@ -1535,7 +1648,8 @@ class ChromaCollection(BaseCollection):
         from ..palace import mine_palace_lock
 
         with mine_palace_lock(self._palace_path):
-            yield
+            with _write_watchdog(self._palace_path, op):
+                yield
 
     # ------------------------------------------------------------------
     # Writes
@@ -1599,7 +1713,7 @@ class ChromaCollection(BaseCollection):
             kwargs["metadatas"] = sanitized
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
-        with self._write_lock():
+        with self._write_lock("add"):
             self._collection.add(**kwargs)
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
@@ -1612,7 +1726,7 @@ class ChromaCollection(BaseCollection):
             kwargs["metadatas"] = sanitized
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
-        with self._write_lock():
+        with self._write_lock("upsert"):
             self._collection.upsert(**kwargs)
 
     def update(
@@ -1632,7 +1746,7 @@ class ChromaCollection(BaseCollection):
             kwargs["metadatas"] = metadatas
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
-        with self._write_lock():
+        with self._write_lock("update"):
             self._collection.update(**kwargs)
 
     # ------------------------------------------------------------------
@@ -1777,7 +1891,7 @@ class ChromaCollection(BaseCollection):
             kwargs["ids"] = ids
         if where is not None:
             kwargs["where"] = where
-        with self._write_lock():
+        with self._write_lock("delete"):
             self._collection.delete(**kwargs)
 
     def count(self):
