@@ -499,6 +499,27 @@ def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None)
         return None
 
 
+def sqlite_journal_mode(palace_path: str) -> Optional[str]:
+    """Return chroma.sqlite3's current ``PRAGMA journal_mode``, lowercased.
+
+    Read-only probe (the query form of the pragma never changes the mode).
+    ``status()`` uses it to report whether the WAL migration
+    (:func:`mempalace.backends.chroma.enable_wal_journal`) has taken effect.
+    WAL lets readers and a single writer proceed concurrently; the legacy
+    ``delete`` mode lets a long writer block all readers. Returns ``None`` on a
+    missing file or any sqlite error.
+    """
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(sqlite_path):
+        return None
+    try:
+        with sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True) as conn:
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+        return row[0].lower() if row and row[0] else None
+    except sqlite3.Error:
+        return None
+
+
 def sqlite_integrity_errors(palace_path: str) -> list[str]:
     """Return SQLite quick_check errors for chroma.sqlite3.
 
@@ -1436,6 +1457,13 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
         print(f"  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.\n")
         return {"status": "uninitialized", "message": "palace has no chroma.sqlite3 yet"}
 
+    journal_mode = sqlite_journal_mode(palace_path)
+    if journal_mode is not None:
+        print(f"  Journal mode: {journal_mode}", end="")
+        if journal_mode != "wal":
+            print(" (will auto-migrate to WAL on next palace open)", end="")
+        print()
+
     # Cheap collection-existence check via sqlite. By design this function
     # never opens a chromadb client (see the docstring); sqlite_drawer_count
     # reads chroma.sqlite3 directly and returns None on any schema/lock error
@@ -1477,7 +1505,7 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
             "  the MCP server and diary entries, which have no source file (#1843)."
         )
     print()
-    return {"drawers": drawers, "closets": closets}
+    return {"drawers": drawers, "closets": closets, "journal_mode": journal_mode}
 
 
 # ---------------------------------------------------------------------------

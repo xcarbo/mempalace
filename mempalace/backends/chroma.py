@@ -1356,6 +1356,120 @@ def _fix_missing_collection_type(palace_path: str) -> None:
         logger.exception("Could not write migration marker %s", marker)
 
 
+_WAL_ENABLED_MARKER = ".wal_enabled"
+
+
+def enable_wal_journal(palace_path: str) -> None:
+    """Switch the palace's ``chroma.sqlite3`` to WAL journal mode (idempotent).
+
+    Rationale: ChromaDB 1.5.x creates its backing SQLite database in the
+    default rollback journal mode (``journal_mode=delete``). In that mode a
+    single writer takes an EXCLUSIVE lock during its transaction/commit that
+    blocks EVERY reader — a long ``mempalace mine`` can freeze all ``memp``
+    reads across every project for the whole run (observed: a ~5h outage where
+    even ``list-drawers`` hung for minutes). WAL lets one writer and any number
+    of readers proceed concurrently, eliminating that class of outage.
+
+    WAL is persistent: once written to the SQLite header it survives process
+    exit and is honored by every subsequent connection — including ChromaDB's
+    own Rust core, which does NOT reset journal_mode on connect (verified
+    against chromadb 1.5.7: a manual ``PRAGMA journal_mode=WAL`` stays ``wal``
+    across a fresh ``PersistentClient`` open + write). A one-time PRAGMA per
+    palace is therefore sufficient; a marker file records success so later
+    opens skip the extra sqlite3 connection entirely (same lifecycle as
+    :func:`_fix_blob_seq_ids`).
+
+    Filesystem constraint — load-bearing: WAL coordinates readers and the
+    writer through a shared-memory ``-shm`` file backed by ``mmap`` and is NOT
+    safe on network filesystems (SMB/NFS). The palace must live on a local
+    disk (``~/.mempalace`` on internal SSD). On this machine there is a hard
+    rule that the palace never lives on the ``/Volumes/codeXD`` SMB mount —
+    do not enable WAL for a palace on a network mount.
+
+    Checkpointing: we rely on SQLite's built-in auto-checkpoint (every ~1000
+    WAL pages / ~4 MB by default), which keeps the ``-wal`` file bounded under
+    normal traffic with no manual WAL management; a clean close truncates it.
+
+    Failure is non-fatal: if the PRAGMA cannot be applied (returns anything
+    other than ``wal`` — e.g. an unsupported filesystem, or a transient error)
+    we log and return WITHOUT writing the marker, leaving the palace fully
+    usable in its existing journal mode and re-attempting on the next open. A
+    palace that never reaches WAL is slower under write contention, never
+    broken.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        # Brand-new palace: chromadb creates the DB lazily on first write, so
+        # there is nothing to convert yet. The create path re-invokes this
+        # after the collection (and thus the DB) exists.
+        return
+    marker = os.path.join(palace_path, _WAL_ENABLED_MARKER)
+    if os.path.isfile(marker):
+        return
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        logger.warning(
+            "Could not set WAL journal mode on %s; leaving journal mode unchanged",
+            db_path,
+            exc_info=True,
+        )
+        return
+    mode = (row[0] if row and row[0] else "").lower()
+    if mode != "wal":
+        logger.warning(
+            "PRAGMA journal_mode=WAL returned %r on %s (filesystem may not "
+            "support WAL); leaving journal mode unchanged",
+            mode,
+            db_path,
+        )
+        return
+    try:
+        Path(marker).touch()
+    except OSError:
+        logger.debug("Could not write WAL marker %s", marker, exc_info=True)
+
+
+def checkpoint_wal(palace_path: str) -> None:
+    """Truncate-checkpoint the palace's WAL so no orphaned ``-wal`` lingers.
+
+    A WAL database whose writer closed WITHOUT checkpointing leaves a populated
+    ``-wal`` / ``-shm`` pair with no live connection maintaining the shared
+    memory index. A subsequent *read-only* (``mode=ro``) open of such a database
+    fails with "unable to open database file" — SQLite must rebuild ``-shm`` to
+    apply the WAL and cannot under ``SQLITE_OPEN_READONLY``. MemPalace has many
+    ``mode=ro`` readers (repair preflight ``quick_check``, status, the
+    ``list``/wing-room sqlite fast-paths, ``extract_via_sqlite``), so when we
+    RELEASE a palace we fold the WAL back into the main db file. This both
+    restores ``mode=ro`` readability once the writer is gone and keeps the
+    ``-wal`` file bounded.
+
+    Concurrent readers/writers are unaffected: while a writer is live it keeps
+    ``-shm`` maintained, so ``mode=ro`` readers already work — this only matters
+    once the writer has let go.
+
+    Best-effort and non-fatal: a busy checkpoint (another live writer holds the
+    db) or any sqlite error is swallowed. Checkpointing never discards committed
+    frames, so the worst case is a slightly larger ``-wal``, never data loss. A
+    no-op on a rollback-journal (non-WAL) database.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        logger.debug("WAL checkpoint on %s failed (non-fatal)", db_path, exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Collection adapter
 # ---------------------------------------------------------------------------
@@ -2152,8 +2266,13 @@ class ChromaBackend(BaseBackend):
         """Run the pre-open safety pass shared by :meth:`make_client` and
         :meth:`_client`.
 
-        Four steps, all required before constructing a ``PersistentClient``:
+        Five steps, all required before constructing a ``PersistentClient``:
 
+        0. ``enable_wal_journal`` — flips an existing ``chroma.sqlite3`` to WAL
+           journal mode so a single writer no longer blocks all readers. No-op
+           on a brand-new palace whose DB does not exist yet (that case is
+           covered post-create in :meth:`get_collection`); idempotent and
+           marker-gated on already-migrated palaces.
         1. ``_fix_missing_collection_type`` — adds the ``_type`` marker to
            ``collections.config_json_str`` that chromadb 1.5.9+ requires
            but <= 1.5.8 never wrote (#1611).
@@ -2174,6 +2293,7 @@ class ChromaBackend(BaseBackend):
         re-open a palace. The ``_quarantined_paths`` gate prevents thrash on
         hot paths (e.g. ``_client()`` is called on every backend operation).
         """
+        enable_wal_journal(palace_path)
         _fix_missing_collection_type(palace_path)
         _fix_blob_seq_ids(palace_path)
         if palace_path not in ChromaBackend._quarantined_paths:
@@ -2278,6 +2398,12 @@ class ChromaBackend(BaseBackend):
                 if explanation:
                     raise ValueError(explanation) from e
                 raise
+        # A brand-new palace's chroma.sqlite3 did not exist when
+        # _prepare_palace_for_open ran (chromadb creates it lazily during the
+        # create/get above), so the pre-open WAL step was a no-op. Re-run it now
+        # that the DB exists so the very first writer runs under WAL, not just
+        # subsequent processes. Idempotent + marker-gated for existing palaces.
+        enable_wal_journal(palace_path)
         _pin_hnsw_threads(collection)
         return ChromaCollection(collection, palace_path=palace_path)
 
@@ -2294,12 +2420,19 @@ class ChromaBackend(BaseBackend):
             return
         _close_client(self._clients.pop(path, None))
         self._freshness.pop(path, None)
+        # Writer released: fold the WAL back so mode=ro readers can reopen and
+        # the -wal file stays bounded. Unconditional (even without a cached
+        # client) so an orphaned -wal left by another handle is cleaned up too.
+        checkpoint_wal(path)
 
     def close(self) -> None:
+        paths = list(self._clients.keys())
         for client in self._clients.values():
             _close_client(client)
         self._clients.clear()
         self._freshness.clear()
+        for path in paths:
+            checkpoint_wal(path)
         self._closed = True
 
     def health(self, palace: Optional[PalaceRef] = None) -> HealthStatus:
@@ -2338,6 +2471,8 @@ class ChromaBackend(BaseBackend):
             },
             **ef_kwargs,
         )
+        # Ensure a freshly-created palace comes up in WAL (see get_collection).
+        enable_wal_journal(palace_path)
         return ChromaCollection(collection, palace_path=palace_path)
 
 
