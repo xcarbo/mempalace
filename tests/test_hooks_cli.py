@@ -339,9 +339,9 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
     # Saves silently — systemMessage notification with themes, no block
     assert result["systemMessage"].startswith("\u2726 15 memories woven into the palace")
     assert "hooks" in result["systemMessage"]
-    # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
+    # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "sessions"
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="wing_sessions", toast=False, agent_name="claude"
+        str(transcript), "test", wing="sessions", toast=False, agent_name="claude"
     )
 
 
@@ -362,7 +362,7 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
             state_dir=tmp_path,
         )
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="wing_myproject", toast=False, agent_name="claude"
+        str(transcript), "test", wing="myproject", toast=False, agent_name="claude"
     )
 
 
@@ -537,21 +537,21 @@ def test_precompact_allows(tmp_path):
 
 def test_wing_from_transcript_path_extracts_project():
     path = "/home/jp/.claude/projects/-home-jp-Projects-memorypalace/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_memorypalace"
+    assert _wing_from_transcript_path(path) == "memorypalace"
 
 
 def test_wing_from_transcript_path_fallback():
-    assert _wing_from_transcript_path("/some/random/path.jsonl") == "wing_sessions"
+    assert _wing_from_transcript_path("/some/random/path.jsonl") == "sessions"
 
 
 def test_wing_from_transcript_path_windows_backslashes():
     path = "C:\\Users\\jp\\.claude\\projects\\-home-jp-Projects-myapp\\session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_myapp"
+    assert _wing_from_transcript_path(path) == "myapp"
 
 
 def test_wing_from_transcript_path_lowercases():
     path = "/home/jp/.claude/projects/-home-jp-Projects-MyProject/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_myproject"
+    assert _wing_from_transcript_path(path) == "myproject"
 
 
 def test_wing_from_transcript_path_non_projects_layout():
@@ -562,14 +562,14 @@ def test_wing_from_transcript_path_non_projects_layout():
     # truncating to the last token (which would drop ``MemPalace`` here and collide
     # with any other ``-mempalace`` leaf elsewhere on the system).
     path = "/home/igor/.claude/projects/-home-igor-dev-MemPalace-mempalace/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_mempalace_mempalace"
+    assert _wing_from_transcript_path(path) == "mempalace-mempalace"
 
 
 def test_wing_from_transcript_path_macos_users_layout():
     # macOS ~/ layout without a Projects/ segment — single-token project name
     # so the heuristic produces the same result as the leaf-only approach.
     path = "/Users/alice/.claude/projects/-Users-alice-code-MyApp/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_myapp"
+    assert _wing_from_transcript_path(path) == "myapp"
 
 
 def test_wing_from_transcript_path_nested_deep():
@@ -580,7 +580,7 @@ def test_wing_from_transcript_path_nested_deep():
     # path as the wing — collision-safe even if multiple clients have a
     # ``frontend/`` subdir.
     path = "/home/bob/.claude/projects/-home-bob-work-clients-acme-frontend/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_clients_acme_frontend"
+    assert _wing_from_transcript_path(path) == "clients-acme-frontend"
 
 
 # --- _wing_from_transcript_path: hyphenated project names (issue #1410) ---
@@ -589,13 +589,13 @@ def test_wing_from_transcript_path_nested_deep():
 def test_wing_from_transcript_path_hyphenated_claude_code():
     """Regression: ``claude-code`` was truncated to ``wing_code`` (#1410)."""
     path = "/Users/me/.claude/projects/-Users-me-claude-code/abc.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_claude_code"
+    assert _wing_from_transcript_path(path) == "claude-code"
 
 
 def test_wing_from_transcript_path_hyphenated_react_native():
     """Regression: ``react-native`` was truncated to ``wing_native`` (#1410)."""
     path = "/Users/me/.claude/projects/-Users-me-react-native/abc.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_react_native"
+    assert _wing_from_transcript_path(path) == "react-native"
 
 
 def test_wing_from_transcript_path_no_collision_between_hyphenated_siblings():
@@ -608,8 +608,8 @@ def test_wing_from_transcript_path_no_collision_between_hyphenated_siblings():
     admin = _wing_from_transcript_path(
         "/Users/me/.claude/projects/-Users-me-admin-portal/abc.jsonl"
     )
-    assert customer == "wing_customer_portal"
-    assert admin == "wing_admin_portal"
+    assert customer == "customer-portal"
+    assert admin == "admin-portal"
     assert customer != admin
 
 
@@ -617,7 +617,7 @@ def test_wing_from_transcript_path_strips_parent_dir_with_hyphenated_project():
     """Reporter's example: ``-home-alice-projects-react-native`` should keep
     the full project name after stripping the ``projects-`` parent (#1410)."""
     path = "/home/alice/.claude/projects/-home-alice-projects-react-native/abc.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_react_native"
+    assert _wing_from_transcript_path(path) == "react-native"
 
 
 # --- _wing_from_transcript_path: cwd-from-JSONL primary path ---
@@ -628,7 +628,7 @@ def test_wing_from_transcript_path_uses_cwd_from_jsonl(tmp_path):
     even if the encoded folder name would have produced a different (and
     noisier) wing."""
     # Encoded folder says ``-home-igor-dev-MemPalace-mempalace`` (would yield
-    # ``wing_mempalace_mempalace`` via fallback), but cwd is the truth.
+    # ``mempalace-mempalace`` via fallback), but cwd is the truth.
     project_dir = tmp_path / "-home-igor-dev-MemPalace-mempalace"
     project_dir.mkdir()
     transcript = project_dir / "session.jsonl"
@@ -637,7 +637,7 @@ def test_wing_from_transcript_path_uses_cwd_from_jsonl(tmp_path):
         '{"type":"user","cwd":"/home/igor/dev/MemPalace/mempalace","content":"hi"}\n',
         encoding="utf-8",
     )
-    assert _wing_from_transcript_path(str(transcript)) == "wing_mempalace"
+    assert _wing_from_transcript_path(str(transcript)) == "mempalace"
 
 
 def test_wing_from_transcript_path_cwd_with_hyphenated_project(tmp_path):
@@ -650,7 +650,7 @@ def test_wing_from_transcript_path_cwd_with_hyphenated_project(tmp_path):
         '{"type":"user","cwd":"/Users/me/git/claude-code","content":"hi"}\n',
         encoding="utf-8",
     )
-    assert _wing_from_transcript_path(str(transcript)) == "wing_claude_code"
+    assert _wing_from_transcript_path(str(transcript)) == "claude-code"
 
 
 def test_wing_from_transcript_path_cwd_skips_lines_without_cwd(tmp_path):
@@ -668,7 +668,7 @@ def test_wing_from_transcript_path_cwd_skips_lines_without_cwd(tmp_path):
     ]
     transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
     # First cwd record wins (line 4, real-project).
-    assert _wing_from_transcript_path(str(transcript)) == "wing_real_project"
+    assert _wing_from_transcript_path(str(transcript)) == "real-project"
 
 
 def test_wing_from_transcript_path_cwd_falls_back_when_no_cwd_in_jsonl(tmp_path):
@@ -682,10 +682,10 @@ def test_wing_from_transcript_path_cwd_falls_back_when_no_cwd_in_jsonl(tmp_path)
         encoding="utf-8",
     )
     # tmp_path leaks into the path before .claude/projects, so the regex
-    # won't match and we hit the wing_sessions default. The point of this
+    # won't match and we hit the "sessions" default. The point of this
     # test: the cwd reader doesn't crash and returns None cleanly.
     result = _wing_from_transcript_path(str(transcript))
-    assert result == "wing_sessions"
+    assert result == "sessions"
 
 
 def test_wing_from_transcript_path_cwd_handles_malformed_jsonl(tmp_path):
@@ -699,13 +699,13 @@ def test_wing_from_transcript_path_cwd_handles_malformed_jsonl(tmp_path):
         '{"type":"valid","cwd":"/Users/me/git/clean-name","content":"ok"}\n',
         encoding="utf-8",
     )
-    assert _wing_from_transcript_path(str(transcript)) == "wing_clean_name"
+    assert _wing_from_transcript_path(str(transcript)) == "clean-name"
 
 
 def test_wing_from_transcript_path_cwd_handles_missing_file():
     """Nonexistent transcript path falls back cleanly to the encoded heuristic."""
     path = "/Users/me/.claude/projects/-Users-me-claude-code/does-not-exist.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_claude_code"
+    assert _wing_from_transcript_path(path) == "claude-code"
 
 
 def test_wing_from_transcript_path_cwd_handles_non_string_cwd(tmp_path):
@@ -719,7 +719,7 @@ def test_wing_from_transcript_path_cwd_handles_non_string_cwd(tmp_path):
         '{"type":"x","cwd":"/Users/me/git/proper-name"}\n',
         encoding="utf-8",
     )
-    assert _wing_from_transcript_path(str(transcript)) == "wing_proper_name"
+    assert _wing_from_transcript_path(str(transcript)) == "proper-name"
 
 
 # --- _log ---
@@ -1933,7 +1933,7 @@ def test_session_end_uses_detached_paths_not_sync_mine(tmp_path):
     mock_auto.assert_called_once()
     mock_sync.assert_not_called()
     mock_save.assert_called_once_with(
-        expected_path, "sess", wing="wing_sessions", toast=False, agent_name="claude"
+        expected_path, "sess", wing="sessions", toast=False, agent_name="claude"
     )
     # The session is over; its per-session save marker is cleared.
     assert not last_save_file.exists()

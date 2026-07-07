@@ -995,8 +995,13 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                     pass
                 project = cwd_norm.rsplit("/", 1)[-1]
                 if project:
-                    slug = project.lower().replace(" ", "_").replace("-", "_")
-                    return f"wing_{slug}"
+                    # Bare hyphenated leaf (e.g. ``cc``, ``hunt-1``) — matches
+                    # the palace convention used by deliberate writes, so hook
+                    # checkpoints land in the same wing instead of a
+                    # ``wing_*`` splinter. No registry gate: hook saves must
+                    # never fail on an unregistered wing (the write path
+                    # creates it).
+                    return project.lower().replace(" ", "-")
     except OSError:
         pass
     return None
@@ -1017,15 +1022,18 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
        → ``-Users-me-code-foo``), so the original directory boundaries are
        lost. We strip the platform user-home prefix (``Users-<user>-`` or
        ``home-<user>-``) and one common parent-dir token (``git-``, ``dev-``,
-       ``projects-``, etc.), then convert the remaining dashes to
-       underscores. Unlike the previous "last token only" heuristic, this
-       never silently truncates a hyphenated project folder name like
-       ``claude-code``, ``react-native``, or ``customer-portal``.
+       ``projects-``, etc.), keeping the remaining dashes. Unlike the
+       previous "last token only" heuristic, this never silently truncates a
+       hyphenated project folder name like ``claude-code``, ``react-native``,
+       or ``customer-portal``.
 
     3. LEGACY — Match an explicit ``-Projects-<name>`` segment for
        transcripts not under the standard Claude Code projects dir.
 
-    4. DEFAULT — ``wing_sessions``.
+    4. DEFAULT — ``sessions``.
+
+    All paths return the bare hyphenated wing name (palace convention;
+    no ``wing_`` prefix) — a ``.palace-wing`` pin file still wins.
 
     Closes #1410.
     """
@@ -1047,24 +1055,24 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
         if m:
             encoded = m.group(1)
         # Strip one common parent-dir token if present, keeping the rest as
-        # the project path. Hyphens become underscores to preserve
-        # uniqueness for hyphenated project folder names.
+        # the project path. Hyphens are preserved (bare-wing convention);
+        # path-separator dashes and project-name hyphens are already
+        # indistinguishable in the encoded form.
         for prefix in _ENCODED_PARENT_PREFIXES:
             if encoded.startswith(prefix):
                 encoded = encoded[len(prefix) :]
                 break
-        project = encoded.lower().replace(" ", "_").replace("-", "_")
+        project = encoded.lower().replace(" ", "-")
         if project:
-            return f"wing_{project}"
+            return project
 
     # 3. Legacy — explicit -Projects-<name> segment
     match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
     if match:
-        project = match.group(1).lower().replace(" ", "_").replace("-", "_")
-        return f"wing_{project}"
+        return match.group(1).lower().replace(" ", "-")
 
     # 4. Default
-    return "wing_sessions"
+    return "sessions"
 
 
 def hook_stop(data: dict, harness: str):

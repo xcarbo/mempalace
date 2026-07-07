@@ -92,6 +92,66 @@ _HOOK_LINE_RE = re.compile(
 # "… +N lines" collapsed-output marker, line-anchored.
 _COLLAPSED_LINES_RE = re.compile(r"(?m)^(?:> )?…\s*\+\d+ lines.*\n?")
 
+# ─── Hook-injected context & search-result echoes ────────────────────────
+# The MemPalace SessionStart hook injects palace context ("MEMPALACE SESSION
+# CONTEXT ..."), and `memp search` output gets echoed back through tool
+# results. Mining either re-files palace content as new drawers (echo
+# pollution). These blocks span blank lines, so the generic blank-line-bounded
+# tag patterns above never remove them — they get their own, marker-gated
+# patterns here.
+
+_INJECTED_CONTEXT_MARKER = "MEMPALACE SESSION CONTEXT"
+
+# <system-reminder> block that carries the hook-injected session context.
+# Allowed to cross blank lines ONLY because the marker gates it; bounded by
+# the nearest closing tag so a dangling open tag can't eat unrelated text.
+_INJECTED_REMINDER_RE = re.compile(
+    r"(?m)^(?:> )?<system-reminder(?:\s[^>]*)?>"
+    r"(?:(?!</system-reminder>)[\s\S])*?"
+    + re.escape(_INJECTED_CONTEXT_MARKER)
+    + r"[\s\S]*?</system-reminder>[ \t]*\n?"
+)
+
+# Superpowers/plugin injection block — machine-generated, always tag-closed.
+_INJECTED_IMPORTANT_RE = re.compile(
+    r"(?m)^(?:> )?<EXTREMELY_IMPORTANT>[\s\S]*?</EXTREMELY_IMPORTANT>[ \t]*\n?"
+)
+
+# Rendered `memp search` dump: a `====...` banner line immediately followed by
+# `Results for: "..."`. In tool results every dump line carries the `→ `
+# prefix; raw CLI pastes indent everything or use banner/separator lines.
+_SEARCH_DUMP_BANNER_RE = re.compile(r"^(?:> )?(?:→ )?={20,}\s*$")
+_SEARCH_DUMP_QUERY_RE = re.compile(r'^(?:> )?(?:→ )?\s*Results for: ".*"')
+_SEARCH_DUMP_BODY_RE = re.compile(r"^(?:> )?(?:→ |[ \t]|─|={20,}\s*$|$)")
+
+
+def _strip_search_dumps(text: str) -> str:
+    """Remove rendered ``memp search`` result dumps (echo pollution).
+
+    A dump starts at a ``====`` banner line whose next line is the
+    ``Results for: "..."`` header, and runs while lines still look like
+    rendered search output (tool-result ``→ `` prefix, indented result
+    text, separators, banners, or blanks). The first ordinary line ends
+    the dump, so surrounding content is kept.
+    """
+    lines = text.split("\n")
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if (
+            _SEARCH_DUMP_BANNER_RE.match(lines[i])
+            and i + 1 < n
+            and _SEARCH_DUMP_QUERY_RE.match(lines[i + 1])
+        ):
+            i += 2
+            while i < n and _SEARCH_DUMP_BODY_RE.match(lines[i]):
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
 
 def strip_noise(text: str) -> str:
     """Remove system tags, hook output, and Claude Code UI chrome from text.
@@ -99,12 +159,26 @@ def strip_noise(text: str) -> str:
     All patterns are line-anchored. User prose that happens to mention these
     strings inline (e.g., documenting them) is preserved verbatim.
     """
+    # Marker-gated multi-line blocks first, so the injected session context
+    # (which spans blank lines) is gone before the blank-line-bounded
+    # generic tag patterns run.
+    text = _INJECTED_REMINDER_RE.sub("", text)
+    text = _INJECTED_IMPORTANT_RE.sub("", text)
     for pat in _NOISE_TAG_PATTERNS:
         text = pat.sub("", text)
     for pat in _NOISE_LINE_PATTERNS:
         text = pat.sub("", text)
     text = _HOOK_LINE_RE.sub("", text)
     text = _COLLAPSED_LINES_RE.sub("", text)
+    text = _strip_search_dumps(text)
+    # A message that IS the injected session context (delivered untagged,
+    # e.g. via additionalContext) is dropped wholesale — but only when the
+    # marker opens the message, so user text mentioning it survives.
+    first_line = text.lstrip().split("\n", 1)[0]
+    if first_line.startswith("> "):
+        first_line = first_line[2:]
+    if first_line.startswith(_INJECTED_CONTEXT_MARKER):
+        return ""
     # Strip the Claude Code collapsed-output chrome "[N tokens] (ctrl+o to expand)".
     # Narrow shape — a bare "(ctrl+o to expand)" in user prose stays intact.
     text = re.sub(r"\s*\[\d+\s+tokens?\]\s*\(ctrl\+o to expand\)", "", text)

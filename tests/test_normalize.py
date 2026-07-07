@@ -1941,3 +1941,124 @@ def test_pi_jsonl_invalid_lines_skipped():
     ]
     result = _try_pi_jsonl("\n".join(lines))
     assert result is not None
+
+
+# ── strip_noise() — hook-injected context & search-result echoes ────────
+
+
+class TestStripInjectedSessionContext:
+    """Hook-injected palace context must never be re-mined (echo pollution)."""
+
+    def test_strips_reminder_wrapped_context_spanning_blank_lines(self):
+        # The SessionStart injection contains blank lines, so the generic
+        # blank-line-bounded tag pattern never removed it.
+        text = (
+            "<system-reminder>\n"
+            "MEMPALACE SESSION CONTEXT (read-only — do not save this back to palace):\n"
+            "\n"
+            "## L0 — IDENTITY\n"
+            "\n"
+            "User: Chris, solo developer.\n"
+            "</system-reminder>\n"
+            "> Real question here."
+        )
+        out = strip_noise(text)
+        assert "MEMPALACE SESSION CONTEXT" not in out
+        assert "L0 — IDENTITY" not in out
+        assert "Real question here." in out
+
+    def test_strips_message_that_is_the_bare_injected_context(self):
+        # additionalContext delivered untagged as its own message chunk.
+        text = (
+            "MEMPALACE SESSION CONTEXT (read-only — do not save this back to palace):\n"
+            "\n"
+            "## PROJECT ROADMAP (cc) — canonical, pinned\n"
+            "Phase 3: ship it."
+        )
+        assert strip_noise(text) == ""
+
+    def test_keeps_user_prose_mentioning_the_marker_mid_message(self):
+        text = (
+            "> Why does MEMPALACE SESSION CONTEXT keep showing up in drawers?\n"
+            "Because the hook injects it every session."
+        )
+        assert strip_noise(text) == text.strip()
+
+    def test_strips_extremely_important_block(self):
+        text = (
+            "<EXTREMELY_IMPORTANT>\n"
+            "You have superpowers.\n"
+            "\n"
+            "**Below is the full content of your skill.**\n"
+            "</EXTREMELY_IMPORTANT>\n"
+            "> Actual user message."
+        )
+        out = strip_noise(text)
+        assert "superpowers" not in out
+        assert "Actual user message." in out
+
+    def test_reminder_without_marker_still_blank_line_bounded(self):
+        # A multi-paragraph system-reminder WITHOUT the marker keeps the old
+        # conservative behavior (no blank-line crossing) — span-safety wins.
+        text = (
+            "> User 1: content <system-reminder>A\n"
+            "\n"
+            "> User 2: more content</system-reminder> tail"
+        )
+        out = strip_noise(text)
+        assert "User 2: more content" in out
+
+
+class TestStripSearchDumps:
+    """Rendered `memp search` output echoed via tool results must be dropped."""
+
+    _DUMP = (
+        "→ ============================================================\n"
+        '→   Results for: "strip hook-injected"\n'
+        "→   Wing: mempalace\n"
+        "→ ============================================================\n"
+        "→ \n"
+        "→   [1] mempalace / follow-ups\n"
+        "→       Source: follow-up.md\n"
+        "→       Match:  cosine_sim=0.275  bm25=0.891\n"
+        "→ \n"
+        "→       drawer body text that must not be re-mined\n"
+        "→ \n"
+        "→   ────────────────────────────────────────────────────────\n"
+    )
+
+    def test_strips_tool_result_search_dump_keeps_surroundings(self):
+        text = "[Bash] memp search 'strip hook-injected'\n" + self._DUMP + "Next assistant text."
+        out = strip_noise(text)
+        assert "Results for:" not in out
+        assert "cosine_sim" not in out
+        assert "must not be re-mined" not in out
+        assert "Next assistant text." in out
+
+    def test_strips_raw_cli_paste_dump(self):
+        text = (
+            "============================================================\n"
+            '  Results for: "auth patterns"\n'
+            "============================================================\n"
+            "\n"
+            "  [1] cc / decisions\n"
+            "      Match:  cosine_sim=0.4  bm25=1.2\n"
+            "\n"
+            "      old drawer content\n"
+            "\n"
+            "  ────────────────────────────────────────\n"
+            "\n"
+            "Unindented follow-up sentence survives."
+        )
+        out = strip_noise(text)
+        assert "Results for:" not in out
+        assert "old drawer content" not in out
+        assert "Unindented follow-up sentence survives." in out
+
+    def test_banner_without_results_header_untouched(self):
+        text = "============================\nJust a markdown divider fan.\n"
+        assert strip_noise(text) == text.strip()
+
+    def test_prose_mentioning_results_for_untouched(self):
+        text = '> The banner says Results for: "x" — why?\nGood question.'
+        assert strip_noise(text) == text.strip()
