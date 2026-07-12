@@ -1092,6 +1092,64 @@ def cmd_repair_status(args):
     repair_status(palace_path=palace_path)
 
 
+def cmd_locks(args):
+    """Inspect ~/.mempalace/locks: holders, ages, residues; --gc sweeps residues."""
+    import json
+
+    from .locks import gc_stale_locks, list_locks, locks_dir
+
+    gc_removed = None
+    if args.gc:
+        gc_removed = gc_stale_locks()
+    entries = list_locks()
+
+    if args.json:
+        print(
+            json.dumps(
+                {"locks_dir": locks_dir(), "gc_removed": gc_removed, "locks": entries},
+                indent=2,
+            )
+        )
+        return
+
+    if gc_removed is not None:
+        print(f"GC'd {gc_removed} residual lock file(s) from {locks_dir()}")
+    if not entries:
+        print(f"No lock files in {locks_dir()}")
+        return
+
+    def _fmt(value, dash="-"):
+        if value is None:
+            return dash
+        if value is True:
+            return "yes"
+        if value is False:
+            return "no"
+        return str(value)
+
+    header = ("NAME", "SIZE", "MTIME", "HELD", "PID", "ALIVE", "ACQUIRED", "ARGV")
+    rows = [header]
+    for e in entries:
+        argv = " ".join(e["argv"]) if e.get("argv") else "-"
+        rows.append(
+            (
+                e["name"],
+                str(e["size"]),
+                e["mtime"],
+                _fmt(e["held"], dash="?"),
+                _fmt(e["pid"]),
+                _fmt(e["pid_alive"], dash="?" if e.get("pid") else "-"),
+                _fmt(e.get("acquired_at")),
+                argv,
+            )
+        )
+    widths = [max(len(row[i]) for row in rows) for i in range(len(header))]
+    for row in rows:
+        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+    held = sum(1 for e in entries if e["held"])
+    print(f"\n{len(entries)} lock file(s), {held} held, in {locks_dir()}")
+
+
 def cmd_repair(args):
     """Rebuild palace vector index from SQLite metadata.
 
@@ -2045,6 +2103,21 @@ def main():
     )
     p_migrate_wings.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
 
+    p_locks = sub.add_parser(
+        "locks",
+        help="Inspect ~/.mempalace/locks — holder PID/argv/age per lock file (--gc sweeps residues)",
+    )
+    p_locks.add_argument(
+        "--json",
+        action="store_true",
+        help="Machine-readable JSON output",
+    )
+    p_locks.add_argument(
+        "--gc",
+        action="store_true",
+        help="Safely remove residual lock files (unheld AND 0-byte or dead holder) before listing",
+    )
+
     p_status = sub.add_parser("status", help="Show what's been filed")
     p_status.add_argument(
         "--backend",
@@ -2197,6 +2270,7 @@ def main():
         "mcp": cmd_mcp,
         "compress": cmd_compress,
         "wake-up": cmd_wakeup,
+        "locks": cmd_locks,
         "repair": cmd_repair,
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,

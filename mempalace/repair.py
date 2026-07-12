@@ -30,6 +30,7 @@ Usage (from CLI):
 """
 
 import argparse
+import logging
 import os
 import shutil
 import sqlite3
@@ -653,9 +654,20 @@ def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=p
                 )
                 conn.commit()
     except MineAlreadyRunning as exc:
-        progress(
-            f"  Skipped FTS5 rebuild: palace is being written by another process ({exc}). "
-            "Stop it and re-run."
+        # Loud on purpose (2026-07-10 outage): an orphaned lock-holder here
+        # silently downgraded a 9-second in-place FTS5 rebuild into a
+        # recommendation for a full re-embed. ``exc`` already carries the
+        # rich holder diagnostics (pid, alive?, cmdline, held-for).
+        skip_msg = (
+            "\n  WARNING: skipped the in-place FTS5 rebuild — the palace mine lock is held.\n"
+            f"  Holder: {exc}\n"
+            "  Clear the orphan lock-holder FIRST, then re-run repair — otherwise the\n"
+            "  light FTS5 fix is skipped and a full re-embed will be recommended\n"
+            "  needlessly. Inspect holders with `memp locks`."
+        )
+        progress(skip_msg)
+        logging.getLogger("mempalace_mcp").warning(
+            "FTS5 autoheal skipped: mine lock held (%s)", exc
         )
         return errors
     except Exception as exc:

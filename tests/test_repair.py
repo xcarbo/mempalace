@@ -2147,6 +2147,36 @@ def test_maybe_autoheal_fts5_index_skips_when_palace_is_being_mined(tmp_path):
     assert repair.sqlite_integrity_errors(palace) == errors
 
 
+def test_maybe_autoheal_fts5_index_skip_is_loud_and_names_holder(tmp_path):
+    """2026-07-10 outage hardening: a lock-held skip must be prominent.
+
+    While an orphaned process held the mine lock, the light in-place FTS5
+    rebuild was skipped with a quiet one-liner and the operator was pushed
+    toward a needless full re-embed. The skip must now surface the holder
+    diagnostics and say to clear the lock-holder first, then re-run repair.
+    """
+    from mempalace.palace import MineAlreadyRunning
+
+    palace = _make_fts5_palace(tmp_path, corrupt=True)
+    errors = repair.sqlite_integrity_errors(palace)
+
+    holder_diag = (
+        "palace /p is held by PID 23392 (memp mine ~/code), alive, "
+        "parent PID 1, lock held for 4h 02m"
+    )
+    messages = []
+    with patch("mempalace.palace.mine_palace_lock", side_effect=MineAlreadyRunning(holder_diag)):
+        remaining = repair.maybe_autoheal_fts5_index(palace, errors, progress=messages.append)
+
+    assert remaining == errors  # behavior unchanged: still skipped, still aborts
+    joined = "\n".join(messages)
+    assert "WARNING" in joined
+    assert "PID 23392" in joined  # holder diagnostics are surfaced verbatim
+    assert "Clear the orphan lock-holder FIRST" in joined
+    assert "re-run repair" in joined
+    assert "full re-embed" in joined
+
+
 def test_rebuild_index_preflight_autoheals_isolated_fts5_then_proceeds(tmp_path, monkeypatch):
     """The preflight no longer hard-aborts on isolated FTS5 corruption (#1596):
     it rebuilds the index, then continues into the rebuild path."""

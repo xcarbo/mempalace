@@ -97,6 +97,20 @@ def test_mine_lock_close_failure_still_runs_cleanup(monkeypatch):
     events = []
 
     class FakeLock:
+        # mine_lock writes a holder record (pid/argv/acquire-time) into the
+        # lock body right after acquire — accept those writes as no-ops.
+        def seek(self, _offset):
+            pass
+
+        def truncate(self, _size):
+            pass
+
+        def write(self, _data):
+            pass
+
+        def flush(self):
+            pass
+
         def close(self):
             events.append("close")
             raise OSError("close failed")

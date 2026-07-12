@@ -9,7 +9,6 @@ import hashlib
 import logging
 import os
 import re
-import sys
 import threading
 from typing import Optional
 
@@ -27,6 +26,13 @@ from .backends import (
 )
 from .backends.embedding_wrapper import EmbeddingCollection
 from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
+from .locks import (
+    ORPHAN_GUIDANCE,
+    describe_holder,
+    maybe_gc_stale_locks,
+    read_holder_record,
+    write_holder_record,
+)
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -730,8 +736,12 @@ def mine_lock(source_file: str):
     Prevents multiple agents from mining the same file simultaneously,
     which causes duplicate drawers when the delete+insert cycle interleaves.
     """
+    maybe_gc_stale_locks()
     lock_path = _mine_lock_path(source_file)
     lf = _acquire_mine_lock_file(lock_path)
+    # Record identity so a contender (or the residue GC after a crash) can
+    # tell who held this file lock — leftover files are otherwise 0-byte.
+    write_holder_record(lf)
     try:
         yield
     finally:
@@ -993,55 +1003,26 @@ def _mark_released(lock_key: str) -> None:
     _holder_state().discard(lock_key)
 
 
-def _format_lock_holder(content: str) -> str:
-    """Render a lock-file body as 'PID N (cmdline)' for diagnostic messages."""
-    parts = content.split(maxsplit=1)
-    if not parts or not parts[0].isdigit():
-        return "another writer (identity not recorded)"
-    pid = parts[0]
-    if len(parts) > 1 and parts[1].strip():
-        return f"PID {pid} ({parts[1].strip()})"
-    return f"PID {pid}"
-
-
-# Byte 0 of the lock file is reserved as the OS lock sentinel.
-# Holder identity is written from byte 1 onward so contenders can read
-# the identity without colliding with byte 0 (Windows msvcrt.locking
-# blocks both reads and writes on the locked byte).
-_LOCK_SENTINEL_BYTES = 1
-
-
-def _read_lock_holder(lock_file) -> str:
-    """Read the prior holder's identity from the lock-file body, best-effort."""
-    try:
-        lock_file.seek(_LOCK_SENTINEL_BYTES)
-        content = lock_file.read()
-        if isinstance(content, bytes):
-            content = content.decode("utf-8", errors="replace")
-        content = content.strip()
-    except OSError:
-        return "another writer (identity not recorded)"
-    if not content:
-        return "another writer (identity not recorded)"
-    return _format_lock_holder(content)
-
-
 def _write_lock_holder(lock_file) -> None:
     """Record this process's identity in the lock-file body. Best-effort.
 
-    Writes from byte 1 onward; byte 0 is the lock sentinel and must not
-    be touched after acquire (truncating it on Windows can interact
-    badly with the active byte-range lock).
+    Delegates to :func:`mempalace.locks.write_holder_record`: a JSON record
+    with pid/ppid/argv and an ISO acquire timestamp, written from byte 1
+    onward — byte 0 is the lock sentinel and must not be touched after
+    acquire (truncating it on Windows can interact badly with the active
+    byte-range lock). Kept as a named wrapper because external callers and
+    tests import it from this module.
     """
-    try:
-        ident = f"{os.getpid()} {' '.join(sys.argv[:3])}".strip()
-        ident_bytes = ident.encode("utf-8")
-        lock_file.seek(_LOCK_SENTINEL_BYTES)
-        lock_file.truncate(_LOCK_SENTINEL_BYTES + len(ident_bytes))
-        lock_file.write(ident_bytes)
-        lock_file.flush()
-    except (OSError, UnicodeError):
-        pass
+    write_holder_record(lock_file)
+
+
+def _palace_contention_error(resolved: str, lock_path: str, lock_file) -> "MineAlreadyRunning":
+    """Build the rich MineAlreadyRunning for a failed palace-lock acquire."""
+    holder = describe_holder(lock_path, read_holder_record(lock_file))
+    return MineAlreadyRunning(
+        f"palace {resolved} is held by {holder}; "
+        "wait for it to finish or stop the holder before retrying; " + ORPHAN_GUIDANCE
+    )
 
 
 @contextlib.contextmanager
@@ -1087,6 +1068,11 @@ def mine_palace_lock(palace_path: str):
         yield
         return
 
+    # Sweep provable lock residues (unheld AND 0-byte-or-dead-holder) before
+    # acquiring; the 2026-07-10 outage left ~2,200 such files behind. Runs at
+    # most once per process, so per-write acquires don't rescan the dir.
+    maybe_gc_stale_locks(lock_dir)
+
     # Ensure the file exists, then open r+ so we can both read the prior
     # holder's identity (for failure diagnostics) and write our own. "w"
     # truncates and erases the prior holder. "a+" puts the position at EOF,
@@ -1094,44 +1080,50 @@ def mine_palace_lock(palace_path: str):
     # *current* position, so two contenders end up locking different bytes
     # and silently both acquire — observed as Windows-CI lock test
     # failures during #1264 development).
-    if not os.path.exists(lock_path):
-        # Touch atomically: O_CREAT|O_EXCL would fail if a concurrent
-        # contender just created it, which is fine — we proceed to open.
+    #
+    # The acquire loops because the residue GC can unlink the inode we opened
+    # between our open() and lock — the same currency protocol as
+    # ``_acquire_mine_lock_file``: after any lock outcome, verify the fd still
+    # matches the pathname and retry on the fresh file when it doesn't.
+    while True:
+        if not os.path.exists(lock_path):
+            # Touch atomically: O_CREAT|O_EXCL would fail if a concurrent
+            # contender just created it, which is fine — we proceed to open.
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
+                os.close(fd)
+            except FileExistsError:
+                pass
+        lf = open(lock_path, "r+b")
+        acquired = False
         try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
-            os.close(fd)
-        except FileExistsError:
-            pass
-    lf = open(lock_path, "r+b")
-    acquired = False
+            # Locks byte 0 explicitly (msvcrt is byte-position dependent;
+            # fcntl.flock is whole-file and the seek is harmless there).
+            acquired = _lock_mine_lock_file(lf, blocking=False)
+            if not acquired:
+                if not _mine_lock_file_is_current(lf, lock_path):
+                    # Contended on an already-unlinked inode (GC mid-sweep) —
+                    # retry on the current pathname instead of reporting a
+                    # phantom holder.
+                    lf.close()
+                    continue
+                raise _palace_contention_error(resolved, lock_path, lf)
+            if not _mine_lock_file_is_current(lf, lock_path):
+                _unlock_mine_lock_file(lf)
+                acquired = False
+                lf.close()
+                continue
+            break
+        except BaseException:
+            if acquired:
+                try:
+                    _unlock_mine_lock_file(lf)
+                except Exception:
+                    logger.debug("Palace-lock release failed", exc_info=True)
+            lf.close()
+            raise
+
     try:
-        # Lock byte 0 explicitly. msvcrt.locking is byte-position dependent;
-        # fcntl.flock is whole-file but the seek is harmless there.
-        lf.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            try:
-                msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
-                acquired = True
-            except OSError as exc:
-                holder = _read_lock_holder(lf)
-                raise MineAlreadyRunning(
-                    f"palace {resolved} is held by {holder}; "
-                    "wait for it to finish or stop the holder before retrying"
-                ) from exc
-        else:
-            import fcntl
-
-            try:
-                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-            except BlockingIOError as exc:
-                holder = _read_lock_holder(lf)
-                raise MineAlreadyRunning(
-                    f"palace {resolved} is held by {holder}; "
-                    "wait for it to finish or stop the holder before retrying"
-                ) from exc
         # Record our own identity for any later contender's diagnostic message.
         _write_lock_holder(lf)
         _mark_held(palace_key)
@@ -1140,20 +1132,10 @@ def mine_palace_lock(palace_path: str):
         finally:
             _mark_released(palace_key)
     finally:
-        if acquired:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    # Match the lock region: byte 0.
-                    lf.seek(0)
-                    msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(lf, fcntl.LOCK_UN)
-            except Exception:
-                pass
+        try:
+            _unlock_mine_lock_file(lf)
+        except Exception:
+            logger.debug("Palace-lock release failed", exc_info=True)
         lf.close()
 
 

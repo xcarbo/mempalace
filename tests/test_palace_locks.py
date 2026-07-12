@@ -280,7 +280,11 @@ def test_write_lock_holder_writes_utf8_bytes_for_non_ascii_argv(tmp_path, monkey
 
     The holder byte count and the on-disk bytes must agree even when argv
     contains characters that are not representable in a Windows ANSI codepage.
+    The body is now a JSON record (pid/ppid/argv/acquired_at); byte 0 stays
+    reserved as the lock sentinel and stale content must be fully truncated.
     """
+    import json
+
     monkeypatch.setattr(
         sys,
         "argv",
@@ -288,13 +292,18 @@ def test_write_lock_holder_writes_utf8_bytes_for_non_ascii_argv(tmp_path, monkey
     )
 
     lock_path = tmp_path / "holder.lock"
-    lock_path.write_bytes(b"\0stale-holder-identity-that-must-be-truncated")
+    lock_path.write_bytes(b"\0" + b"x" * 512)  # stale content that must be truncated
 
     with lock_path.open("r+b") as lock_file:
         _write_lock_holder(lock_file)
 
-    ident = f"{os.getpid()} {' '.join(sys.argv[:3])}".strip()
-    assert lock_path.read_bytes() == b"\0" + ident.encode("utf-8")
+    body = lock_path.read_bytes()
+    assert body[:1] == b"\0"
+    record = json.loads(body[1:].decode("utf-8"))
+    assert record["pid"] == os.getpid()
+    assert record["argv"] == ["mempalace", "mine", "café/北"]
+    assert "acquired_at" in record
+    assert "ppid" in record
 
 
 def test_write_lock_holder_is_best_effort_on_unicode_error(monkeypatch):
