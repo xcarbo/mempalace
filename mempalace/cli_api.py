@@ -247,17 +247,17 @@ _COLLIDER_ARG_MAP = {
         "query": "query",
         "wing": "wing",
         "room": "room",
-        "limit": "results",  # human flag is --results
+        "limit": "results",  # human flag is --results (--limit is an alias)
         "source_file": "source_file",
         "max_distance": "max_distance",
+        "context": "context",  # re-ranking hint, forwarded verbatim to the tool
     },
     "status": {},
 }
 
 # Schema properties deliberately NOT exposed on the collider path, with reasons.
 COLLIDER_UNMAPPED = {
-    # context: re-ranking hint only ("NOT used for embedding") — no CLI use case.
-    "search": {"context"},
+    "search": set(),
     "status": set(),
 }
 

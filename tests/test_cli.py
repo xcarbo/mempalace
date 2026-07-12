@@ -147,6 +147,54 @@ def test_cmd_search_error_exits(mock_config_cls):
         assert exc_info.value.code == 1
 
 
+# ── _reconcile_search_query (tool-schema --query alias) ────────────────
+
+
+def test_reconcile_search_query_folds_alias_into_positional():
+    from mempalace.cli import _reconcile_search_query
+
+    args = argparse.Namespace(query=None, query_opt="alias query")
+    _reconcile_search_query(args)
+    assert args.query == "alias query"
+
+
+def test_reconcile_search_query_positional_untouched_without_alias():
+    from mempalace.cli import _reconcile_search_query
+
+    args = argparse.Namespace(query="positional", query_opt=None)
+    _reconcile_search_query(args)
+    assert args.query == "positional"
+
+
+def test_reconcile_search_query_same_value_both_forms_ok():
+    from mempalace.cli import _reconcile_search_query
+
+    args = argparse.Namespace(query="same", query_opt="same")
+    _reconcile_search_query(args)
+    assert args.query == "same"
+
+
+def test_reconcile_search_query_conflict_errors(capsys):
+    from mempalace.cli import _reconcile_search_query
+
+    args = argparse.Namespace(query="one", query_opt="two")
+    with pytest.raises(SystemExit) as exc_info:
+        _reconcile_search_query(args)
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "one" in err and "two" in err and "--query" in err
+
+
+def test_reconcile_search_query_missing_errors(capsys):
+    from mempalace.cli import _reconcile_search_query
+
+    args = argparse.Namespace(query=None, query_opt=None)
+    with pytest.raises(SystemExit) as exc_info:
+        _reconcile_search_query(args)
+    assert exc_info.value.code == 2
+    assert "--query" in capsys.readouterr().err
+
+
 # ── cmd_instructions ───────────────────────────────────────────────────
 
 

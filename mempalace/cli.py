@@ -913,6 +913,30 @@ def cmd_daemon(args):
         sys.exit(1)
 
 
+def _reconcile_search_query(args):
+    """Fold the ``--query`` tool-schema alias into the positional query.
+
+    Runs before BOTH search paths (human ``cmd_search`` and the ``--json``
+    collider), so each sees a single reconciled ``args.query``.
+    """
+    opt = getattr(args, "query_opt", None)
+    if opt is not None:
+        if args.query is not None and args.query != opt:
+            print(
+                "mempalace: search got two different queries "
+                f"(positional {args.query!r} vs --query {opt!r}) — pass only one",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        args.query = opt
+    if args.query is None:
+        print(
+            "mempalace: search needs a query (positional or --query)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
 def cmd_search(args):
     # The human search path (searcher.search) does not support these filters;
     # fail fast rather than silently return unfiltered results.
@@ -1761,7 +1785,13 @@ def main():
 
     # search
     p_search = sub.add_parser("search", help="Find anything, exact words")
-    p_search.add_argument("query", help="What to search for")
+    p_search.add_argument("query", nargs="?", default=None, help="What to search for")
+    p_search.add_argument(
+        "--query",
+        dest="query_opt",
+        default=None,
+        help="Search query (tool-schema alias for the positional form)",
+    )
     p_search.add_argument(
         "--backend",
         default=None,
@@ -1769,7 +1799,21 @@ def main():
     )
     p_search.add_argument("--wing", default=None, help="Limit to one project")
     p_search.add_argument("--room", default=None, help="Limit to one room")
-    p_search.add_argument("--results", type=int, default=5, help="Number of results")
+    p_search.add_argument(
+        "--results",
+        "--limit",
+        dest="results",
+        type=int,
+        default=5,
+        help="Number of results (--limit is the tool-schema alias)",
+    )
+    p_search.add_argument(
+        "--context",
+        default=None,
+        help="Background context for the search (tool-schema flag; a re-ranking "
+        "hint NOT used for embedding — forwarded to the search tool on the "
+        "--json path, no effect on human output)",
+    )
     p_search.add_argument(
         "--source-file",
         dest="source_file",
@@ -2072,7 +2116,8 @@ def main():
     # dumps them all as JSON). Per-call parser, so this append is not cumulative.
     if parser.epilog:
         parser.epilog += (
-            "\n\nMemory tools (drawer CRUD, search, knowledge graph) are flat commands:\n"
+            "\n\nMemory tools (drawer CRUD, search, knowledge graph) are flat commands —\n"
+            "any tool from `memp list-tools` is callable as `memp <tool>` with its schema flags:\n"
             "  memp list-tools       full JSON list of every tool + its flags\n"
             "  memp <tool> --help    flags for one tool (e.g. memp get-drawer --help)"
         )
@@ -2097,6 +2142,11 @@ def main():
     if not args.command:
         parser.print_help()
         return
+
+    # Reconcile the --query alias before either search path (human or --json)
+    # reads args.query.
+    if args.command == "search":
+        _reconcile_search_query(args)
 
     # Handle two-level subcommands
     if args.command == "hook":

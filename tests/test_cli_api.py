@@ -257,6 +257,32 @@ def test_run_collider_search_passes_source_file_and_max_distance(monkeypatch):
     }
 
 
+def test_run_collider_search_forwards_context(monkeypatch):
+    """The schema's ``context`` prop is mapped, not COLLIDER_UNMAPPED (#G6)."""
+    import argparse
+
+    captured = {}
+
+    def fake_run_tool(tool_name, arguments, pretty=False):
+        captured["args"] = arguments
+        return 0
+
+    monkeypatch.setattr(cli_api, "_run_tool", fake_run_tool)
+    ns = argparse.Namespace(
+        command="search",
+        query="hello",
+        wing=None,
+        room=None,
+        results=5,
+        context="background info",
+        json=True,
+        pretty=False,
+    )
+    rc = cli_api.run_collider(ns)
+    assert rc == 0
+    assert captured["args"]["context"] == "background info"
+
+
 def test_run_collider_status_rejects_backend_flag(monkeypatch, capsys):
     """``memp status --backend X --json`` must fail fast, not silently ignore
     --backend: the MCP status tool takes no arguments, so the collider cannot
@@ -361,6 +387,60 @@ def test_cli_search_without_json_calls_upstream(monkeypatch):
     monkeypatch.setattr(cli, "cmd_search", lambda args: routed.setdefault("human", True))
     _run_cli(monkeypatch, ["search", "q"])
     assert routed.get("human") and not routed.get("json")
+
+
+# ── tool-schema flag aliases on `memp search` (#G6) ──────────────────────────
+
+
+def test_cli_search_schema_flag_aliases_route_human(monkeypatch):
+    """--query/--limit/--context parse and reach cmd_search equivalent to the
+    legacy positional + --results forms."""
+    from mempalace import cli
+
+    captured = {}
+    monkeypatch.setattr(cli, "cmd_search", lambda args: captured.setdefault("args", args))
+    rc = _run_cli(monkeypatch, ["search", "--query", "q", "--limit", "7", "--context", "bg"])
+    assert rc == 0
+    ns = captured["args"]
+    assert ns.query == "q"
+    assert ns.results == 7
+    assert ns.context == "bg"
+
+
+def test_cli_search_legacy_positional_and_results_still_work(monkeypatch):
+    from mempalace import cli
+
+    captured = {}
+    monkeypatch.setattr(cli, "cmd_search", lambda args: captured.setdefault("args", args))
+    rc = _run_cli(monkeypatch, ["search", "q", "--results", "7"])
+    assert rc == 0
+    assert captured["args"].query == "q"
+    assert captured["args"].results == 7
+
+
+def test_cli_search_conflicting_query_forms_error(monkeypatch, capsys):
+    from mempalace import cli
+
+    called = {}
+    monkeypatch.setattr(cli, "cmd_search", lambda args: called.setdefault("ran", True))
+    rc = _run_cli(monkeypatch, ["search", "one", "--query", "two"])
+    assert rc == 2
+    assert "ran" not in called
+    err = capsys.readouterr().err
+    assert "--query" in err and "one" in err and "two" in err
+
+
+def test_cli_search_query_flag_reaches_json_collider(monkeypatch):
+    """The alias is reconciled BEFORE the --json collider reads args.query."""
+    from mempalace import cli_api
+
+    captured = {}
+    monkeypatch.setattr(
+        cli_api, "run_collider", lambda args: (captured.setdefault("query", args.query), 0)[1]
+    )
+    rc = _run_cli(monkeypatch, ["search", "--query", "q", "--json"])
+    assert rc == 0
+    assert captured["query"] == "q"
 
 
 def test_cli_core_command_does_not_import_mcp_server(monkeypatch):
@@ -548,6 +628,24 @@ def test_subprocess_search_help_shows_v350_filters():
     assert r.returncode == 0, r.stderr
     assert "--source-file" in r.stdout
     assert "--max-distance" in r.stdout
+
+
+def test_subprocess_top_level_help_mentions_tool_dispatch():
+    # `memp --help` must say that any tool from list-tools is callable as
+    # `memp <tool>` — discoverability must not depend on knowing list-tools.
+    r = _memp_subprocess("--help")
+    assert r.returncode == 0, r.stderr
+    assert "memp <tool>" in r.stdout
+    assert "list-tools" in r.stdout
+
+
+def test_subprocess_search_help_shows_schema_flag_aliases():
+    # The tool-schema aliases must be discoverable from `memp search --help`.
+    r = _memp_subprocess("search", "--help")
+    assert r.returncode == 0, r.stderr
+    assert "--query" in r.stdout
+    assert "--limit" in r.stdout
+    assert "--context" in r.stdout
 
 
 def test_cmd_search_rejects_json_only_filters_without_json():
