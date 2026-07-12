@@ -4918,6 +4918,24 @@ def _serve_http(host: str, port: int) -> None:
             logger.info("MemPalace MCP HTTP server shutting down")
 
 
+def _drop_broken_stdout() -> None:
+    """Point fd 1 at devnull after a stdout write failed with a pipe error.
+
+    The response line that failed mid-write can leave bytes buffered in
+    ``sys.stdout``; the interpreter's shutdown flush would then re-raise
+    ``BrokenPipeError`` and turn a clean exit into status 120. With fd 1
+    on devnull that final flush drains harmlessly, so the process exits 0
+    and any held flocks (e.g. ``mine_palace``) release via normal
+    teardown.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
 def _run_stdio_loop() -> None:
     _restore_stdout()
 
@@ -4952,23 +4970,49 @@ def _run_stdio_loop() -> None:
     while True:
         try:
             line = sys.stdin.readline()
-            if not line:
-                break
+        except KeyboardInterrupt:
+            break
+        except OSError as exc:
+            # An orphaned pty/pipe surfaces as EIO/EBADF here instead of a
+            # clean EOF — same meaning: the client is gone. Never loop on
+            # it: an orphaned stdio server holding the mine_palace flock
+            # blocked all palace writes for hours (2026-07-10 outage).
+            logger.info("stdin read failed (%s) — client disconnected, shutting down", exc)
+            break
+        if not line:
+            logger.info("stdin EOF — client disconnected, shutting down")
+            break
 
-            line = line.strip()
-            if not line:
-                continue
+        line = line.strip()
+        if not line:
+            continue
 
+        payload = None
+        try:
             request = json.loads(line)
             response = handle_request(request)
-
             if response is not None:
-                sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
+                payload = json.dumps(response, ensure_ascii=False)
         except KeyboardInterrupt:
             break
         except Exception as e:
             logger.error(f"Server error: {e}")
+            continue
+
+        if payload is None:
+            continue
+        try:
+            sys.stdout.write(payload + "\n")
+            sys.stdout.flush()
+        except KeyboardInterrupt:
+            break
+        except (BrokenPipeError, OSError) as exc:
+            # The client's read end is gone; every future response write
+            # would fail the same way, so treat it like stdin EOF and
+            # shut down instead of swallowing it in the generic handler.
+            logger.info("stdout write failed (%s) — client disconnected, shutting down", exc)
+            _drop_broken_stdout()
+            break
 
 
 def _run_http_loop() -> None:
