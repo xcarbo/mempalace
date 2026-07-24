@@ -24,6 +24,7 @@ from .backends import (
     UnsupportedCapabilityError,
 )
 from .config import sqlite_read_uri
+from .rerank import MAX_RERANK_POOL, maybe_rerank, rerank_enabled
 from .retrieval_log import log_retrieval
 from .palace import (
     _open_collection_or_explain,
@@ -1111,7 +1112,9 @@ def _finalize_candidate_hits(
         }
 
     ranked = _hybrid_rank(hits, query, metric=_metric_for_collection(drawers_col))
-    hits = _dedupe_by_drawer_id(ranked)[:n_results]
+    # Optional second-stage rerank on the deduped pool (opt-in, local,
+    # fail-soft — see mempalace/rerank.py), then the final cut.
+    hits = maybe_rerank(query, _dedupe_by_drawer_id(ranked))[:n_results]
     for h in hits:
         h.pop("_sort_key", None)
         h.pop("_source_file_full", None)
@@ -1327,7 +1330,12 @@ def search_memories(
     try:
         dkwargs = {
             "query_texts": [query],
-            "n_results": n_results * 3,  # over-fetch for re-ranking
+            # Over-fetch for hybrid re-ranking; wider still when the local
+            # reranker is on so its pool holds ~MAX_RERANK_POOL distinct
+            # drawers even after chunk dedup.
+            "n_results": max(n_results * 3, MAX_RERANK_POOL * 2)
+            if rerank_enabled()
+            else n_results * 3,
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
@@ -1436,7 +1444,11 @@ def search_memories(
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
-    hits = _dedupe_by_drawer_id(scored)[:n_results]
+    # With the reranker on, keep a wider pool alive through hydration and
+    # finalize — the second stage may promote a candidate the first stage
+    # ranked below the cut. Without it, cut to n_results as before.
+    pool_size = max(n_results, MAX_RERANK_POOL) if rerank_enabled() else n_results
+    hits = _dedupe_by_drawer_id(scored)[:pool_size]
 
     # Drawer-grep enrichment: for closet-boosted hits whose source has
     # multiple drawers, return the keyword-best chunk + its immediate
