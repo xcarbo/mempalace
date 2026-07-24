@@ -594,6 +594,7 @@ def sqlite_journal_mode(palace_path: str) -> Optional[str]:
     except sqlite3.Error:
         return None
 
+
 _SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS = 15.0
 
 

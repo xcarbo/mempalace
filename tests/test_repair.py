@@ -1824,6 +1824,7 @@ def test_rebuild_from_sqlite_dest_carries_format_stamp(tmp_path):
     stamp = json.loads((dest / "palace_format.json").read_text())
     assert stamp["format_version"] == PALACE_FORMAT_VERSION
 
+
 def test_rebuild_from_sqlite_rebuilds_fts5_after_chroma_closes(tmp_path, monkeypatch):
     """The SQLite recovery path must finish by rebuilding Chroma's FTS5 index.
 

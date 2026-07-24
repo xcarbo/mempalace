@@ -1184,6 +1184,72 @@ def cmd_locks(args):
     print(f"\n{len(entries)} lock file(s), {held} held, in {locks_dir()}")
 
 
+def _cmd_repair_from_sqlite(args, palace_path):
+    """`repair --mode from-sqlite`: rebuild the palace from its SQLite rows."""
+    from .migrate import confirm_destructive_action
+    from .repair import RebuildCleanupError, RebuildPartialError, rebuild_from_sqlite
+
+    source_path = getattr(args, "source", None)
+    source_path = os.path.abspath(os.path.expanduser(source_path)) if source_path else palace_path
+    archive_existing = getattr(args, "archive_existing", False)
+
+    # Gate any path that touches the user's existing palace dir
+    # behind confirm_destructive_action. The legacy mode already
+    # gates; from-sqlite needs the same protection because:
+    # (a) --archive-existing renames the existing palace,
+    # (b) --source PATH writes into --palace dir which the user
+    #     may not realize is also a palace.
+    # No prompt when source != dest AND dest does not exist (pure
+    # extract-into-fresh-dir case is non-destructive to existing
+    # palaces).
+    if getattr(args, "dry_run", False):
+        print("\n  DRY RUN — no changes made.")
+        print(f"  Would rebuild from SQLite: {source_path}")
+        print(f"  Into palace: {palace_path}")
+        if archive_existing:
+            print(f"  Would archive existing palace to: {palace_path}.pre-rebuild-<timestamp>")
+        return
+
+    is_destructive_to_dest = source_path == palace_path or os.path.exists(palace_path)
+    if is_destructive_to_dest and not confirm_destructive_action(
+        "Rebuild from SQLite", palace_path, assume_yes=getattr(args, "yes", False)
+    ):
+        return
+
+    try:
+        counts = rebuild_from_sqlite(
+            source_palace=source_path,
+            dest_palace=palace_path,
+            archive_existing_dest=archive_existing,
+        )
+    except RebuildPartialError as exc:
+        # The error itself was already printed by rebuild_from_sqlite
+        # with recovery instructions; surface a non-zero exit so
+        # scripts and CI gates see the failure.
+        print(
+            "\n  Rebuild partial — see message above. "
+            f"Failed in collection: {exc.failed_collection}"
+        )
+        sys.exit(1)
+    except RebuildCleanupError:
+        # All rows may have landed, but rebuild_from_sqlite deliberately
+        # withholds success until FTS5 rebuild, VACUUM, and quick_check are
+        # clean. Its exception already includes the retained destination
+        # and archive/source recovery paths.
+        print("\n  Rebuild cleanup failed — see recovery details above.")
+        sys.exit(1)
+    # An empty counts dict is rebuild_from_sqlite's documented signal
+    # for a validation refusal (missing source, existing dest,
+    # in-place without --archive-existing). The library already
+    # printed an actionable message; exit non-zero so unattended
+    # scripts/CI distinguish "invalid inputs" from a successful
+    # rebuild that legitimately found zero rows (which still returns
+    # a populated dict with 0-valued counts).
+    if not counts:
+        sys.exit(1)
+    return
+
+
 def cmd_repair(args):
     """Rebuild palace vector index from SQLite metadata.
 
@@ -1235,70 +1301,7 @@ def cmd_repair(args):
         return
 
     if getattr(args, "mode", "legacy") == "from-sqlite":
-        from .migrate import confirm_destructive_action
-        from .repair import RebuildCleanupError, RebuildPartialError, rebuild_from_sqlite
-
-        source_path = getattr(args, "source", None)
-        source_path = (
-            os.path.abspath(os.path.expanduser(source_path)) if source_path else palace_path
-        )
-        archive_existing = getattr(args, "archive_existing", False)
-
-        # Gate any path that touches the user's existing palace dir
-        # behind confirm_destructive_action. The legacy mode already
-        # gates; from-sqlite needs the same protection because:
-        # (a) --archive-existing renames the existing palace,
-        # (b) --source PATH writes into --palace dir which the user
-        #     may not realize is also a palace.
-        # No prompt when source != dest AND dest does not exist (pure
-        # extract-into-fresh-dir case is non-destructive to existing
-        # palaces).
-        if getattr(args, "dry_run", False):
-            print("\n  DRY RUN — no changes made.")
-            print(f"  Would rebuild from SQLite: {source_path}")
-            print(f"  Into palace: {palace_path}")
-            if archive_existing:
-                print(f"  Would archive existing palace to: {palace_path}.pre-rebuild-<timestamp>")
-            return
-
-        is_destructive_to_dest = source_path == palace_path or os.path.exists(palace_path)
-        if is_destructive_to_dest and not confirm_destructive_action(
-            "Rebuild from SQLite", palace_path, assume_yes=getattr(args, "yes", False)
-        ):
-            return
-
-        try:
-            counts = rebuild_from_sqlite(
-                source_palace=source_path,
-                dest_palace=palace_path,
-                archive_existing_dest=archive_existing,
-            )
-        except RebuildPartialError as exc:
-            # The error itself was already printed by rebuild_from_sqlite
-            # with recovery instructions; surface a non-zero exit so
-            # scripts and CI gates see the failure.
-            print(
-                "\n  Rebuild partial — see message above. "
-                f"Failed in collection: {exc.failed_collection}"
-            )
-            sys.exit(1)
-        except RebuildCleanupError:
-            # All rows may have landed, but rebuild_from_sqlite deliberately
-            # withholds success until FTS5 rebuild, VACUUM, and quick_check are
-            # clean. Its exception already includes the retained destination
-            # and archive/source recovery paths.
-            print("\n  Rebuild cleanup failed — see recovery details above.")
-            sys.exit(1)
-        # An empty counts dict is rebuild_from_sqlite's documented signal
-        # for a validation refusal (missing source, existing dest,
-        # in-place without --archive-existing). The library already
-        # printed an actionable message; exit non-zero so unattended
-        # scripts/CI distinguish "invalid inputs" from a successful
-        # rebuild that legitimately found zero rows (which still returns
-        # a populated dict with 0-valued counts).
-        if not counts:
-            sys.exit(1)
-        return
+        return _cmd_repair_from_sqlite(args, palace_path)
 
     db_path = os.path.join(palace_path, "chroma.sqlite3")
 

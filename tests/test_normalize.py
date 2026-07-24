@@ -2014,9 +2014,7 @@ class TestStripInjectedSessionContext:
         # A multi-paragraph system-reminder WITHOUT the marker keeps the old
         # conservative behavior (no blank-line crossing) — span-safety wins.
         text = (
-            "> User 1: content <system-reminder>A\n"
-            "\n"
-            "> User 2: more content</system-reminder> tail"
+            "> User 1: content <system-reminder>A\n\n> User 2: more content</system-reminder> tail"
         )
         out = strip_noise(text)
         assert "User 2: more content" in out

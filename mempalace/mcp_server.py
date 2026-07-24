@@ -5459,6 +5459,8 @@ def _drop_broken_stdout() -> None:
         os.close(devnull)
     except (OSError, ValueError, AttributeError):
         pass
+
+
 def _startup_preflight() -> None:
     """Startup SQLite integrity + HNSW capacity probes, off the protocol thread.
 
