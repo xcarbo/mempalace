@@ -779,7 +779,8 @@ def test_safe_wing_slug_falls_back_to_sessions_when_empty():
 
 def test_wing_from_transcript_path_cwd_plus_prefixed_dir(tmp_path):
     """Reporter's case: a ``+``-prefixed working directory must yield a sanitizable
-    wing (``wing_project``), not the rejected ``wing_+project``."""
+    wing. Fork: bare-wing convention — ``project``, not the rejected ``+project``
+    (upstream expects ``wing_project``; see _bare_wing_slug)."""
     project_dir = tmp_path / "encoded-dir"
     project_dir.mkdir()
     transcript = project_dir / "session.jsonl"
@@ -787,13 +788,13 @@ def test_wing_from_transcript_path_cwd_plus_prefixed_dir(tmp_path):
         '{"type":"user","cwd":"/Users/me/code/+project","content":"hi"}\n',
         encoding="utf-8",
     )
-    assert _wing_from_transcript_path(str(transcript)) == "wing_project"
+    assert _wing_from_transcript_path(str(transcript)) == "project"
 
 
 def test_wing_from_transcript_path_legacy_plus_prefixed_project():
     """Legacy ``-Projects-<name>`` path with a ``+``-prefixed project folder."""
     path = "/Users/me/foo/-Projects-+app/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_app"
+    assert _wing_from_transcript_path(path) == "app"
 
 
 @given(st.text(min_size=1, max_size=300))

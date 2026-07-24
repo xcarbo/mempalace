@@ -981,6 +981,26 @@ def _safe_wing_slug(name: str) -> str:
     return slug or "sessions"
 
 
+def _bare_wing_slug(name: str) -> str:
+    """Normalize a project name into a BARE wing slug ``sanitize_name`` accepts.
+
+    Fork counterpart of :func:`_safe_wing_slug` (#1852): same guarantee — a
+    project dir with special characters (e.g. ``+app``) must never derive a
+    wing ``sanitize_name`` rejects, silently breaking diary auto-save — but
+    keeps the fork's bare-wing conventions: lowercase, spaces and junk runs
+    become hyphens, no ``wing_`` prefix. Strict no-op for every name the
+    derivation previously produced AND the validator accepted, so no existing
+    wing is ever renamed (pinned by tests/test_hooks_wing_routing.py); legacy
+    path-encoded wings keep their leading dash.
+    """
+    slug = name.lower().replace(" ", "-")
+    slug = re.sub(r"^[^\w.'-]+|[^\w.'-]+$", "", slug)
+    slug = re.sub(r"[^\w.'-]+", "-", slug)
+    slug = re.sub(r"\.{2,}", ".", slug)
+    slug = slug[:126].lstrip("_.'").rstrip("_.'-")
+    return slug or "sessions"
+
+
 def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
     """Read ``cwd`` from the first JSONL line that records it.
 
@@ -1031,7 +1051,7 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                     # ``wing_*`` splinter. No registry gate: hook saves must
                     # never fail on an unregistered wing (the write path
                     # creates it).
-                    return project.lower().replace(" ", "-")
+                    return _bare_wing_slug(project)
     except OSError:
         pass
     return None
@@ -1092,14 +1112,12 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
             if encoded.startswith(prefix):
                 encoded = encoded[len(prefix) :]
                 break
-        project = encoded.lower().replace(" ", "-")
-        if project:
-            return project
+        return _bare_wing_slug(encoded)
 
     # 3. Legacy — explicit -Projects-<name> segment
     match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
     if match:
-        return match.group(1).lower().replace(" ", "-")
+        return _bare_wing_slug(match.group(1))
 
     # 4. Default
     return "sessions"

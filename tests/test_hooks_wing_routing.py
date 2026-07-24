@@ -134,8 +134,11 @@ def test_convo_miner_explicit_wing_passes_through_verbatim():
         ("vlad-ozweb", "vlad-ozweb"),
         ("my.app", "my.app"),
         # Tripwire: upstream _safe_wing_slug (aac947a) would emit
-        # "foo_bar" here. The fork keeps the '+' verbatim.
-        ("foo+bar", "foo+bar"),
+        # "foo_bar" here. The fork maps invalid runs to hyphens instead
+        # (_bare_wing_slug, v3.6.0 merge). The pre-merge verbatim "foo+bar"
+        # was never writable — sanitize_name rejects '+' — so no existing
+        # wing can carry that name and this pin change renames nothing.
+        ("foo+bar", "foo-bar"),
     ],
 )
 def test_cwd_leaf_derivation_matches_pre_merge_fork(tmp_path, leaf, expected):
