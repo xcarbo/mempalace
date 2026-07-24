@@ -147,3 +147,43 @@ class TestToolSearchLogs:
         assert rec["tool"] == "search"
         assert rec["drawer_ids"] == ["d1"]
         assert rec["distances"] == [0.3]
+
+
+# ── chunk-hit dedup ────────────────────────────────────────────────────
+
+
+class TestChunkDedup:
+    def test_chunked_drawer_surfaces_once(self, palace_path, collection):
+        """Chunks of one logical drawer must collapse to a single hit."""
+        collection.add(
+            ids=[f"drawer_w_r_multi_chunk_{i:06d}" for i in range(3)] + ["drawer_w_r_other"],
+            documents=[
+                "kubernetes ingress routing rules for the staging cluster",
+                "kubernetes ingress certificate renewal via cert-manager",
+                "kubernetes ingress canary weights and rollback procedure",
+                "postgres backup rotation schedule",
+            ],
+            metadatas=[
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": "k8s.md",
+                    "chunk_index": i,
+                    "parent_drawer_id": "drawer_w_r_multi",
+                }
+                for i in range(3)
+            ]
+            + [{"wing": "w", "room": "r", "source_file": "pg.md", "chunk_index": 0}],
+        )
+        result = search_memories("kubernetes ingress", palace_path, n_results=5)
+        ids = [h["drawer_id"] for h in result["results"]]
+        assert ids.count("drawer_w_r_multi") == 1
+        assert len(ids) == len(set(ids))
+
+    def test_dedupe_keeps_hits_without_identity(self):
+        from mempalace.searcher import _dedupe_by_drawer_id
+
+        hits = [{"text": "a"}, {"text": "b"}, {"drawer_id": "d1"}, {"drawer_id": "d1"}]
+        out = _dedupe_by_drawer_id(hits)
+        assert len(out) == 3
+        assert [h.get("drawer_id") for h in out] == [None, None, "d1"]

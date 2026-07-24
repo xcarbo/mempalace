@@ -55,6 +55,31 @@ def _drawer_id_from(meta: dict, record_id) -> "str | None":
     return _CHUNK_ID_SUFFIX_RE.sub("", str(record_id)) or None
 
 
+def _dedupe_by_drawer_id(hits: list) -> list:
+    """Collapse chunk-level hits to one entry per logical drawer.
+
+    Chunked drawers embed each chunk separately, so one drawer can occupy
+    several ranks in a single result set (observed: the same drawer at 3
+    of the top 5), crowding distinct drawers out of top-N. Keep the
+    best-ranked chunk per drawer_id — callers pass hits already in score
+    order, and hydration re-expands the winning chunk with its neighbors.
+    Hits without a drawer identity are always kept (legacy rows must not
+    collapse into each other).
+    """
+    seen = set()
+    out = []
+    for h in hits:
+        did = h.get("drawer_id") or h.get("_parent_drawer_id")
+        if did is None:
+            out.append(h)
+            continue
+        if did in seen:
+            continue
+        seen.add(did)
+        out.append(h)
+    return out
+
+
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.
 _CLOSET_DRAWER_REF_RE = re.compile(r"→([\w,]+)")
@@ -562,7 +587,9 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     try:
         kwargs = {
             "query_texts": [query],
-            "n_results": n_results,
+            # Over-fetch so chunk-level duplicates of one drawer can be
+            # collapsed and still fill n_results with distinct drawers.
+            "n_results": n_results * 2,
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
@@ -593,10 +620,15 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     metric = _metric_for_collection(col)
     rids = _first_or_empty(results, "ids") or [None] * len(docs)
     hits = [
-        {"text": doc or "", "distance": float(dist), "metadata": meta or {}, "record_id": rid}
+        {
+            "text": doc or "",
+            "distance": float(dist),
+            "metadata": meta or {},
+            "drawer_id": _drawer_id_from(meta, rid),
+        }
         for doc, meta, dist, rid in zip(docs, metas, dists, rids)
     ]
-    hits = _hybrid_rank(hits, query, metric=metric)
+    hits = _dedupe_by_drawer_id(_hybrid_rank(hits, query, metric=metric))[:n_results]
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
@@ -614,7 +646,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         source = Path(meta.get("source_file", "?")).name
         wing_name = meta.get("wing", "?")
         room_name = meta.get("room", "?")
-        drawer_id = _drawer_id_from(meta, hit.get("record_id"))
+        drawer_id = hit.get("drawer_id")
         seen_drawer_ids.append(drawer_id)
 
         print(f"  [{i}] {wing_name} / {room_name}")
@@ -880,7 +912,7 @@ def _bm25_only_via_sqlite(
         c["bm25_score"] = round(raw, 3)
         c["_score"] = (raw / max_bm25) if max_bm25 > 0 else 0.0
     candidates.sort(key=lambda c: c["_score"], reverse=True)
-    hits = candidates[:n_results]
+    hits = _dedupe_by_drawer_id(candidates)[:n_results]
     for h in hits:
         h.pop("_score", None)
         # Strip internal fields by default so the public BM25-only fallback
@@ -1078,7 +1110,8 @@ def _finalize_candidate_hits(
             "hint": "Use candidate_strategy='vector' or select a backend that supports lexical search.",
         }
 
-    hits = _hybrid_rank(hits, query, metric=_metric_for_collection(drawers_col))[:n_results]
+    ranked = _hybrid_rank(hits, query, metric=_metric_for_collection(drawers_col))
+    hits = _dedupe_by_drawer_id(ranked)[:n_results]
     for h in hits:
         h.pop("_sort_key", None)
         h.pop("_source_file_full", None)
@@ -1403,7 +1436,7 @@ def search_memories(
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
-    hits = scored[:n_results]
+    hits = _dedupe_by_drawer_id(scored)[:n_results]
 
     # Drawer-grep enrichment: for closet-boosted hits whose source has
     # multiple drawers, return the keyword-best chunk + its immediate
