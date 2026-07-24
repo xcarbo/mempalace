@@ -16,9 +16,12 @@ import subprocess
 import sys
 import threading
 
+from unittest import mock
+
 import pytest
 
 from mempalace import locks as locks_mod
+from mempalace import palace as palace_mod
 from mempalace.locks import (
     ORPHAN_GUIDANCE,
     gc_stale_locks,
@@ -62,7 +65,10 @@ def _hold_palace_lock(palace: str):
 
     flock via an independent open file description conflicts even within the
     same process, so the main thread contending on the same palace observes a
-    genuine held lock (the re-entrant pass-through is per-thread). Called
+    genuine held lock. Since the v3.6.0 merge the re-entrant pass-through is
+    process-wide (#1859), so the contending acquire inside the block runs with
+    ``_held_by_this_process`` patched to False — simulating the cross-process
+    contender (orphaned mine, second CLI) these diagnostics exist for. Called
     AFTER the test redirects HOME / patches argv, so the holder record is
     written where and how the test expects.
     """
@@ -84,7 +90,8 @@ def _hold_palace_lock(palace: str):
     try:
         assert acquired.wait(timeout=10), "holder thread failed to acquire in time"
         assert not errors, f"holder thread failed: {errors}"
-        yield
+        with mock.patch.object(palace_mod, "_held_by_this_process", return_value=False):
+            yield
     finally:
         release.set()
         thread.join(timeout=10)

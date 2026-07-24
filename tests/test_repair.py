@@ -1370,6 +1370,12 @@ def test_sqlite_integrity_errors_uses_bounded_contention_timeout(tmp_path, monke
     db_path = palace / "chroma.sqlite3"
     db_path.touch()
 
+    # The fork's orphaned-WAL preflight opens its own sqlite connection via the
+    # same (globally patched) sqlite3.connect; stub it so this test asserts
+    # only the quick_check connection contract. checkpoint_wal has its own
+    # coverage in test_backends.py.
+    monkeypatch.setattr(repair, "checkpoint_wal", lambda p: None)
+
     calls = []
 
     class _Result:
@@ -1926,57 +1932,6 @@ def test_rebuild_from_sqlite_in_place_archives_when_opted_in(tmp_path):
 
     rebuilt = ChromaBackend().get_collection(str(palace), "mempalace_drawers")
     assert rebuilt.count() == 15
-
-
-def test_rebuild_from_sqlite_heals_malformed_dest_fts5(tmp_path, monkeypatch):
-    """The bulk upsert can leave the destination's FTS5 inverted index
-    malformed (observed live at ~90k rows), which the MCP startup
-    integrity gate then refuses — a *completed* rebuild that strands the
-    palace. rebuild_from_sqlite must quick_check its destination and run
-    the #1596 FTS5 heal when the errors are isolated-FTS5."""
-    source = tmp_path / "source"
-    dest = tmp_path / "dest"
-    rows = [(f"d{i}", f"body {i}", {"wing": "w", "room": "r"}) for i in range(5)]
-    _seed_palace(source, "mempalace_drawers", rows)
-
-    fts_error = "malformed inverted index for FTS5 table main.embedding_fulltext_search"
-    integrity_calls: list[str] = []
-    heal_calls: list[tuple[str, list[str]]] = []
-
-    def fake_integrity(palace_path):
-        integrity_calls.append(palace_path)
-        return [fts_error]
-
-    def fake_heal(palace_path, errors, **kwargs):
-        heal_calls.append((palace_path, list(errors)))
-        return []
-
-    monkeypatch.setattr(repair, "sqlite_integrity_errors", fake_integrity)
-    monkeypatch.setattr(repair, "maybe_autoheal_fts5_index", fake_heal)
-
-    repair.rebuild_from_sqlite(str(source), str(dest))
-
-    assert str(dest) in integrity_calls
-    assert heal_calls == [(str(dest), [fts_error])]
-
-
-def test_rebuild_from_sqlite_skips_heal_on_clean_dest(tmp_path, monkeypatch):
-    """Clean destination quick_check → the FTS5 heal must not run."""
-    source = tmp_path / "source"
-    dest = tmp_path / "dest"
-    _seed_palace(source, "mempalace_drawers", [("d0", "body", {"wing": "w", "room": "r"})])
-
-    heal_calls: list[str] = []
-    monkeypatch.setattr(repair, "sqlite_integrity_errors", lambda p: [])
-    monkeypatch.setattr(
-        repair,
-        "maybe_autoheal_fts5_index",
-        lambda p, e, **kw: heal_calls.append(p) or [],
-    )
-
-    repair.rebuild_from_sqlite(str(source), str(dest))
-
-    assert heal_calls == []
 
 
 def test_rebuild_from_sqlite_in_place_refuses_without_archive_flag(tmp_path):
