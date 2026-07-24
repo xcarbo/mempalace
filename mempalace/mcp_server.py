@@ -77,6 +77,7 @@ from .backends.chroma import (  # noqa: E402
 )
 from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
+from .retrieval_log import log_retrieval  # noqa: E402
 from .searcher import (  # noqa: E402
     _distance_to_similarity,
     _metric_for_collection,
@@ -2098,6 +2099,19 @@ def tool_search(
         }
     if context:
         result["context_received"] = True
+    hits = result.get("results") or []
+    log_retrieval(
+        "search",
+        query=sanitized["clean_query"],
+        wing=wing,
+        room=room,
+        source_file=source_file,
+        limit=limit,
+        returned=len(hits),
+        drawer_ids=[h.get("drawer_id") for h in hits],
+        distances=[h.get("effective_distance") for h in hits],
+        fallback=result.get("fallback"),
+    )
     return result
 
 
@@ -3120,6 +3134,7 @@ def tool_get_drawer(drawer_id: str):
 
     try:
         record = _logical_drawer_record(col, drawer_id)
+        log_retrieval("get_drawer", drawer_id=drawer_id, found=record is not None)
         if record is None:
             return {"error": f"Drawer not found: {drawer_id}"}
         return _drawer_payload(record)

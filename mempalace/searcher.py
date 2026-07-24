@@ -24,12 +24,36 @@ from .backends import (
     UnsupportedCapabilityError,
 )
 from .config import sqlite_read_uri
+from .retrieval_log import log_retrieval
 from .palace import (
     _open_collection_or_explain,
     get_closets_collection,
     get_collection,
     resolve_backend_name,
 )
+
+# Chunked drawers store their chunks under "<drawer_id>_chunk_NNNNNN"; the
+# logical id a caller can feed to get_drawer is the record id minus that
+# suffix (or the parent_drawer_id metadata when present).
+_CHUNK_ID_SUFFIX_RE = re.compile(r"_chunk_\d+$")
+
+
+def _drawer_id_from(meta: dict, record_id) -> "str | None":
+    """Logical drawer id for a search hit, usable with mempalace_get_drawer.
+
+    Chunked drawers carry ``parent_drawer_id`` metadata; legacy single-chunk
+    drawers (the vast majority of an old palace) don't, so fall back to the
+    backend record id with any ``_chunk_NNNNNN`` suffix stripped. Returns
+    ``None`` only when neither identity survives (e.g. the sqlite BM25
+    fallback on rows missing both).
+    """
+    parent = (meta or {}).get("parent_drawer_id")
+    if parent:
+        return str(parent)
+    if record_id is None:
+        return None
+    return _CHUNK_ID_SUFFIX_RE.sub("", str(record_id)) or None
+
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.
@@ -477,6 +501,8 @@ def _print_search_results_bm25_only(
         source = Path(hit.get("source_file", "?")).name
 
         print(f"  [{i}] {wing_name} / {room_name}")
+        if hit.get("drawer_id"):
+            print(f"      ID:     {hit['drawer_id']}")
         print(f"      Source: {source}")
         print(f"      Match:  bm25={bm25}  (vector disabled)")
         print()
@@ -486,6 +512,17 @@ def _print_search_results_bm25_only(
         print(f"  {'─' * 56}")
 
     print()
+    log_retrieval(
+        "search",
+        source="cli",
+        query=query,
+        wing=wing,
+        room=room,
+        limit=n_results,
+        returned=len(hits),
+        drawer_ids=[h.get("drawer_id") for h in hits],
+        fallback="bm25_only_via_sqlite",
+    )
 
 
 def search(query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5):
@@ -554,9 +591,10 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     # `_hybrid_rank`; do the same here so CLI results match what agents
     # see via `mempalace_search`.
     metric = _metric_for_collection(col)
+    rids = _first_or_empty(results, "ids") or [None] * len(docs)
     hits = [
-        {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
-        for doc, meta, dist in zip(docs, metas, dists)
+        {"text": doc or "", "distance": float(dist), "metadata": meta or {}, "record_id": rid}
+        for doc, meta, dist, rid in zip(docs, metas, dists, rids)
     ]
     hits = _hybrid_rank(hits, query, metric=metric)
 
@@ -568,6 +606,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         print(f"  Room: {room}")
     print(f"{'=' * 60}\n")
 
+    seen_drawer_ids = []
     for i, hit in enumerate(hits, 1):
         vec_sim = round(_distance_to_similarity(hit["distance"], metric), 3)
         bm25 = hit.get("bm25_score", 0.0)
@@ -575,8 +614,12 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         source = Path(meta.get("source_file", "?")).name
         wing_name = meta.get("wing", "?")
         room_name = meta.get("room", "?")
+        drawer_id = _drawer_id_from(meta, hit.get("record_id"))
+        seen_drawer_ids.append(drawer_id)
 
         print(f"  [{i}] {wing_name} / {room_name}")
+        if drawer_id:
+            print(f"      ID:     {drawer_id}")
         print(f"      Source: {source}")
         print(f"      Match:  {metric}_sim={vec_sim}  bm25={bm25}")
         print()
@@ -587,6 +630,16 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         print(f"  {'─' * 56}")
 
     print()
+    log_retrieval(
+        "search",
+        source="cli",
+        query=query,
+        wing=wing,
+        room=room,
+        limit=n_results,
+        returned=len(hits),
+        drawer_ids=seen_drawer_ids,
+    )
 
 
 def _bm25_only_via_sqlite(
@@ -758,6 +811,19 @@ def _bm25_only_via_sqlite(
             """,
             candidate_ids,
         ).fetchall()
+        # Map internal integer ids to the backend record ids so BM25-only
+        # hits carry the same public drawer_id as vector hits. Best-effort:
+        # a schema mismatch just leaves drawer_id to the metadata fallback.
+        record_id_by_row: dict[int, str] = {}
+        try:
+            record_id_by_row = dict(
+                conn.execute(
+                    f"SELECT id, embedding_id FROM embeddings WHERE id IN ({placeholders})",
+                    candidate_ids,
+                ).fetchall()
+            )
+        except sqlite3.Error:
+            logger.debug("embedding_id lookup failed; drawer_id falls back", exc_info=True)
     finally:
         conn.close()
 
@@ -785,6 +851,7 @@ def _bm25_only_via_sqlite(
         candidates.append(
             {
                 "text": d["text"],
+                "drawer_id": _drawer_id_from(meta, record_id_by_row.get(d["_id"])),
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
                 "source_file": Path(full_source).name if full_source else "?",
@@ -888,6 +955,7 @@ def _merge_bm25_union_candidates(
         bm25_extra.append(
             {
                 "text": hit.document or "",
+                "drawer_id": _drawer_id_from(meta, hit.id),
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
                 "source_file": Path(full_source).name if full_source else "?",
@@ -1271,10 +1339,15 @@ def search_memories(
     CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
     scored: list = []
-    for doc, meta, dist in zip(
-        _first_or_empty(drawer_results, "documents"),
+    _docs = _first_or_empty(drawer_results, "documents")
+    # A backend that omits "ids" must not zero out the whole result set —
+    # pad with None and let drawer_id fall back to parent_drawer_id/None.
+    _rids = _first_or_empty(drawer_results, "ids") or [None] * len(_docs)
+    for doc, meta, dist, rid in zip(
+        _docs,
         _first_or_empty(drawer_results, "metadatas"),
         _first_or_empty(drawer_results, "distances"),
+        _rids,
     ):
         meta = meta or {}
         doc = doc or ""
@@ -1302,6 +1375,7 @@ def search_memories(
         effective_dist = max(0.0, min(2.0, dist - boost))
         entry = {
             "text": doc,
+            "drawer_id": _drawer_id_from(meta, rid),
             "wing": meta.get("wing", "unknown"),
             "room": meta.get("room", "unknown"),
             # source_file is the basename (display); source_path is the full

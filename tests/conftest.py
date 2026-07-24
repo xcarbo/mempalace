@@ -52,6 +52,16 @@ except ImportError:
 
 
 @pytest.fixture(autouse=True)
+def _no_retrieval_log(monkeypatch):
+    """Never append test noise to the user's real retrieval log.
+
+    Tests that exercise the flight recorder opt back in by deleting the
+    env var under a scratch HOME (see test_retrieval_log.scratch_home).
+    """
+    monkeypatch.setenv("MEMPALACE_RETRIEVAL_LOG", "0")
+
+
+@pytest.fixture(autouse=True)
 def _reset_mcp_cache():
     """Reset cached MCP state between tests without importing mcp_server.
 
