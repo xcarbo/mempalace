@@ -1126,6 +1126,35 @@ def cmd_repair_status(args):
     repair_status(palace_path=palace_path)
 
 
+def cmd_asof(args):
+    """Time machine: palace state at a past date (read-only)."""
+    import json as _json
+
+    from .asof import render, snapshot
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    try:
+        snap = snapshot(
+            palace_path,
+            args.date,
+            wing=args.wing,
+            latest=args.latest,
+        )
+    except ValueError as e:
+        print(f"mempalace: {e}", file=sys.stderr)
+        sys.exit(2)
+    # snapshot() imports mcp_server, whose import-time redirect points
+    # sys.stdout at stderr (stdio-protocol protection). Restore the real
+    # stdout before emitting, same as the api-tool dispatch path does.
+    from .cli_api import _restore_real_stdout
+
+    _restore_real_stdout()
+    if args.json:
+        print(_json.dumps(snap, indent=2, default=str))
+    else:
+        print(render(snap))
+
+
 def cmd_locks(args):
     """Inspect ~/.mempalace/locks: holders, ages, residues; --gc sweeps residues."""
     import json
@@ -2342,6 +2371,17 @@ def main():
         help="Safely remove residual lock files (unheld AND 0-byte or dead holder) before listing",
     )
 
+    p_asof = sub.add_parser(
+        "as-of",
+        help="Time machine — palace state at a past date (drawers, roadmap, KG facts)",
+    )
+    p_asof.add_argument("date", help="Target date: YYYY-MM-DD (end-of-day) or ISO datetime")
+    p_asof.add_argument("--wing", default=None, help="Scope to one wing (enables KG facts)")
+    p_asof.add_argument(
+        "--latest", type=int, default=10, help="How many most-recent drawers to show"
+    )
+    p_asof.add_argument("--json", action="store_true", help="Machine-readable JSON output")
+
     p_hallways = sub.add_parser("hallways", help="List entity hallways (associative graph)")
     p_hallways.add_argument("--wing", default=None, help="Filter to one wing")
     p_hallways.add_argument("--limit", type=int, default=50, help="Max hallways to show")
@@ -2498,6 +2538,7 @@ def main():
         "serve": cmd_serve,
         "compress": cmd_compress,
         "wake-up": cmd_wakeup,
+        "as-of": cmd_asof,
         "locks": cmd_locks,
         "repair": cmd_repair,
         "repair-status": cmd_repair_status,
