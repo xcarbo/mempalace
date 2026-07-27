@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import pickle
+import struct
 import re
 import shlex
 import sqlite3
@@ -73,6 +74,11 @@ def _hnsw_link_to_data_ratio(seg_dir: str) -> Optional[float]:
         return None
 
     try:
+        # Deliberately apparent size, not allocated blocks: this ratio is also
+        # evaluated on small segments, where block-granularity rounding would
+        # inflate both terms and destroy the signal. The sparse-file blind spot
+        # this leaves is covered by ``reclaim_runaway_link_lists``, which uses
+        # st_blocks against an exact per-segment ceiling.
         data_size = os.path.getsize(data_path)
         link_size = os.path.getsize(link_path)
     except OSError:
@@ -1222,6 +1228,127 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
             logger.exception("Failed to quarantine invalid HNSW metadata in %s", seg_dir)
 
     return moved
+
+
+# chroma-hnswlib persistHeader() layout: a leading u32 version, then the
+# HEADER_FIELDS macro. Verified byte-exact against live segments.
+_HNSW_HEADER = struct.Struct("<I QQQQQQ iI QQQ d Q")
+_HNSW_HEADER_FIELDS = (
+    "version",
+    "offset_level0",
+    "max_elements",
+    "cur_element_count",
+    "size_data_per_element",
+    "label_offset",
+    "offset_data",
+    "maxlevel",
+    "enterpoint_node",
+    "maxM",
+    "maxM0",
+    "M",
+    "mult",
+    "ef_construction",
+)
+
+# The real failure overshoots the ceiling by ~4000x, so a 4x slack costs
+# nothing in detection and buys immunity to false positives.
+_LINK_LISTS_SLACK = 4.0
+# Never act below this absolute size, whatever the ratio: a freshly-built
+# segment can briefly hold a header describing fewer elements than
+# link_lists.bin already covers.
+_LINK_LISTS_MIN_BYTES = 256 * 1024 * 1024
+
+
+def _link_lists_ceiling(header: dict) -> int:
+    """Largest ``link_lists.bin`` a segment could legitimately produce.
+
+    Every term comes from ``header.bin``, so this is an exact bound rather
+    than a tuned threshold: each element contributes a 4-byte length prefix
+    plus at most ``maxlevel`` link-list blocks of ``maxM * 4 + 4`` bytes.
+    """
+    size_links_per_element = header["maxM"] * 4 + 4
+    return header["cur_element_count"] * (4 + size_links_per_element * (header["maxlevel"] + 1))
+
+
+def reclaim_runaway_link_lists(palace_path: str) -> list[str]:
+    """Delete any ``link_lists.bin`` that exceeds its own header's ceiling.
+
+    chroma-hnswlib's ``persistDirty`` skips non-dirty elements by seeking a
+    stride computed from in-memory element levels, while ``loadLinkLists``
+    reconstructs those levels *from the file itself* without validation
+    (hnswalg.h:1365). One torn record — a writer killed mid-persist — poisons
+    the level table, so every later persist seeks further past EOF and writes,
+    growing the file sparsely without bound. Each reload amplifies it.
+
+    On 2026-07-27 this reached 231 GiB (1.92 TiB apparent) against a 58 MiB
+    ceiling, exhausted the boot volume, starved macOS of swap and caused three
+    watchdog kernel panics. See
+    docs/recovery/link-lists-runaway-disk-exhaustion.md and
+    https://github.com/chroma-core/chroma/issues/7510.
+
+    Two details are load-bearing:
+
+    * **Measure allocated blocks, not ``st_size``.** The runaway file is
+      sparse, so size-based checks miss it entirely.
+    * **Reclaim with ``unlink``, never truncation.** On a full volume a
+      copy-on-write truncate fails with ENOSPC — it needs free space to free
+      space — which is exactly when this runs.
+
+    Quarantined segments are scanned too: the integrity gate renames a bad
+    segment aside but never frees it, which is how 231 GiB of dead bytes sat
+    unnoticed on the boot volume. Removing the file leaves the segment
+    unloadable, so the existing quarantine path rebuilds it from SQLite —
+    strictly better than filling the disk.
+    """
+    try:
+        entries = os.listdir(palace_path)
+    except OSError:
+        return []
+
+    reclaimed: list[str] = []
+    for name in entries:
+        seg_dir = os.path.join(palace_path, name)
+        if not os.path.isdir(seg_dir):
+            continue
+        ll_path = os.path.join(seg_dir, "link_lists.bin")
+        hdr_path = os.path.join(seg_dir, "header.bin")
+        if not os.path.isfile(ll_path) or not os.path.isfile(hdr_path):
+            continue
+
+        try:
+            raw = open(hdr_path, "rb").read()
+            if len(raw) < _HNSW_HEADER.size:
+                continue
+            header = dict(zip(_HNSW_HEADER_FIELDS, _HNSW_HEADER.unpack_from(raw, 0)))
+            allocated = os.stat(ll_path).st_blocks * 512
+        except OSError:
+            continue
+        except struct.error:
+            continue
+
+        if header["cur_element_count"] <= 0 or header["maxM"] <= 0:
+            continue
+        ceiling = _link_lists_ceiling(header)
+        if allocated <= _LINK_LISTS_MIN_BYTES or allocated <= ceiling * _LINK_LISTS_SLACK:
+            continue
+
+        try:
+            os.unlink(ll_path)
+            reclaimed.append(ll_path)
+            logger.error(
+                "Reclaimed runaway link_lists.bin in %s: %.1f GiB allocated against a "
+                "%.1f MiB ceiling (%d elements, maxlevel %d). The segment must now be "
+                "rebuilt from SQLite; see chroma-core/chroma#7510.",
+                seg_dir,
+                allocated / 2**30,
+                ceiling / 2**20,
+                header["cur_element_count"],
+                header["maxlevel"],
+            )
+        except OSError:
+            logger.exception("Failed to reclaim runaway link_lists.bin in %s", seg_dir)
+
+    return reclaimed
 
 
 def _fix_blob_seq_ids(palace_path: str) -> None:
@@ -2422,6 +2549,10 @@ class ChromaBackend(BaseBackend):
         _fix_missing_collection_type(palace_path)
         _fix_blob_seq_ids(palace_path)
         if palace_path not in ChromaBackend._quarantined_paths:
+            # Runs before the metadata/stale gates: a runaway link_lists.bin is
+            # a disk-space emergency rather than a load error, and quarantine
+            # alone would rename it aside while still holding the bytes.
+            reclaim_runaway_link_lists(palace_path)
             quarantine_invalid_hnsw_metadata(palace_path)
             quarantine_stale_hnsw(palace_path)
             ChromaBackend._quarantined_paths.add(palace_path)
