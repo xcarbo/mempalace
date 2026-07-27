@@ -1703,6 +1703,52 @@ def test_extract_via_sqlite_returns_all_rows_with_metadata(tmp_path):
     )
 
 
+def test_extract_via_sqlite_reads_wal_palace_without_shm_sidecar(tmp_path):
+    """A WAL-mode palace with no ``-shm`` file is still readable.
+
+    This is the exact shape ``repair --archive-existing`` leaves behind, and
+    ``mode=ro`` alone cannot open it: a read-only connection needs the
+    shared-memory index and may not create it, so SQLite raises
+    ``unable to open database file``. During the 2026-07-27 link_lists
+    recovery that made the from-sqlite rebuild unable to read its own archive,
+    and the error surfaced against the *destination* collection — pointing
+    triage at entirely the wrong file.
+
+    See docs/recovery/link-lists-runaway-disk-exhaustion.md (Failure 3).
+    """
+    rows = [
+        (f"drawer_{i:03d}", f"document body {i}", {"wing": "w", "room": "r"}) for i in range(10)
+    ]
+    _seed_palace(tmp_path, "mempalace_drawers", rows)
+
+    sqlite_path = os.path.join(str(tmp_path), "chroma.sqlite3")
+    with closing(sqlite3.connect(sqlite_path)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    # Reproduce the archive: WAL mode recorded in the header, sidecars gone.
+    for sidecar in ("chroma.sqlite3-shm", "chroma.sqlite3-wal"):
+        p = os.path.join(str(tmp_path), sidecar)
+        if os.path.exists(p):
+            os.unlink(p)
+
+    # Confirm WAL from the file header rather than by connecting: any
+    # read-write connection would recreate the -shm this test needs absent.
+    # Bytes 18/19 are the write/read format versions; 2 means WAL.
+    with open(sqlite_path, "rb") as fh:
+        header = fh.read(20)
+    assert header[18] == 2 and header[19] == 2, "palace is not in WAL mode"
+    assert not os.path.exists(os.path.join(str(tmp_path), "chroma.sqlite3-shm"))
+
+    extracted = list(repair.extract_via_sqlite(str(tmp_path), "mempalace_drawers"))
+
+    assert len(extracted) == 10, (
+        "extraction returned nothing from a WAL palace with no -shm sidecar; "
+        "the mode=ro open needs an immutable=1 fallback"
+    )
+    assert {emb_id for emb_id, _, _ in extracted} == {r[0] for r in rows}
+
+
 def test_extract_via_sqlite_preserves_typed_metadata(tmp_path):
     """Chromadb stores int / float / bool / string in distinct typed
     columns. Extraction must round-trip the original type, not coerce

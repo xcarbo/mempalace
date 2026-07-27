@@ -251,7 +251,7 @@ def normalize_milvus_consistency_level(value) -> str:
     raise ValueError(f"milvus_consistency_level must be one of: {allowed}")
 
 
-def sqlite_read_uri(db_path: str) -> str:
+def sqlite_read_uri(db_path: str, *, immutable: bool = False) -> str:
     """Return a read-only ``file:`` URI for ``sqlite3.connect(..., uri=True)``.
 
     A bare ``f"file:{db_path}?mode=ro"`` mis-parses paths containing spaces or
@@ -259,11 +259,24 @@ def sqlite_read_uri(db_path: str) -> str:
     user folder like ``First Last``, many macOS paths). ``pathname2url``
     percent-encodes the path and normalizes separators so the database opens on
     every platform.
+
+    ``immutable=True`` additionally promises SQLite the file cannot change,
+    which skips locking and the shared-memory index entirely. That is the only
+    way to read a **WAL-mode database whose ``-shm`` file is absent**: a plain
+    ``mode=ro`` open of one fails with ``unable to open database file``, because
+    a read-only connection cannot create the ``-shm`` it needs. Archived
+    palaces are exactly that shape.
+
+    Only pass ``immutable=True`` for a source nothing is writing — an archive
+    or a copy. Using it on the live palace can return torn or stale pages.
     """
     from urllib.request import pathname2url
 
     db_path = os.fspath(db_path)
-    return f"file:{pathname2url(db_path)}?mode=ro"
+    uri = f"file:{pathname2url(db_path)}?mode=ro"
+    if immutable:
+        uri += "&immutable=1"
+    return uri
 
 
 @lru_cache(maxsize=1)

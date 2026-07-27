@@ -1311,7 +1311,20 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
     if not os.path.isfile(sqlite_path):
         return
 
-    conn = sqlite3.connect(sqlite_read_uri(sqlite_path), uri=True)
+    try:
+        conn = sqlite3.connect(sqlite_read_uri(sqlite_path), uri=True)
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+    except sqlite3.OperationalError:
+        # A WAL-mode database with no ``-shm`` sidecar cannot be opened
+        # read-only — SQLite needs the shared-memory index and ``mode=ro`` may
+        # not create it. ``repair --archive-existing`` produces precisely that
+        # shape, so without this fallback the rebuild path cannot read its own
+        # archive (it fails with "unable to open database file", reported
+        # against the destination collection, which points triage at the wrong
+        # file). ``immutable=1`` is safe here: a rebuild source is quiesced by
+        # construction.
+        conn = sqlite3.connect(sqlite_read_uri(sqlite_path, immutable=True), uri=True)
+
     try:
         seg_row = conn.execute(
             """
