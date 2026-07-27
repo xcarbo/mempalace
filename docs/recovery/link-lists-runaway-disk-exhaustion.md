@@ -298,6 +298,52 @@ putting it after gives `invalid choice` on `repair_action`.
    forget it.
 4. **Verify** with a known-good query before trusting recall.
 
+## What was actually done (2026-07-27)
+
+Upstream report: **[chroma-core/chroma#7510]**(https://github.com/chroma-core/chroma/issues/7510).
+(Filed against `chroma` because issues are disabled on `chroma-core/hnswlib`,
+where the code lives.)
+
+| Change | Where |
+|---|---|
+| `reclaim_runaway_link_lists()` — deletes any `link_lists.bin` over its header-derived ceiling, runs first in the pre-open safety pass, and scans quarantined dirs | `mempalace/backends/chroma.py` |
+| `palace_disk_guard.py` — 15-min cron (`12-59/15`): header ceiling, free-space floor on **both** volumes, and a write probe | `mempalace-tools`, `~/.agents/palace-disk-guard.toml` |
+| `repair --mode from-sqlite` could not read its own archive (WAL + `mode=ro` + no `-shm`) | `mempalace/repair.py`, `config.py` |
+| Palace relocated to `/Volumes/xData/.mempalace`, `~/.mempalace` now a symlink | — |
+| `backup.sh` — resolve the symlink, refuse an undersized/near-empty archive | `mempalace-tools` |
+
+### Detection was never the gap — reclamation was
+
+The pre-existing link-to-data ratio gate **did** fire and quarantine the
+segment at 07:56. It renamed the directory aside and left all 231 GiB in place.
+The host then died twice more. When adding safeguards to this class of failure,
+verify they *free* bytes rather than merely relabel them.
+
+### Relocating the palace: two traps
+
+The palace now lives on `/Volumes/xData` so a runaway can no longer take the
+boot volume's swap with it. Two things bite immediately:
+
+**macOS TCC is per-binary.** launchd-spawned processes are blocked from
+external volumes unless that specific binary holds Full Disk Access, and the
+grant is revoked silently across macOS updates. Measured on this host:
+
+| Spawned by | Writes to `/Volumes/xData` |
+|---|---|
+| `/bin/bash` under a LaunchAgent | **blocked** (silent EPERM) |
+| `mempalace-api`'s venv python under a LaunchAgent | allowed |
+| cron (`/usr/sbin/cron`) children | allowed |
+
+Test before trusting it, and keep the guard's write probe in place — it turns
+a silent revocation into a visible trip within 15 minutes.
+
+**`tar` archives a symlink, not its target.** `backup.sh` ran
+`tar -C "$HOME" .mempalace`; once `~/.mempalace` became a symlink that produced
+a **362-byte tarball that still exited 0 and logged "backup complete"** — a
+total, silent backup loss. Resolve with `pwd -P` and archive from the real
+parent. The same trap applies to `find ~/.mempalace` (no trailing slash does
+not descend). Any backup should assert a floor on its own output.
+
 ## Hardening worth doing
 
 - **Reclaim on quarantine.** The integrity gate renames but never frees. When
@@ -349,9 +395,21 @@ putting it after gives `invalid choice` on `repair_action`.
 find ~/.mempalace/palace -name 'link_lists.bin' -exec du -h {} \;
 ```
 
-Anything above a few MB is suspect. Compare against `ls -lh` on the same file:
-**if `du` and `ls` disagree, trust `du`** — during this incident `ls` reported
-258 MB for a file holding 231 GiB of blocks.
+Anything above a few MB is suspect. **If `du` and `ls` disagree, trust `du`** —
+`du` reports allocated blocks, which is what fills the disk.
+
+Or just ask the guard, which computes each segment's exact ceiling from its own
+`header.bin` and checks both volumes plus writability:
+
+```bash
+python3 ~/code/mini-utils/mempalace-tools/palace_disk_guard.py
+```
+
+A caveat on the incident's own numbers: the write-up records a 258 MB apparent
+size against 231 GiB of blocks. That is not physically constructible —
+`st_blocks` cannot exceed the file length — so treat it as a reading taken
+against the wrong path (three directories shared the UUID prefix by then), not
+as a property of this failure.
 
 ## Incident timeline (host `xcarbo-dev`)
 
