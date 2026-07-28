@@ -171,3 +171,96 @@ def test_cwd_leaf_derivation_matches_pre_merge_fork(tmp_path, leaf, expected):
 )
 def test_transcript_path_fallbacks_match_pre_merge_fork(path, expected):
     assert _wing_from_transcript_path(path) == expected
+
+
+# --- linked git worktrees resolve to the project, not the checkout dir ---
+#
+# Regression for the `worktree` wing: a herdr-spawn worktree checks out to
+# ~/.local/state/herdr-spawn/<id>/worktree, so EVERY agent in EVERY repo
+# derived the same junk wing (10 diary drawers landed there before this fix).
+# The .claude/worktrees shape splits a project's memory into a sibling wing
+# instead. Both must route to the main repo's wing.
+
+
+def _make_linked_worktree(tmp_path: Path, main_name: str, checkout: Path) -> Path:
+    """Build the on-disk shape git creates for a linked worktree."""
+    main = tmp_path / main_name
+    (main / ".git" / "worktrees" / checkout.name).mkdir(parents=True)
+    checkout.mkdir(parents=True, exist_ok=True)
+    (checkout / ".git").write_text(
+        f"gitdir: {main / '.git' / 'worktrees' / checkout.name}\n", encoding="utf-8"
+    )
+    return main
+
+
+def test_herdr_spawn_worktree_routes_to_project_wing(tmp_path):
+    """The killer case: checkout dir is literally named ``worktree``."""
+    checkout = tmp_path / "state" / "herdr-spawn" / "torq-fix-260728" / "worktree"
+    _make_linked_worktree(tmp_path, "torq-terminal", checkout)
+
+    transcript = _write_transcript(tmp_path, checkout)
+    assert _wing_from_transcript_path(transcript) == "torq-terminal"
+
+
+def test_dot_claude_worktree_routes_to_project_wing(tmp_path):
+    checkout = tmp_path / "mempalace" / ".claude" / "worktrees" / "federated-mixing-micali"
+    _make_linked_worktree(tmp_path, "mempalace", checkout)
+
+    transcript = _write_transcript(tmp_path, checkout)
+    assert _wing_from_transcript_path(transcript) == "mempalace"
+
+
+def test_palace_wing_pin_in_main_repo_beats_worktree_derivation(tmp_path):
+    """A pin that is gitignored lives only in the main repo — honour it anyway."""
+    checkout = tmp_path / "state" / "spawn" / "worktree"
+    main = _make_linked_worktree(tmp_path, "torq", checkout)
+    (main / ".palace-wing").write_text("torq-terminal\n", encoding="utf-8")
+
+    transcript = _write_transcript(tmp_path, checkout)
+    assert _wing_from_transcript_path(transcript) == "torq-terminal"
+
+
+def test_ordinary_checkout_is_untouched_by_worktree_resolution(tmp_path):
+    """A .git DIRECTORY is not a linked worktree — derivation must not change."""
+    project = tmp_path / "mempalace"
+    (project / ".git").mkdir(parents=True)
+
+    transcript = _write_transcript(tmp_path, project)
+    assert _wing_from_transcript_path(transcript) == "mempalace"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "",  # empty .git file
+        "not a gitdir line",  # unparseable
+        "gitdir: /somewhere/else/.git",  # a submodule, not a worktree
+        "gitdir: /a/.git/worktrees",  # truncated, no <name> component
+    ],
+)
+def test_malformed_git_file_falls_back_to_leaf(tmp_path, body):
+    """Never crash a hook on a weird .git file — fall back to the old behaviour."""
+    project = tmp_path / "someproj"
+    project.mkdir()
+    (project / ".git").write_text(body, encoding="utf-8")
+
+    transcript = _write_transcript(tmp_path, project)
+    assert _wing_from_transcript_path(transcript) == "someproj"
+
+
+def test_encoded_fallback_strips_worktree_suffix():
+    """No cwd in the transcript — the encoded marker still names the project.
+
+    The invariant is *parity*, not a literal: a worktree session must land in
+    the same wing as an ordinary session of the same repo. The encoded fallback
+    does not strip ``/Volumes`` path prefixes (pinned above by
+    ``test_transcript_path_fallbacks_match_pre_merge_fork``), so both sides
+    carry that prefix — only the checkout noise is removed.
+    """
+    base = "/Users/xdev/.claude/projects/-Volumes-xData-codeXD-mempalace"
+    worktree_path = f"{base}-.claude-worktrees-federated-mixing-micali/s.jsonl"
+
+    assert _wing_from_transcript_path(worktree_path) == _wing_from_transcript_path(
+        f"{base}/s.jsonl"
+    )
+    assert "worktrees" not in _wing_from_transcript_path(worktree_path)

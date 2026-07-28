@@ -1001,6 +1001,53 @@ def _bare_wing_slug(name: str) -> str:
     return slug or "sessions"
 
 
+def _main_worktree_root(cwd: str) -> Optional[str]:
+    """Resolve a git worktree checkout back to its main repository root.
+
+    A session running in a linked worktree must file under the PROJECT's wing,
+    not the checkout directory's name. Two shapes bite in practice:
+
+    * ``herdr-spawn --worktree`` checks out to
+      ``~/.local/state/herdr-spawn/<id>/worktree`` — the leaf segment is the
+      literal string ``worktree``, so every agent in every repo derived the
+      same junk wing.
+    * ``.claude/worktrees/<slug>`` checkouts derive
+      ``<project>-.claude-worktrees-<slug>`` — a sibling wing that splits a
+      project's memory in two.
+
+    A linked worktree's ``.git`` is a FILE containing ``gitdir: <path>``
+    pointing at ``<main>/.git/worktrees/<name>``, so the main root is three
+    levels up. Parsed directly rather than shelling out to ``git`` — hooks have
+    a sub-500ms budget and must not depend on git being on PATH.
+
+    Returns the main worktree root, or ``None`` when ``cwd`` is not a linked
+    worktree (an ordinary checkout has a ``.git`` DIRECTORY and is left alone).
+    """
+    try:
+        gitfile = Path(cwd) / ".git"
+        if not gitfile.is_file():
+            return None  # ordinary checkout, or not a repo at all
+        text = gitfile.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+    match = re.match(r"gitdir:\s*(.+)$", text, re.MULTILINE)
+    if not match:
+        return None
+
+    gitdir = Path(match.group(1).strip())
+    if not gitdir.is_absolute():
+        gitdir = Path(cwd) / gitdir
+
+    # <main>/.git/worktrees/<name> — anything else is not a linked worktree.
+    parts = gitdir.parts
+    if len(parts) < 4 or parts[-2] != "worktrees" or parts[-3] != ".git":
+        return None
+
+    root = Path(*parts[:-3])
+    return str(root) if str(root) not in ("", "/") else None
+
+
 def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
     """Read ``cwd`` from the first JSONL line that records it.
 
@@ -1032,18 +1079,27 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                 cwd_norm = cwd.replace("\\", "/").rstrip("/")
                 if not cwd_norm:
                     continue
+                # A linked git worktree must resolve to the PROJECT it belongs
+                # to, not the checkout dir's name (which is often the literal
+                # "worktree"). Ordinary checkouts return None and fall through
+                # unchanged.
+                project_root = _main_worktree_root(cwd_norm) or cwd_norm
+
                 # A .palace-wing file in the project root pins the wing
                 # explicitly (bare name, no wing_ prefix); it wins over
-                # leaf-segment derivation.
-                try:
-                    override = Path(cwd_norm) / ".palace-wing"
-                    if override.is_file():
-                        pinned = override.read_text(encoding="utf-8").strip()
-                        if pinned:
-                            return pinned.splitlines()[0].strip()
-                except OSError:
-                    pass
-                project = cwd_norm.rsplit("/", 1)[-1]
+                # leaf-segment derivation. Check the main repo root first so a
+                # pin that is gitignored (and therefore absent from the linked
+                # worktree) is still honoured.
+                for candidate in (project_root, cwd_norm):
+                    try:
+                        override = Path(candidate) / ".palace-wing"
+                        if override.is_file():
+                            pinned = override.read_text(encoding="utf-8").strip()
+                            if pinned:
+                                return pinned.splitlines()[0].strip()
+                    except OSError:
+                        pass
+                project = project_root.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
                 if project:
                     # Bare hyphenated leaf (e.g. ``cc``, ``hunt-1``) — matches
                     # the palace convention used by deliberate writes, so hook
@@ -1112,6 +1168,13 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
             if encoded.startswith(prefix):
                 encoded = encoded[len(prefix) :]
                 break
+        # Worktree checkouts encode as ``<project>-.claude-worktrees-<slug>``.
+        # Without cwd in the transcript we cannot resolve the repo, but the
+        # marker itself is unambiguous: everything from it on is checkout
+        # noise, and the project name sits in front of it.
+        wt = re.split(r"-\.claude-worktrees-", encoded, maxsplit=1)
+        if len(wt) == 2 and wt[0]:
+            encoded = wt[0]
         return _bare_wing_slug(encoded)
 
     # 3. Legacy — explicit -Projects-<name> segment
