@@ -188,6 +188,12 @@ def get_collection(
         from .config import get_configured_collection_name
 
         collection_name = get_configured_collection_name()
+    # Expand ~ and $VARS before anything touches the filesystem. Without this
+    # a caller passing "~/.mempalace/palace" silently gets a brand-new EMPTY
+    # palace in a literal "~" directory under the CWD (create=True), which
+    # looks exactly like total memory loss and leaves a stray dir behind.
+    if isinstance(palace_path, str):
+        palace_path = os.path.expanduser(os.path.expandvars(palace_path))
     backend_obj = get_backend_for_palace(palace_path, explicit=backend)
     palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
     try:

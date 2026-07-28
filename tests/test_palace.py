@@ -185,3 +185,38 @@ def test_open_collection_or_explain_distinguishes_collection_subclass(tmp_path, 
     assert result is None
     assert any("initialized but empty" in line for line in lines)
     assert not any("No palace found" in line for line in lines)
+
+
+def test_get_collection_expands_tilde_instead_of_creating_a_literal_dir(tmp_path, monkeypatch):
+    """``~`` must resolve to HOME, not become a directory named "~".
+
+    With create=True an unexpanded "~/.mempalace/palace" silently produced a
+    brand-new EMPTY palace under the CWD — indistinguishable from total memory
+    loss, and it littered a stray "~" directory in whatever repo you happened
+    to be standing in.
+    """
+    home = tmp_path / "home"
+    real_palace = home / ".mempalace" / "palace"
+    real_palace.mkdir(parents=True)
+    make_minimal_chroma_sqlite(real_palace)
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    seen = {}
+
+    def fake_backend(palace_path, explicit=None):
+        seen["path"] = palace_path
+        raise PalaceNotFoundError(str(palace_path))
+
+    monkeypatch.setattr("mempalace.palace.get_backend_for_palace", fake_backend)
+
+    try:
+        get_collection("~/.mempalace/palace")
+    except PalaceNotFoundError:
+        pass
+
+    assert seen["path"] == str(real_palace)
+    assert "~" not in seen["path"]
+    assert not (tmp_path / "~").exists()
