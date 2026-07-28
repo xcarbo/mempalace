@@ -2393,12 +2393,24 @@ def _logical_drawer_record(col, drawer_id: str):
     return _logical_chunk_group(col, drawer_id)
 
 
+def _content_digest(content) -> str:
+    """sha256 of a logical drawer's content — the check-and-set token.
+
+    Exposed as ``content_sha256`` on every get_drawer payload and accepted by
+    ``update_drawer(if_unchanged=...)``. Callers must never re-derive this by
+    piping ``content`` through a shell (trailing newlines from ``jq -r`` change
+    the digest); read the field the palace returns.
+    """
+    return hashlib.sha256(str(content or "").encode("utf-8")).hexdigest()
+
+
 def _drawer_payload(record):
     safe_meta = _response_safe_meta(record["metadata"])
 
     payload = {
         "drawer_id": record["drawer_id"],
         "content": record["content"],
+        "content_sha256": _content_digest(record["content"]),
         "wing": safe_meta.get("wing", ""),
         "room": safe_meta.get("room", ""),
         "metadata": safe_meta,
@@ -3215,8 +3227,21 @@ def tool_list_drawers(
         return {"error": str(e)}
 
 
-def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, room: str = None):
-    """Update an existing logical drawer's content and/or metadata."""
+def tool_update_drawer(
+    drawer_id: str,
+    content: str = None,
+    wing: str = None,
+    room: str = None,
+    if_unchanged: str = None,
+):
+    """Update an existing logical drawer's content and/or metadata.
+
+    ``if_unchanged`` makes the write check-and-set: pass the ``content_sha256``
+    from the get_drawer call you synthesized against and the update is refused
+    if anyone rewrote the drawer in between. Singleton drawers (a project's
+    roadmap, the wings-registry) are read-modify-write, so a blind second writer
+    silently reverts the first — that is what this guards.
+    """
     global _metadata_cache
 
     if content is None and wing is None and room is None:
@@ -3233,6 +3258,24 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
         old_meta = _safe_meta(record["metadata"])
         old_doc = record["content"]
+
+        if if_unchanged is not None:
+            expected = str(if_unchanged).strip().lower()
+            actual = _content_digest(old_doc)
+            if expected != actual:
+                return {
+                    "success": False,
+                    "conflict": True,
+                    "drawer_id": drawer_id,
+                    "expected_sha256": expected,
+                    "actual_sha256": actual,
+                    "error": (
+                        f"Drawer {drawer_id} changed since you read it "
+                        f"(expected {expected[:12]}…, found {actual[:12]}…). "
+                        "Nothing was written. Re-fetch the drawer, re-apply your "
+                        "edit on top of the current content, and retry."
+                    ),
+                }
 
         new_doc = old_doc
         if content is not None:
@@ -4521,7 +4564,7 @@ TOOLS = {
         "handler": tool_sync,
     },
     "mempalace_get_drawer": {
-        "description": "Fetch a single drawer by ID — returns full content and metadata.",
+        "description": "Fetch a single drawer by ID — returns full content, metadata, and content_sha256 (pass that back as update_drawer's if_unchanged for a check-and-set write).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -4562,7 +4605,7 @@ TOOLS = {
         "handler": tool_list_drawers,
     },
     "mempalace_update_drawer": {
-        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found.",
+        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found. Pass if_unchanged for a check-and-set write — required practice for singleton drawers (a project's roadmap, the wings-registry) where a blind second writer silently reverts the first.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -4578,6 +4621,10 @@ TOOLS = {
                 "room": {
                     "type": "string",
                     "description": "New room (optional — omit to keep existing)",
+                },
+                "if_unchanged": {
+                    "type": "string",
+                    "description": "Check-and-set token: the content_sha256 returned by the get_drawer call you synthesized against. The write is refused with conflict=true if the drawer changed since. Use the field verbatim — re-hashing piped content adds a trailing newline and never matches.",
                 },
             },
             "required": ["drawer_id"],

@@ -2471,6 +2471,82 @@ class TestWriteTools:
         assert result["success"] is True
         assert result.get("noop") is True
 
+    def test_get_drawer_exposes_content_sha256(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """The CAS token is the digest of the content the caller actually read."""
+        import hashlib
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_get_drawer
+
+        fetched = tool_get_drawer("drawer_proj_backend_aaa")
+        assert (
+            fetched["content_sha256"]
+            == hashlib.sha256(fetched["content"].encode("utf-8")).hexdigest()
+        )
+
+    def test_update_drawer_if_unchanged_matching_digest_writes(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_get_drawer, tool_update_drawer
+
+        before = tool_get_drawer("drawer_proj_backend_aaa")
+        result = tool_update_drawer(
+            "drawer_proj_backend_aaa",
+            content="Rewritten under CAS.",
+            if_unchanged=before["content_sha256"],
+        )
+
+        assert result["success"] is True
+        assert tool_get_drawer("drawer_proj_backend_aaa")["content"] == "Rewritten under CAS."
+
+    def test_update_drawer_if_unchanged_stale_digest_refuses(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """Second writer holding a stale digest must not clobber the first.
+
+        This is the roadmap-singleton race: agent A and agent B both read the
+        drawer, A writes, then B writes from its now-stale baseline and silently
+        reverts A.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_get_drawer, tool_update_drawer
+
+        stale = tool_get_drawer("drawer_proj_backend_aaa")["content_sha256"]
+
+        assert tool_update_drawer("drawer_proj_backend_aaa", content="agent A wrote this")[
+            "success"
+        ]
+
+        result = tool_update_drawer(
+            "drawer_proj_backend_aaa",
+            content="agent B clobbering from a stale read",
+            if_unchanged=stale,
+        )
+
+        assert result["success"] is False
+        assert result["conflict"] is True
+        assert result["expected_sha256"] == stale
+        assert result["actual_sha256"] != stale
+        # The refusal must leave agent A's write intact.
+        assert tool_get_drawer("drawer_proj_backend_aaa")["content"] == "agent A wrote this"
+
+    def test_update_drawer_if_unchanged_accepts_uppercase_digest(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_get_drawer, tool_update_drawer
+
+        digest = tool_get_drawer("drawer_proj_backend_aaa")["content_sha256"]
+        result = tool_update_drawer(
+            "drawer_proj_backend_aaa",
+            content="case-insensitive token",
+            if_unchanged=f"  {digest.upper()}  ",
+        )
+        assert result["success"] is True
+
     def test_tool_create_tunnel_preserves_hyphenated_wings(self, monkeypatch, tmp_path):
         """Regression for #1504: ``tool_create_tunnel`` stores the wing slug
         verbatim, and both hyphen and underscore queries find the result."""
