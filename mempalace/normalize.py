@@ -45,6 +45,10 @@ _NOISE_TAGS = (
     "system-reminder",
     "command-message",
     "command-name",
+    # Without this, stripping <command-message> leaves a bare
+    # "<command-args></command-args>" orphan that clears the chunk floor and
+    # gets filed as a drawer (49 such drawers observed in the sessions wing).
+    "command-args",
     "task-notification",
     "user-prompt-submit-hook",
     "hook_output",
@@ -81,6 +85,28 @@ _NOISE_LINE_PREFIXES = (
 
 _NOISE_LINE_PATTERNS = [
     re.compile(rf"(?m)^(?:> )?{re.escape(p)}.*\n?") for p in _NOISE_LINE_PREFIXES
+]
+
+# ─── Agent-harness scaffolding ───────────────────────────────────────────
+# Multi-agent workflows seed subagents with fixed prompt boilerplate, and the
+# transcript miner files each occurrence as its own drawer. Measured in the
+# sessions wing (20k sample): 218 copies of the refute instruction, 218 of the
+# voter headers, 33 of the docs-fetch line. These are machine-generated
+# scaffolding, never the user's words, and they crowd canonical drawers out of
+# top-N (golden-recall lost the wings-registry and roadmap queries to exactly
+# this class of drawer).
+#
+# Anchored to line start and matched on the generated wording only — prose
+# that merely discusses being skeptical or verifying claims is untouched.
+_SCAFFOLDING_LINE_RES = [
+    # "Be SKEPTICAL. Try to REFUTE this claim. ≥2/3 refutations kill it."
+    re.compile(r"(?m)^(?:> )?Be SKEPTICAL\. Try to REFUTE this claim\..*\n?"),
+    # "## Adversarial Claim Verifier (voter 1/3)"
+    re.compile(r"(?m)^(?:> )?#*\s*Adversarial Claim Verifier \(voter \d+/\d+\).*\n?"),
+    # "Fetch the complete documentation index at: https://code.claude.com/..."
+    re.compile(r"(?m)^(?:> )?Fetch the complete documentation index at:.*\n?"),
+    # "Work from: /path/to/dir" — the seeded cwd line in spawned-agent briefs.
+    re.compile(r"(?m)^(?:> )?Work from: /\S*\s*\n?"),
 ]
 
 # Claude Code TUI hook-run chrome, e.g. "Ran 2 Stop hook", "Ran 1 PreCompact hook".
@@ -168,6 +194,8 @@ def strip_noise(text: str) -> str:
     for pat in _NOISE_TAG_PATTERNS:
         text = pat.sub("", text)
     for pat in _NOISE_LINE_PATTERNS:
+        text = pat.sub("", text)
+    for pat in _SCAFFOLDING_LINE_RES:
         text = pat.sub("", text)
     text = _HOOK_LINE_RE.sub("", text)
     text = _COLLAPSED_LINES_RE.sub("", text)

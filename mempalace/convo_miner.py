@@ -75,6 +75,12 @@ CONVO_EXTENSIONS = {
 # only — project mining semantics are unchanged.
 CONVO_SKIP_DIRS = SKIP_DIRS | {"tool-results"}
 
+# Deliberately 30, NOT config.DEFAULT_MIN_CHUNK_SIZE (50). Raising it to 50 was
+# tried while cleaning up sessions-wing noise and reverted: it silently dropped
+# genuine short exchanges ("> What is memory?\nMemory is persistence." is 40
+# chars) and the meaningful trailing remainder that #1534 exists to preserve.
+# Verbatim is sacred — machine-generated scaffolding is removed by pattern in
+# normalize.strip_noise, never by a length floor over the user's words.
 MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
 _LINE_GROUP_SIZE = 25  # lines per fallback group when no paragraph breaks

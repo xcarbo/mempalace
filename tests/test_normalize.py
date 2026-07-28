@@ -2,6 +2,8 @@ import json
 import stat
 from unittest.mock import patch
 
+import pytest
+
 from mempalace.normalize import (
     _SLACK_PROVENANCE_FOOTER,
     _extract_content,
@@ -2073,3 +2075,54 @@ class TestStripSearchDumps:
     def test_prose_mentioning_results_for_untouched(self):
         text = '> The banner says Results for: "x" — why?\nGood question.'
         assert strip_noise(text) == text.strip()
+
+
+class TestStripAgentScaffolding:
+    """Multi-agent harness boilerplate must never become drawers.
+
+    Measured in the live sessions wing (20k-drawer sample): 218 copies of the
+    refute instruction, 218 voter headers, 49 command-arg orphans, 33
+    docs-fetch lines. That class of drawer is what pushed the wings-registry
+    and mempalace-roadmap queries out of golden-recall's top 10.
+    """
+
+    @pytest.mark.parametrize(
+        ("label", "text"),
+        [
+            (
+                "refute-instruction",
+                "Be SKEPTICAL. Try to REFUTE this claim. ≥2/3 refutations kill it.",
+            ),
+            ("voter-header", "> ## Adversarial Claim Verifier (voter 1/3)"),
+            ("voter-header-3", "## Adversarial Claim Verifier (voter 3/3)"),
+            (
+                "docs-fetch",
+                "> Fetch the complete documentation index at: https://code.claude.com/docs/index.md",
+            ),
+            ("work-from", "Work from: /Users/xdev/.mempalace/tools"),
+        ],
+    )
+    def test_scaffolding_is_stripped_to_nothing(self, label, text):
+        assert strip_noise(text) == ""
+
+    def test_command_args_orphan_is_stripped(self):
+        """Stripping <command-message> used to leave a bare <command-args> pair.
+
+        The orphan cleared the old 30-char chunk floor and was filed as a
+        drawer 49 times.
+        """
+        text = "> <command-message>clear</command-message>\n<command-args></command-args>"
+        assert strip_noise(text) == ""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "I told the reviewer to be skeptical about the claim, and we refuted it together.",
+            "The workflow spawns an Adversarial Claim Verifier for each finding.",
+            "Work from home was the policy until March.",
+            "We need to fetch the complete documentation index at some point for the docs site.",
+        ],
+    )
+    def test_prose_lookalikes_survive_verbatim(self, text):
+        """Verbatim is sacred — prose that merely discusses the scaffolding stays."""
+        assert strip_noise(text) == text
