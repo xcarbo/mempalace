@@ -36,9 +36,13 @@ import argparse
 from pathlib import Path
 
 from .config import MempalaceConfig
-from .corpus_origin import detect_origin_heuristic, detect_origin_llm
-from .llm_client import LLMError, get_provider
 from .version import __version__
+
+# corpus_origin and llm_client are imported lazily inside _run_pass_zero — they
+# are only needed by `mempalace init`'s corpus detection, but importing them at
+# module level pulled urllib.request -> http.client -> ssl into EVERY CLI
+# invocation. That includes the Stop hook, which runs on every message.
+# Measured 2026-07-28: ~15ms of the ~47ms `import mempalace.cli` cost.
 
 
 _MEMPALACE_PROJECT_FILES = ("mempalace.yaml", "entities.json")
@@ -164,6 +168,8 @@ def _run_pass_zero(project_dir, palace_dir, llm_provider) -> dict:
     from datetime import datetime, timezone
     from pathlib import Path
 
+    from .corpus_origin import detect_origin_heuristic, detect_origin_llm
+
     samples = _gather_origin_samples(project_dir)
     if not samples:
         print("  Skipping corpus-origin detection — no readable samples.")
@@ -278,6 +284,7 @@ def cmd_init(args):
     import json
     from pathlib import Path
     from .entity_detector import confirm_entities
+    from .llm_client import LLMError, get_provider
     from .project_scanner import discover_entities
     from .room_detector_local import detect_rooms_local
 
