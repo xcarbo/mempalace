@@ -2545,3 +2545,61 @@ def test_mine_limit_summary_counts(tmp_path, capsys):
     assert "Files processed: 2" in out
     assert "Drawers filed: 6" in out
     assert "(limit: 2 new)" in out
+
+
+def test_sqlite_wing_room_counts_collapses_chunks_to_logical_drawers(palace_path, collection):
+    """A chunked drawer is ONE drawer, not one per chunk.
+
+    Chunked drawers store a row per chunk, all sharing ``parent_drawer_id``.
+    Counting rows made a single 12-chunk roadmap report as ``roadmap: 12`` in
+    list_rooms while list_drawers said 1 — for a documented singleton that
+    reads as twelve competing roadmaps. The tally must agree with
+    ``_logical_drawer_record``.
+    """
+    from mempalace.backends.chroma import _sqlite_wing_room_counts
+
+    parent = "drawer_proj_roadmap_abc"
+    collection.add(
+        ids=[f"{parent}_chunk_{i:06d}" for i in range(12)],
+        documents=[f"roadmap chunk {i}" for i in range(12)],
+        metadatas=[
+            {"wing": "proj", "room": "roadmap", "parent_drawer_id": parent, "chunk_index": i}
+            for i in range(12)
+        ],
+    )
+    collection.add(
+        ids=["drawer_proj_decisions_solo"],
+        documents=["an ordinary unchunked drawer"],
+        metadatas=[{"wing": "proj", "room": "decisions"}],
+    )
+
+    result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
+    assert result is not None
+    total, wing_rooms = result
+
+    assert dict(wing_rooms["proj"]) == {"roadmap": 1, "decisions": 1}
+    assert total == 2, "12 chunks + 1 solo drawer is 2 logical drawers"
+
+
+def test_sqlite_wing_room_counts_keeps_distinct_chunked_drawers_apart(palace_path, collection):
+    """Collapsing must key on parent_drawer_id, not merge every chunked row.
+
+    Two different chunked drawers in the same room stay two drawers — a
+    COUNT(DISTINCT) over the wrong column would fold them into one.
+    """
+    from mempalace.backends.chroma import _sqlite_wing_room_counts
+
+    rows_ids, rows_meta, rows_docs = [], [], []
+    for parent in ("drawer_proj_technical_aaa", "drawer_proj_technical_bbb"):
+        for i in range(3):
+            rows_ids.append(f"{parent}_chunk_{i:06d}")
+            rows_docs.append(f"{parent} chunk {i}")
+            rows_meta.append(
+                {"wing": "proj", "room": "technical", "parent_drawer_id": parent, "chunk_index": i}
+            )
+    collection.add(ids=rows_ids, documents=rows_docs, metadatas=rows_meta)
+
+    result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
+    assert result is not None
+    _, wing_rooms = result
+    assert dict(wing_rooms["proj"]) == {"technical": 2}

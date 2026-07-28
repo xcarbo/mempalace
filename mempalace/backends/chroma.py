@@ -892,7 +892,16 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
 def _sqlite_wing_room_counts(
     palace_path: str, collection_name: str
 ) -> Optional[tuple[int, dict[str, dict[str, int]]]]:
-    """Tally drawers by wing/room straight from ``chroma.sqlite3``.
+    """Tally LOGICAL drawers by wing/room straight from ``chroma.sqlite3``.
+
+    Counts drawers, not embedding rows. A chunked drawer occupies one row per
+    chunk, all sharing a ``parent_drawer_id``; counting rows made a single
+    12-chunk roadmap read as ``roadmap: 12`` in ``list_rooms`` while
+    ``list_drawers`` correctly reported 1 — indistinguishable from twelve
+    competing roadmap drawers, which is an alarming thing to see for a
+    singleton. ``COUNT(DISTINCT COALESCE(parent_drawer_id, e.id))`` collapses
+    each chunk family to one and leaves unchunked rows counting as themselves,
+    matching ``_logical_drawer_record`` / ``_dedupe_by_drawer_id``.
 
     Returns ``(total, {wing: {room: count}})`` or ``None`` when the read
     cannot be trusted — missing DB file, the collection has not been
@@ -952,12 +961,15 @@ def _sqlite_wing_room_counts(
                                 CAST(wm.float_value AS TEXT), '?') AS wing,
                        COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
                                 CAST(rm.float_value AS TEXT), '?') AS room,
-                       COUNT(*) AS n
+                       COUNT(DISTINCT COALESCE(pm.string_value,
+                                               CAST(e.id AS TEXT))) AS n
                 FROM embeddings e
                 JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
                 JOIN collections c ON s.collection = c.id
                 LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
                 LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
+                LEFT JOIN embedding_metadata pm ON pm.id = e.id
+                     AND pm.key = 'parent_drawer_id'
                 WHERE c.name = ?
                 GROUP BY wing, room
                 """,
