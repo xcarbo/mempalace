@@ -62,6 +62,22 @@ def _no_retrieval_log(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_local_rerank(monkeypatch):
+    """Never let the ambient shell's local reranker decide test outcomes.
+
+    ``rerank_enabled()`` keys off MEMPALACE_RERANK_URL + MEMPALACE_RERANK_MODEL,
+    which this machine's zshrc exports for every interactive shell and agent.
+    With them set, ranking assertions were silently re-scored by LM Studio:
+    ``test_effective_distance_clamped_to_valid_cosine_range`` and
+    ``test_search_union_uses_sqlite_exact_lexical_search`` failed locally while
+    passing in CI, and the results also depended on :1234 being up. Tests that
+    exercise reranking set these vars themselves.
+    """
+    monkeypatch.delenv("MEMPALACE_RERANK_URL", raising=False)
+    monkeypatch.delenv("MEMPALACE_RERANK_MODEL", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _reset_mcp_cache():
     """Reset cached MCP state between tests without importing mcp_server.
 

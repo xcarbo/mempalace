@@ -47,6 +47,18 @@ def _fake_urlopen_factory(vectors, calls=None):
 
 
 class TestGating:
+    def test_suite_runs_with_rerank_off_regardless_of_ambient_env(self):
+        """Guard the autouse ``_no_local_rerank`` fixture in conftest.
+
+        Deliberately touches no env vars: this machine's zshrc exports
+        MEMPALACE_RERANK_URL/_MODEL into every shell and agent, and when they
+        leaked into the suite LM Studio silently re-scored ranking assertions
+        (two tests failed locally, passed in CI). Unlike
+        ``test_disabled_by_default``, which clears the vars itself, this fails
+        if the fixture is removed.
+        """
+        assert rerank_enabled() is False
+
     def test_disabled_by_default(self, monkeypatch):
         monkeypatch.delenv(rerank.RERANK_URL_ENV, raising=False)
         monkeypatch.delenv(rerank.RERANK_MODEL_ENV, raising=False)
