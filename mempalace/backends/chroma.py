@@ -2686,21 +2686,37 @@ class ChromaBackend(BaseBackend):
         path = palace.local_path if isinstance(palace, PalaceRef) else palace
         if path is None:
             return
+        # Fold the WAL back so mode=ro readers can reopen and the -wal file
+        # stays bounded. Done BEFORE releasing the client — see close() for why
+        # the reverse order is a SIGBUS risk rather than merely untidy. Still
+        # unconditional (even without a cached client) so an orphaned -wal left
+        # by another handle is cleaned up too.
+        checkpoint_wal(path)
         _close_client(self._clients.pop(path, None))
         self._freshness.pop(path, None)
-        # Writer released: fold the WAL back so mode=ro readers can reopen and
-        # the -wal file stays bounded. Unconditional (even without a cached
-        # client) so an orphaned -wal left by another handle is cleaned up too.
-        checkpoint_wal(path)
 
     def close(self) -> None:
+        # Checkpoint BEFORE releasing the clients, never after. Once chromadb's
+        # Rust core has dropped a palace, a statement issued by Python's
+        # sqlite3 against that same file can land on a mapping the core left
+        # behind — and if the file was unlinked and recreated in between (a
+        # rebuild, a repair, a test's rmtree) that access is a **SIGBUS**, not
+        # an exception. checkpoint_wal's `except sqlite3.Error` cannot catch a
+        # signal; the interpreter dies mid-close with no traceback.
+        #
+        # Whether it fires depends on the SQLite build (3.51.0 survives;
+        # 3.50.4 and 3.53.3 die), which is why this went unnoticed for so long
+        # — see palace.warn_if_sqlite_untested().
+        #
+        # Checkpointing while the client is still attached is safe and just as
+        # effective: measured, a 4.2 MB -wal truncates to 0 bytes either way.
         paths = list(self._clients.keys())
+        for path in paths:
+            checkpoint_wal(path)
         for client in self._clients.values():
             _close_client(client)
         self._clients.clear()
         self._freshness.clear()
-        for path in paths:
-            checkpoint_wal(path)
         self._closed = True
 
     def health(self, palace: Optional[PalaceRef] = None) -> HealthStatus:
