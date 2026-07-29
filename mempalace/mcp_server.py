@@ -78,6 +78,7 @@ from .backends.chroma import (  # noqa: E402
 from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .retrieval_log import log_retrieval  # noqa: E402
+from .write_log import ERR_CAS_CONFLICT, log_write, log_write_failure  # noqa: E402
 from .searcher import (  # noqa: E402
     _distance_to_similarity,
     _metric_for_collection,
@@ -2691,6 +2692,14 @@ def tool_add_drawer(
             _outbox_emit(_config, wing, drawer_id, "added")
         except Exception:
             pass
+        log_write(
+            "add_drawer",
+            ok=True,
+            drawer_id=drawer_id,
+            wing=wing,
+            room=room,
+            chunks=len(chunk_ids),
+        )
         return {
             "success": True,
             "drawer_id": drawer_id,
@@ -2700,6 +2709,7 @@ def tool_add_drawer(
             "chunk_ids": chunk_ids,
         }
     except Exception as e:
+        log_write_failure("add_drawer", e, wing=wing, room=room)
         return {"success": False, "error": str(e)}
 
 
@@ -3263,6 +3273,19 @@ def tool_update_drawer(
             expected = str(if_unchanged).strip().lower()
             actual = _content_digest(old_doc)
             if expected != actual:
+                # A refused check-and-set is a real, actionable event: it means
+                # two writers raced on a singleton. It is not an exception, so
+                # nothing else would ever record it.
+                log_write(
+                    "update_drawer",
+                    ok=False,
+                    error_class=ERR_CAS_CONFLICT,
+                    drawer_id=drawer_id,
+                    wing=old_meta.get("wing"),
+                    room=old_meta.get("room"),
+                    expected_sha256=expected[:16],
+                    actual_sha256=actual[:16],
+                )
                 return {
                     "success": False,
                     "conflict": True,
@@ -3344,6 +3367,15 @@ def tool_update_drawer(
             except Exception:
                 pass
 
+            log_write(
+                "update_drawer",
+                ok=True,
+                drawer_id=drawer_id,
+                wing=new_meta.get("wing", ""),
+                room=new_meta.get("room", ""),
+                chunks=len(chunk_ids),
+                checked=if_unchanged is not None,
+            )
             return {
                 "success": True,
                 "drawer_id": drawer_id,
@@ -3370,6 +3402,14 @@ def tool_update_drawer(
         except Exception:
             pass
 
+        log_write(
+            "update_drawer",
+            ok=True,
+            drawer_id=drawer_id,
+            wing=new_meta.get("wing", ""),
+            room=new_meta.get("room", ""),
+            checked=if_unchanged is not None,
+        )
         return {
             "success": True,
             "drawer_id": drawer_id,
@@ -3377,6 +3417,7 @@ def tool_update_drawer(
             "room": new_meta.get("room", ""),
         }
     except Exception as e:
+        log_write_failure("update_drawer", e, drawer_id=drawer_id)
         return {"success": False, "error": str(e)}
 
 

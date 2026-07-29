@@ -29,10 +29,12 @@ from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
 from .locks import (
     ORPHAN_GUIDANCE,
     describe_holder,
+    held_duration_seconds,
     maybe_gc_stale_locks,
     read_holder_record,
     write_holder_record,
 )
+from .write_log import ERR_LOCK_CONTENTION, log_write
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -1070,8 +1072,45 @@ def _write_lock_holder(lock_file) -> None:
 
 
 def _palace_contention_error(resolved: str, lock_path: str, lock_file) -> "MineAlreadyRunning":
-    """Build the rich MineAlreadyRunning for a failed palace-lock acquire."""
-    holder = describe_holder(lock_path, read_holder_record(lock_file))
+    """Build the rich MineAlreadyRunning for a failed palace-lock acquire.
+
+    Also emits the structured `lock_acquire` failure event. This is the single
+    place a contended palace lock is turned into an error, so instrumenting it
+    here catches every caller — CLI, MCP, hooks, HTTP — without touching any of
+    them.
+
+    The prose message stays exactly as it was (it is what a human sees at the
+    moment of failure); the event carries the same facts as *fields*, so the
+    daily health agent can answer "did writes recover?" without regex-scraping
+    English.
+    """
+    record = read_holder_record(lock_file)
+    holder = describe_holder(lock_path, record)
+
+    # Best-effort structured holder facts. A detached background miner is
+    # reparented to PID 1 by design (a hook spawns it, the hook exits), so
+    # holder_ppid is recorded as data — it is NOT on its own evidence of an
+    # orphan. Only an mcp_server with ppid 1 is the reaper's business.
+    holder_pid = holder_ppid = holder_argv = None
+    if isinstance(record, dict):
+        holder_pid = record.get("pid")
+        holder_ppid = record.get("ppid")
+        argv = record.get("argv")
+        if isinstance(argv, (list, tuple)):
+            argv = " ".join(str(a) for a in argv)
+        holder_argv = str(argv)[:300] if argv else None
+
+    log_write(
+        "lock_acquire",
+        ok=False,
+        error_class=ERR_LOCK_CONTENTION,
+        palace=resolved,
+        holder_pid=holder_pid,
+        holder_ppid=holder_ppid,
+        holder_argv=holder_argv,
+        held_seconds=held_duration_seconds(lock_path, record),
+    )
+
     return MineAlreadyRunning(
         f"palace {resolved} is held by {holder}; "
         "wait for it to finish or stop the holder before retrying; " + ORPHAN_GUIDANCE
