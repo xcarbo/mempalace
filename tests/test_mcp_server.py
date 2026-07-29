@@ -2547,6 +2547,121 @@ class TestWriteTools:
         )
         assert result["success"] is True
 
+    # ── check-and-set across the chunked path ──────────────────────────
+    #
+    # The drawers CAS exists to protect are singletons that are read, edited and
+    # written back: a project's roadmap, the wings-registry. Those are long, so
+    # they are stored chunked — one embedding row per chunk sharing
+    # parent_drawer_id, reassembled on read. Every CAS test above uses a short
+    # single-row drawer, so the whole feature is unproven on exactly the drawers
+    # it was written for. If the digest that get_drawer publishes were computed
+    # over anything but the same reassembly update_drawer compares against, CAS
+    # would conflict on every attempt and no guarded roadmap write could ever
+    # land — and nothing here would fail.
+
+    def _chunked_drawer(self, config):
+        """File a drawer long enough to be split, return (id, content)."""
+        from mempalace.mcp_server import tool_add_drawer
+
+        content = " ".join(f"paragraph-{i} verbatim body text" for i in range(200))
+        assert len(content) > config.chunk_size
+        result = tool_add_drawer(wing="project", room="roadmap", content=content)
+        assert result["success"] is True
+        assert result["chunks"] > 1, "fixture must actually exercise the chunked path"
+        return result["drawer_id"], content
+
+    def test_chunked_drawer_is_readable_under_its_logical_id(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """A chunked drawer round-trips verbatim through its logical id.
+
+        tool_add_drawer's docstring still claims get/delete report "not found"
+        on the chunked path. They do not — _logical_drawer_record falls back to
+        the chunk group — and the CAS contract depends on that being true.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_get_drawer
+
+        drawer_id, content = self._chunked_drawer(config)
+
+        fetched = tool_get_drawer(drawer_id)
+        assert fetched["content"] == content
+        assert fetched["chunks"] > 1
+
+    def test_chunked_singleton_accepts_its_own_published_digest(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """get_drawer's digest must be accepted by update_drawer on a chunked drawer.
+
+        This is the documented workflow for a roadmap drawer. A mismatch between
+        the reassembly used to publish content_sha256 and the one used to check
+        it would refuse every guarded write to every long singleton.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_get_drawer, tool_update_drawer
+
+        drawer_id, _ = self._chunked_drawer(config)
+        digest = tool_get_drawer(drawer_id)["content_sha256"]
+
+        new_content = " ".join(f"revised-{i} verbatim body text" for i in range(200))
+        result = tool_update_drawer(drawer_id, content=new_content, if_unchanged=digest)
+
+        assert result["success"] is True
+        assert tool_get_drawer(drawer_id)["content"] == new_content
+
+    def test_chunked_singleton_refuses_a_stale_digest_without_losing_content(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """The lost-update race, on the drawer shape it actually happens to.
+
+        Two agents fan out, both read the roadmap, A writes, B writes from its
+        stale baseline. B must be refused and A's rewrite must survive intact —
+        including the chunk rows, which a partial rewrite would leave mixed
+        between the two versions.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_get_drawer, tool_update_drawer
+
+        drawer_id, _ = self._chunked_drawer(config)
+        stale = tool_get_drawer(drawer_id)["content_sha256"]
+
+        agent_a = " ".join(f"agent-A-{i} wrote this line" for i in range(200))
+        assert tool_update_drawer(drawer_id, content=agent_a)["success"] is True
+
+        agent_b = " ".join(f"agent-B-{i} clobbered this line" for i in range(200))
+        refused = tool_update_drawer(drawer_id, content=agent_b, if_unchanged=stale)
+
+        assert refused["success"] is False
+        assert refused["conflict"] is True
+        after = tool_get_drawer(drawer_id)
+        assert after["content"] == agent_a
+        assert "agent-B" not in after["content"]
+
+    def test_shrinking_a_chunked_drawer_leaves_no_orphan_chunk_rows(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """A shorter rewrite must delete the chunks it no longer needs.
+
+        The update path upserts the new chunk ids and deletes the leftovers. If
+        that delete regressed, the tail of the previous version would stay in the
+        palace and reassembly would splice old text onto new — silent corruption
+        that reads as a plausible drawer.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_get_drawer, tool_update_drawer
+
+        drawer_id, _ = self._chunked_drawer(config)
+        long_chunks = tool_get_drawer(drawer_id)["chunks"]
+
+        short = " ".join(f"short-{i} body" for i in range(60))
+        assert len(short) > config.chunk_size
+        assert tool_update_drawer(drawer_id, content=short)["success"] is True
+
+        after = tool_get_drawer(drawer_id)
+        assert after["content"] == short
+        assert after["chunks"] < long_chunks
+        assert "paragraph-" not in after["content"]
+
     def test_tool_create_tunnel_preserves_hyphenated_wings(self, monkeypatch, tmp_path):
         """Regression for #1504: ``tool_create_tunnel`` stores the wing slug
         verbatim, and both hyphen and underscore queries find the result."""
