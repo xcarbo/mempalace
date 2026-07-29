@@ -77,6 +77,79 @@ def _no_local_rerank(monkeypatch):
     monkeypatch.delenv("MEMPALACE_RERANK_MODEL", raising=False)
 
 
+# Ambient MEMPALACE_* variables that must never reach a test. Every one of
+# these is read by production code, so an exported value silently re-points or
+# re-configures the system under test. Deliberate opt-ins
+# (``MEMPALACE_*_LIVE_URL`` / ``_LIVE_DSN``) are NOT listed — those exist to be
+# set from the shell.
+_AMBIENT_VARS_TO_SCRUB = (
+    # Palace location. The dangerous one: see _no_ambient_config below.
+    "MEMPALACE_PALACE_PATH",
+    "MEMPAL_PALACE_PATH",
+    "MEMPAL_DIR",
+    # Storage backend selection — flips chroma tests onto another backend.
+    "MEMPALACE_BACKEND",
+    "MEMPALACE_BACKEND_EXPLICIT",
+    # Embedding identity — changes vectors, and with them every ranking
+    # assertion, exactly like the rerank leak did.
+    "MEMPALACE_EMBEDDING_MODEL",
+    "MEMPALACE_EMBEDDING_DEVICE",
+    "MEMPALACE_EMBEDDING_THREADS",
+    # Ingest shape.
+    "MEMPALACE_MAX_CHUNKS_PER_FILE",
+    "MEMPALACE_TOPIC_TUNNEL_MIN_COUNT",
+    "MEMPALACE_SOURCE_DIR",
+    # Write path.
+    "MEMPALACE_WRITE_LOG",
+    "MEMPALACE_WRITE_ROUTING",
+    "MEMPALACE_CLI_WRITE_ROUTING",
+    "MEMPALACE_HOOK_WRITE_ROUTING",
+    # A low watchdog budget makes a slow write os._exit the whole test process.
+    "MEMPALACE_WRITE_WATCHDOG_SECONDS",
+    # MCP surface.
+    "MEMPALACE_MCP_READ_ONLY",
+    "MEMPALACE_MCP_ALLOW_PEER_WRITER",
+    "MEMPALACE_MCP_HTTP_TOKEN",
+    # Hooks / daemon / process plumbing.
+    "MEMPALACE_HOOKS_AUTO_SAVE",
+    "MEMPALACE_HOOKS_DAEMON",
+    "MEMPALACE_DAEMON_STATE_ROOT",
+    "MEMPALACE_MINE_PID_FILE",
+    "MEMPALACE_MINE_TIMEOUT_HOURS",
+    "MEMPALACE_PYTHON",
+    "MEMPALACE_LOG_FILE",
+    # Outbox — an exported URL would make tests emit to a real endpoint.
+    "MEMPALACE_OUTBOX_URL",
+    "MEMPALACE_OUTBOX_SECRET",
+    "MEMPALACE_OUTBOX_WINGS",
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_config(monkeypatch):
+    """Strip ambient MEMPALACE_* configuration from every test.
+
+    HOME was already redirected, but ``MempalaceConfig`` reads
+    ``MEMPALACE_PALACE_PATH`` from the environment and that value wins over the
+    ``config`` fixture's config.json. With it exported, twelve tests — including
+    ``test_clean_lone_surrogates.py::TestToolsAcceptSurrogates::test_add_drawer_content``
+    and ``test_cli_api.py::test_full_crud_round_trip`` — stop using their scratch
+    palace and read, write and DELETE against whatever palace the variable names.
+    Pointed at ``~/.mempalace/palace`` that is the user's real 140k-drawer memory,
+    and the suite still reports one failure out of 3,575.
+
+    ``sandbox.env`` exports exactly that variable, so the hazard is one
+    ``source`` away. The rest of the list is the same class of bug with a smaller
+    blast radius: production reads them, so an exported value reconfigures the
+    system under test without changing a line of code.
+
+    Tests that exercise any of these set them explicitly with ``monkeypatch``,
+    which runs after this fixture and therefore still wins.
+    """
+    for var in _AMBIENT_VARS_TO_SCRUB:
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture(autouse=True)
 def _reset_mcp_cache():
     """Reset cached MCP state between tests without importing mcp_server.

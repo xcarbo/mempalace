@@ -30,6 +30,24 @@ def test_config_from_file():
     assert cfg.palace_path == "/custom/palace"
 
 
+def test_env_palace_path_overrides_the_config_file(tmp_path, monkeypatch):
+    """MEMPALACE_PALACE_PATH beats config.json — the opposite of ``backend``.
+
+    Pinned deliberately, because this asymmetry is a trap. ``backend`` takes the
+    config file over the environment (see the next test); ``palace_path`` takes
+    the environment over the config file. That is why ``conftest`` scrubs the
+    variable from every test: exported, it re-points a dozen tests — including
+    the add/update/delete round trips — off their scratch palace and onto
+    whatever it names, while the suite still reports a single failure.
+    """
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"palace_path": str(tmp_path / "from_file")}, f)
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path / "from_env"))
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.palace_path == str(tmp_path / "from_env")
+
+
 def test_backend_from_config_wins_over_env(tmp_path, monkeypatch):
     with open(tmp_path / "config.json", "w") as f:
         json.dump({"backend": "sqlite_exact"}, f)
