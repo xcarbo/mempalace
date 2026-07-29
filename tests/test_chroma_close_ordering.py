@@ -122,7 +122,16 @@ def test_wal_is_actually_truncated_with_the_client_still_attached(tmp_path):
 
     chroma_mod.checkpoint_wal(str(palace))
 
-    assert wal.stat().st_size == 0, "checkpoint must truncate the WAL even while attached"
+    # "Folded" has two legal shapes and they differ by SQLite version: 3.51.0
+    # truncates the -wal to 0 bytes and leaves it in place, 3.53.3 removes the
+    # file outright. Asserting size == 0 passed on one and raised
+    # FileNotFoundError on the other — a version difference dressed up as a
+    # product bug. Accept either; what matters is that no WAL content survives.
+    folded = not wal.exists() or wal.stat().st_size == 0
+    assert folded, (
+        f"checkpoint must fold the WAL even while attached; "
+        f"-wal still holds {wal.stat().st_size:,} bytes"
+    )
 
     backend.close()
 

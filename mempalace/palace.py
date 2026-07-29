@@ -175,8 +175,8 @@ def _enforce_embedder_identity(collection, palace_path, collection_name, *, crea
 
 # SQLite versions known to survive chromadb's Rust core and Python's sqlite3
 # both touching a palace database in one process. See warn_if_sqlite_untested().
-_SQLITE_KNOWN_GOOD = ("3.51.0",)
-_SQLITE_KNOWN_BAD = ("3.50.4", "3.53.3", "3.53.4")
+_SQLITE_KNOWN_GOOD = ("3.51.0", "3.53.3", "3.53.4")
+_SQLITE_KNOWN_BAD = ("3.50.4",)
 _sqlite_version_warned = False
 
 
@@ -184,25 +184,30 @@ def warn_if_sqlite_untested() -> Optional[str]:
     """Warn once when the interpreter's SQLite is not a version we have tested.
 
     chromadb's Rust core and Python's ``sqlite3`` both operate on the palace
-    database. On some SQLite builds, any statement Python executes against a
-    database chromadb's Rust side has just closed **crashes the process with
-    SIGBUS** — from the second palace opened in a process onward. There is no
-    exception and no traceback; the interpreter dies mid-write.
+    database. Issuing a statement from Python against a database the Rust side
+    has already released can land on a mapping it left behind, and on some
+    SQLite builds that access is a **SIGBUS** — no exception, no traceback, the
+    interpreter dies mid-write.
 
-    Measured 2026-07-29 against chromadb 1.5.x, full suite per row:
+    The root cause was ours and is fixed: ``ChromaBackend.close()`` used to
+    checkpoint the WAL *after* releasing its clients. It now checkpoints first,
+    while the client is still attached (see ``backends/chroma.py``). That
+    removed the crash on every build measured, including the ones that used to
+    die:
 
-        python 3.12.11 + sqlite 3.50.4  -> SIGBUS
-        python 3.12.8  + sqlite 3.51.0  -> clean
-        python 3.13.7  + sqlite 3.51.0  -> clean
-        python 3.13.14 + sqlite 3.51.0  -> clean
-        python 3.13.14 + sqlite 3.53.3  -> SIGBUS
-        python 3.14.6  + sqlite 3.53.3  -> SIGBUS
+        python 3.12.11 + sqlite 3.50.4  -> SIGBUS before the fix
+        python 3.13.14 + sqlite 3.51.0  -> clean (3,605 tests)
+        python 3.13.14 + sqlite 3.53.3  -> SIGBUS before, clean after (3,608)
+        python 3.14.6  + sqlite 3.53.3  -> SIGBUS before, clean after (3,607)
 
-    The interpreter version is not the variable — SQLite is, and **both older
-    and newer than 3.51.0 crash**. A pyenv build that picks up Homebrew's
-    SQLite instead of the system one silently lands on a bad version, which is
-    exactly how this reaches a user: as a bus error during a save, not as a
-    message.
+    This guard stays because the failure mode is uniquely bad — a signal, not
+    an error — and because the ordering rule is easy to reverse in a future
+    refactor without anything going red on the developer's own SQLite build.
+    It is a tripwire for an untested combination, not a claim of breakage.
+
+    Note 3.51.0 and 3.53.x differ in how a checkpoint folds the WAL: 3.51.0
+    truncates the ``-wal`` to 0 bytes, 3.53.x removes the file. Both are
+    "folded"; code that asserts one shape breaks on the other.
 
     Returns the warning text (also logged) or None when the version is known
     good. Never raises and never blocks the open — an untested version is not

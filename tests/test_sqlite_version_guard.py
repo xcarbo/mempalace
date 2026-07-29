@@ -36,25 +36,22 @@ def test_known_good_version_is_silent(monkeypatch):
 
 
 def test_known_bad_version_is_named_as_known_to_crash(monkeypatch):
-    _pin_sqlite(monkeypatch, "3.53.3")
+    _pin_sqlite(monkeypatch, "3.50.4")
     msg = palace.warn_if_sqlite_untested()
 
     assert msg is not None
-    assert "3.53.3" in msg
+    assert "3.50.4" in msg
     assert "KNOWN" in msg
     # The actionable half: a user who hits this needs to know the cause is
     # their interpreter build, not their palace.
     assert "Homebrew" in msg
 
 
-def test_the_older_bad_version_is_also_caught(monkeypatch):
-    """3.50.4 was the original SIGBUS; a guard that only knows about newer
-    versions would miss the uv-managed interpreter that started all this."""
-    _pin_sqlite(monkeypatch, "3.50.4")
-    msg = palace.warn_if_sqlite_untested()
-
-    assert msg is not None
-    assert "3.50.4" in msg
+def test_a_newly_verified_version_is_silent(monkeypatch):
+    """3.53.3 crashed before the close-ordering fix and is clean after it.
+    Promoting it to known-good is the point of having measured it."""
+    _pin_sqlite(monkeypatch, "3.53.3")
+    assert palace.warn_if_sqlite_untested() is None
 
 
 def test_unknown_version_warns_without_claiming_breakage(monkeypatch):
@@ -69,7 +66,7 @@ def test_unknown_version_warns_without_claiming_breakage(monkeypatch):
 
 def test_warning_fires_once_per_process(monkeypatch):
     """Every palace open calls this; warning on each would bury the signal."""
-    _pin_sqlite(monkeypatch, "3.53.3")
+    _pin_sqlite(monkeypatch, "3.50.4")
 
     assert palace.warn_if_sqlite_untested() is not None
     assert palace.warn_if_sqlite_untested() is None
