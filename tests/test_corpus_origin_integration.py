@@ -679,7 +679,7 @@ def test_init_default_attempts_llm_provider(ai_dialogue_corpus: Path, tmp_path: 
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", return_value=fake_provider) as mock_get,
+        patch("mempalace.llm_client.get_provider", return_value=fake_provider) as mock_get,
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
     ):
@@ -705,7 +705,7 @@ def test_init_no_llm_skips_provider_acquisition(ai_dialogue_corpus: Path, tmp_pa
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider") as mock_get,
+        patch("mempalace.llm_client.get_provider") as mock_get,
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
     ):
@@ -734,7 +734,7 @@ def test_init_graceful_fallback_when_provider_unavailable(
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.llm_client.get_provider", return_value=fake_provider),
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
     ):
@@ -762,7 +762,7 @@ def test_init_graceful_fallback_on_provider_construction_error(
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", side_effect=LLMError("no api key")),
+        patch("mempalace.llm_client.get_provider", side_effect=LLMError("no api key")),
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
     ):
@@ -791,7 +791,7 @@ def test_init_legacy_llm_flag_compatible(ai_dialogue_corpus: Path, tmp_path: Pat
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", return_value=fake_provider) as mock_get,
+        patch("mempalace.llm_client.get_provider", return_value=fake_provider) as mock_get,
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
     ):
@@ -845,9 +845,9 @@ def test_end_to_end_init_with_llm_separates_personas(ai_dialogue_corpus: Path, t
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.llm_client.get_provider", return_value=fake_provider),
         patch(
-            "mempalace.cli.detect_origin_llm",
+            "mempalace.corpus_origin.detect_origin_llm",
             return_value=fake_llm_origin_result,
         ),
         patch("mempalace.cli._maybe_run_mine_after_init"),
@@ -1184,8 +1184,8 @@ def test_integration_entities_json_includes_topics_excludes_personas(
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", return_value=fake_provider),
-        patch("mempalace.cli.detect_origin_llm", return_value=fake_origin),
+        patch("mempalace.llm_client.get_provider", return_value=fake_provider),
+        patch("mempalace.corpus_origin.detect_origin_llm", return_value=fake_origin),
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
     ):
@@ -1239,8 +1239,8 @@ def test_integration_add_to_known_entities_called_with_wing(
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", return_value=fake_provider),
-        patch("mempalace.cli.detect_origin_llm", return_value=fake_origin),
+        patch("mempalace.llm_client.get_provider", return_value=fake_provider),
+        patch("mempalace.corpus_origin.detect_origin_llm", return_value=fake_origin),
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
         patch("mempalace.miner.add_to_known_entities") as mock_add,
@@ -1468,7 +1468,7 @@ def test_merge_tier_fields_heuristic_yes_llm_no_keeps_heuristic_bool():
             (project_dir / f"log{i}.md").write_text(sample)
         palace_dir = Path(tmp_dir) / "palace"
 
-        with patch("mempalace.cli.detect_origin_llm", return_value=llm_wrong_result):
+        with patch("mempalace.corpus_origin.detect_origin_llm", return_value=llm_wrong_result):
             wrapped = _run_pass_zero(
                 project_dir=str(project_dir),
                 palace_dir=str(palace_dir),
@@ -1536,7 +1536,7 @@ def test_merge_tier_fields_heuristic_no_no_personas_leak():
             (project_dir / f"diary{i}.md").write_text(sample)
         palace_dir = Path(tmp_dir) / "palace"
 
-        with patch("mempalace.cli.detect_origin_llm", return_value=llm_agreeing_result):
+        with patch("mempalace.corpus_origin.detect_origin_llm", return_value=llm_agreeing_result):
             wrapped = _run_pass_zero(
                 project_dir=str(project_dir),
                 palace_dir=str(palace_dir),
@@ -1591,7 +1591,7 @@ def test_merge_tier_fields_heuristic_yes_llm_yes_combines_evidence():
             (project_dir / f"log{i}.md").write_text(sample)
         palace_dir = Path(tmp_dir) / "palace"
 
-        with patch("mempalace.cli.detect_origin_llm", return_value=llm_agreeing_result):
+        with patch("mempalace.corpus_origin.detect_origin_llm", return_value=llm_agreeing_result):
             wrapped = _run_pass_zero(
                 project_dir=str(project_dir),
                 palace_dir=str(palace_dir),
@@ -1670,7 +1670,7 @@ def test_merge_tier_fields_confidence_matches_heuristic_call():
             (project_dir / f"log{i}.md").write_text(sample)
         palace_dir = Path(tmp_dir) / "palace"
 
-        with patch("mempalace.cli.detect_origin_llm", return_value=llm_distinct_result):
+        with patch("mempalace.corpus_origin.detect_origin_llm", return_value=llm_distinct_result):
             wrapped = _run_pass_zero(
                 project_dir=str(project_dir),
                 palace_dir=str(palace_dir),
@@ -1749,7 +1749,7 @@ def test_init_prints_privacy_warning_when_provider_is_external(
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.llm_client.get_provider", return_value=fake_provider),
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
     ):
@@ -1794,7 +1794,7 @@ def test_init_no_privacy_warning_when_provider_is_local(
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.llm_client.get_provider", return_value=fake_provider),
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
     ):
@@ -1817,7 +1817,7 @@ def test_init_no_privacy_warning_with_no_llm_flag(ai_dialogue_corpus: Path, tmp_
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider") as mock_get,
+        patch("mempalace.llm_client.get_provider") as mock_get,
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
     ):
@@ -1867,7 +1867,7 @@ def test_init_blocks_with_consent_prompt_when_api_key_from_env(
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.llm_client.get_provider", return_value=fake_provider),
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
         patch("builtins.input", return_value="y") as mock_input,
@@ -1891,7 +1891,7 @@ def test_init_consent_prompt_y_proceeds_with_llm(ai_dialogue_corpus: Path, tmp_p
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.llm_client.get_provider", return_value=fake_provider),
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
         patch("builtins.input", return_value="y"),
@@ -1917,7 +1917,7 @@ def test_init_consent_prompt_n_falls_back_to_heuristic(
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.llm_client.get_provider", return_value=fake_provider),
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
         patch("builtins.input", return_value="n"),
@@ -1948,7 +1948,7 @@ def test_init_no_consent_prompt_when_api_key_from_flag(
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.llm_client.get_provider", return_value=fake_provider),
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
         patch("builtins.input") as mock_input,
@@ -1975,7 +1975,7 @@ def test_init_accept_external_llm_flag_bypasses_consent_prompt(
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.llm_client.get_provider", return_value=fake_provider),
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
         patch("builtins.input") as mock_input,
@@ -2009,7 +2009,7 @@ def test_init_no_consent_prompt_when_endpoint_is_local(
 
     with (
         patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
-        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.llm_client.get_provider", return_value=fake_provider),
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
         patch("builtins.input") as mock_input,
