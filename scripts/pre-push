@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+#
+# pre-push — refuse to push unless the FULL suite passes.
+#
+# Install:  ln -sf ../../scripts/pre-push .git/hooks/pre-push
+# Bypass:   git push --no-verify   (deliberate, visible, and yours to justify)
+#
+# This is the cheapest thing that would have caught commit 27a3437's 23-test
+# breakage. That change was verified against a subset and pushed; the full
+# suite stops at the first broken patch target. Nothing in the loop ran it.
+#
+# It is a pre-PUSH, not a pre-COMMIT, hook on purpose: the suite takes ~90s,
+# which is too slow to pay on every commit and cheap to pay before publishing.
+
+set -uo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+echo "pre-push: running the full test suite (~90s). --no-verify to skip."
+
+if ! "${repo_root}/scripts/full-suite.sh"; then
+    echo ""
+    echo "pre-push: BLOCKED. Fix the suite, or push with --no-verify and say why."
+    exit 1
+fi
