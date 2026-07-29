@@ -1461,9 +1461,15 @@ def test_try_normalize_json_valid_but_unknown_schema():
 
 
 def test_messages_to_transcript_basic():
+    """User turns are quoted, assistant turns are not.
+
+    The ``patch("mempalace.normalize.spellcheck_user_text", create=True)`` that
+    used to wrap this call was doubly inert: the name does not exist on the
+    module, and ``spellcheck=False`` means no speller is consulted anyway. It
+    read as "spellchecking is stubbed here", which was misleading.
+    """
     msgs = [("user", "Q"), ("assistant", "A")]
-    with patch("mempalace.normalize.spellcheck_user_text", side_effect=lambda x: x, create=True):
-        result = _messages_to_transcript(msgs, spellcheck=False)
+    result = _messages_to_transcript(msgs, spellcheck=False)
     assert "> Q" in result
     assert "A" in result
 

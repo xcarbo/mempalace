@@ -1,5 +1,6 @@
 """Tests for mempalace.repair — scan, prune, and rebuild HNSW index."""
 
+import json
 import os
 import sqlite3
 from contextlib import closing
@@ -15,20 +16,44 @@ from mempalace import repair
 # ── _get_palace_path ──────────────────────────────────────────────────
 
 
-@patch("mempalace.repair.MempalaceConfig", create=True)
-def test_get_palace_path_from_config(mock_config_cls):
-    mock_config_cls.return_value.palace_path = "/configured/palace"
-    with patch.dict("sys.modules", {}):
-        # Force reimport to pick up the mock
-        result = repair._get_palace_path()
-    assert isinstance(result, str)
+def test_get_palace_path_reads_the_configured_palace(tmp_path, monkeypatch):
+    """repair must operate on the palace the user configured.
+
+    Repair rewrites and deletes drawers, so resolving the wrong path is either a
+    no-op on an empty directory or destructive on the wrong palace.
+
+    The previous version of this test patched
+    ``mempalace.repair.MempalaceConfig`` with ``create=True``. That attribute
+    does not exist — ``_get_palace_path`` imports the class inside the function —
+    so ``create=True`` invented a name nothing reads, the mock was never
+    consulted, and the sole assertion (``isinstance(result, str)``) was equally
+    true of the fallback. The test passed no matter what the function returned.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    configured = tmp_path / "configured" / "palace"
+    cfg_dir = tmp_path / ".mempalace"
+    cfg_dir.mkdir()
+    (cfg_dir / "config.json").write_text(json.dumps({"palace_path": str(configured)}))
+
+    assert repair._get_palace_path() == str(configured)
 
 
-def test_get_palace_path_fallback():
-    with patch("mempalace.repair._get_palace_path") as mock_get:
-        mock_get.return_value = os.path.join(os.path.expanduser("~"), ".mempalace", "palace")
-        result = mock_get()
-        assert ".mempalace" in result
+def test_get_palace_path_falls_back_to_the_default_without_config(tmp_path, monkeypatch):
+    """No config file must still yield the default palace, never "" or None.
+
+    The previous version patched ``_get_palace_path`` itself and then asserted
+    on the mock's own return value, so no production code ran at all.
+
+    Asserted against ``config.DEFAULT_PALACE_PATH`` rather than a path built
+    from HOME, because that constant is expanded once at import: a later HOME
+    change does not move the default.
+    """
+    from mempalace.config import DEFAULT_PALACE_PATH
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert repair._get_palace_path() == DEFAULT_PALACE_PATH
+    assert DEFAULT_PALACE_PATH.endswith(os.path.join(".mempalace", "palace"))
 
 
 def test_get_collection_name_from_config():
