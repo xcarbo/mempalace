@@ -385,3 +385,140 @@ def test_memp_locks_registered_in_cli_dispatch():
     assert result.returncode == 0
     assert "--gc" in result.stdout
     assert "--json" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# 5. The contention event, and the sweep's safety margins
+# ---------------------------------------------------------------------------
+
+
+def _write_log_records(home) -> list[dict]:
+    """Every record the write log collected under ``home`` this test."""
+    from mempalace.write_log import write_log_path
+
+    path = write_log_path()
+    assert path.startswith(str(home)), "write log must be inside the scratch HOME"
+    if not os.path.isfile(path):
+        return []
+    with open(path, encoding="utf-8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+def test_contention_emits_a_structured_lock_acquire_failure(tmp_path, monkeypatch):
+    """A blocked write must be answerable later, not just printed once.
+
+    ``_palace_contention_error`` is the single place a contended palace lock
+    becomes an error, so it is the only place the event can be recorded — which
+    is exactly why the recorder was put there. Every other contention test in
+    this file asserts the English sentence and would stay green if the
+    ``log_write`` call were deleted, leaving "did writes recover after the
+    outage?" unanswerable again.
+    """
+    _set_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "argv", ["memp", "mine", "/some/dir"])
+    palace = str(tmp_path / "palace")
+
+    with _hold_palace_lock(palace):
+        with pytest.raises(MineAlreadyRunning):
+            with mine_palace_lock(palace):
+                pytest.fail("second acquire of a held palace lock must raise")
+
+    events = [r for r in _write_log_records(tmp_path) if r["op"] == "lock_acquire"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["ok"] is False
+    assert event["error_class"] == "lock_contention"
+    assert event["palace"] == os.path.realpath(palace)
+    assert event["holder_pid"] == os.getpid()
+    assert "memp mine /some/dir" in event["holder_argv"]
+    assert event["held_seconds"] >= 0
+
+
+def test_an_uncontended_acquire_records_nothing(tmp_path, monkeypatch):
+    """Only failures are events. A recorder that logged every acquire would
+    grow a line per write and drown the failures it exists to surface."""
+    _set_home(monkeypatch, tmp_path)
+    palace = str(tmp_path / "palace")
+
+    with mine_palace_lock(palace):
+        pass
+
+    assert _write_log_records(tmp_path) == []
+
+
+def test_gc_leaves_a_lock_file_that_was_replaced_mid_sweep(tmp_path, monkeypatch):
+    """The sweep must never unlink an inode it did not prove stale.
+
+    ``_gc_one_lock_file`` opens the path, proves the file unheld and stale, then
+    unlinks *the path*. Between the open and the unlink another process can
+    acquire the lock — creating a fresh file at the same name — and the sweep
+    would delete a live holder's lock, letting a second writer into the same
+    palace and corrupting the HNSW graph. The guard is a re-check that the open
+    fd still names the same inode.
+
+    The monkeypatch is a scheduling seam only: it makes the replacement happen
+    at the one instant the race needs. What is asserted is the observable
+    outcome on disk — the replacement file survives.
+    """
+    lock_dir = _set_home(monkeypatch, tmp_path)
+    path = os.path.join(lock_dir, "mine_palace_deadbeef.lock")
+    open(path, "wb").close()  # 0-byte residue: provably stale, would be swept
+
+    real_probe = locks_mod._probe_lock
+    swapped = {"done": False}
+
+    def _probe_then_replace(lock_file):
+        result = real_probe(lock_file)
+        if not swapped["done"]:
+            swapped["done"] = True
+            # A contender wins the race: fresh file, same name, new inode.
+            os.remove(path)
+            with open(path, "wb") as fh:
+                fh.write(b"\0" + json.dumps({"pid": os.getpid()}).encode())
+        return result
+
+    monkeypatch.setattr(locks_mod, "_probe_lock", _probe_then_replace)
+
+    gc_stale_locks(lock_dir)
+
+    assert os.path.exists(path), "sweep deleted a lock file it never proved stale"
+    assert swapped["done"], "the race was never triggered; test proves nothing"
+
+
+def test_maybe_gc_never_raises_when_the_sweep_fails(tmp_path, monkeypatch):
+    """A broken locks directory must not block every write in the system.
+
+    ``maybe_gc_stale_locks`` runs on the acquire path of every palace write. If
+    it could propagate an OSError — an unreadable locks dir, a permissions
+    change — a housekeeping problem would become a total write outage.
+    """
+    _set_home(monkeypatch, tmp_path)
+    _reset_gc_throttle(monkeypatch)
+
+    def boom(*_a, **_kw):
+        raise OSError("locks dir is unreadable")
+
+    monkeypatch.setattr(locks_mod, "gc_stale_locks", boom)
+
+    assert maybe_gc_stale_locks() == 0
+
+
+def test_list_locks_reports_hold_duration_for_a_live_holder(tmp_path, monkeypatch):
+    """`memp locks` is what a human reads during a write outage.
+
+    The duration field is the one that answers "has this been stuck for hours?",
+    and it is only populated for locks that are actually held — the case no
+    existing test covers, because they all inspect residue.
+    """
+    _set_home(monkeypatch, tmp_path)
+    palace = str(tmp_path / "palace")
+
+    with _hold_palace_lock(palace):
+        entries = locks_mod.list_locks()
+
+    held = [e for e in entries if e["held"]]
+    assert len(held) == 1, f"expected exactly one held lock, got {entries}"
+    assert held[0]["pid"] == os.getpid()
+    assert held[0]["pid_alive"] is True
+    assert isinstance(held[0]["held_for_seconds"], int)
+    assert held[0]["held_for_seconds"] >= 0
