@@ -2651,6 +2651,14 @@ def tool_add_drawer(
                 _outbox_emit(_config, wing, drawer_id, "added")
             except Exception:
                 pass
+            log_write(
+                "add_drawer",
+                ok=True,
+                drawer_id=drawer_id,
+                wing=wing,
+                room=room,
+                chunks=1,
+            )
             return {
                 "success": True,
                 "drawer_id": drawer_id,
