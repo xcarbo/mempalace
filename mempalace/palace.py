@@ -173,6 +173,68 @@ def _enforce_embedder_identity(collection, palace_path, collection_name, *, crea
     _VALIDATED_IDENTITY.add(key)
 
 
+# SQLite versions known to survive chromadb's Rust core and Python's sqlite3
+# both touching a palace database in one process. See warn_if_sqlite_untested().
+_SQLITE_KNOWN_GOOD = ("3.51.0",)
+_SQLITE_KNOWN_BAD = ("3.50.4", "3.53.3", "3.53.4")
+_sqlite_version_warned = False
+
+
+def warn_if_sqlite_untested() -> Optional[str]:
+    """Warn once when the interpreter's SQLite is not a version we have tested.
+
+    chromadb's Rust core and Python's ``sqlite3`` both operate on the palace
+    database. On some SQLite builds, any statement Python executes against a
+    database chromadb's Rust side has just closed **crashes the process with
+    SIGBUS** — from the second palace opened in a process onward. There is no
+    exception and no traceback; the interpreter dies mid-write.
+
+    Measured 2026-07-29 against chromadb 1.5.x, full suite per row:
+
+        python 3.12.11 + sqlite 3.50.4  -> SIGBUS
+        python 3.12.8  + sqlite 3.51.0  -> clean
+        python 3.13.7  + sqlite 3.51.0  -> clean
+        python 3.13.14 + sqlite 3.51.0  -> clean
+        python 3.13.14 + sqlite 3.53.3  -> SIGBUS
+        python 3.14.6  + sqlite 3.53.3  -> SIGBUS
+
+    The interpreter version is not the variable — SQLite is, and **both older
+    and newer than 3.51.0 crash**. A pyenv build that picks up Homebrew's
+    SQLite instead of the system one silently lands on a bad version, which is
+    exactly how this reaches a user: as a bus error during a save, not as a
+    message.
+
+    Returns the warning text (also logged) or None when the version is known
+    good. Never raises and never blocks the open — an untested version is not
+    proof of breakage, and refusing to start would be worse than the risk.
+    """
+    global _sqlite_version_warned
+    import sqlite3
+
+    version = sqlite3.sqlite_version
+    if version in _SQLITE_KNOWN_GOOD or _sqlite_version_warned:
+        return None
+
+    _sqlite_version_warned = True
+    if version in _SQLITE_KNOWN_BAD:
+        msg = (
+            f"SQLite {version} is KNOWN to crash this palace with SIGBUS "
+            f"(chromadb's Rust core vs Python's sqlite3 on a closed database, "
+            f"second palace onward in a process). Known-good: "
+            f"{', '.join(_SQLITE_KNOWN_GOOD)}. Rebuild your interpreter against "
+            f"the system SQLite — do NOT pass Homebrew's sqlite to a pyenv build."
+        )
+    else:
+        msg = (
+            f"SQLite {version} is untested with this palace. Known-good: "
+            f"{', '.join(_SQLITE_KNOWN_GOOD)}; known-bad: "
+            f"{', '.join(_SQLITE_KNOWN_BAD)}. If saves die without a traceback, "
+            f"suspect this first."
+        )
+    logger.warning(msg)
+    return msg
+
+
 def get_collection(
     palace_path: str,
     collection_name: Optional[str] = None,
@@ -186,6 +248,7 @@ def get_collection(
     ``set-embedder`` override path can open a palace whose recorded model
     differs from the current one (the very state it exists to repair).
     """
+    warn_if_sqlite_untested()
     if collection_name is None:
         from .config import get_configured_collection_name
 
