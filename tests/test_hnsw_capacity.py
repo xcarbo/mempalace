@@ -646,8 +646,15 @@ def test_tool_status_via_sqlite_returns_breakdown(palace_with_drawers, monkeypat
     assert out["wings"].get("design") == 1
 
 
-def test_capacity_status_flags_small_gap_with_explicit_low_sync_threshold(tmp_path):
-    """New palaces use a low explicit sync threshold, so 57 missing rows is unsafe."""
+def test_capacity_status_tolerates_small_gap_with_explicit_low_sync_threshold(tmp_path):
+    """A low explicit sync threshold must not collapse the ceiling to 2x itself.
+
+    ``hnsw:sync_threshold`` bounds flush lag only while a writer is open. Once
+    that writer exits holding a partial batch, the tail stays unflushed until
+    some later writer runs, so a 57-row gap is ordinary rest-state lag and not
+    corruption. Deriving the threshold from sync_threshold alone made this the
+    *diverged* case, which disabled vector search over the entire index.
+    """
     seg = "seg-1816-explicit-low-sync"
     _seed_chroma_db(str(tmp_path), sqlite_count=1768, segment_id=seg, sync_threshold=2)
     _write_pickle(str(tmp_path), seg, hnsw_count=1711)
@@ -655,7 +662,44 @@ def test_capacity_status_flags_small_gap_with_explicit_low_sync_threshold(tmp_pa
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
 
     assert info["divergence"] == 57
-    assert info["threshold"] == 4
+    assert info["threshold"] >= 2000
+    assert info["status"] == "ok"
+    assert info["diverged"] is False
+
+
+def test_capacity_status_tolerates_hook_write_burst_at_palace_scale(tmp_path):
+    """Regression for the live palace: a hook writes ~100 drawers and exits.
+
+    Observed 2026-07-31 on the 156k-embedding palace. The Stop hook saved a
+    diary checkpoint, sqlite went to 156,597 while the flushed pickle stayed at
+    156,494, and the probe reported the palace corrupt and told the user to run
+    `mempalace repair` — over a 0.07% gap that no writer was left alive to
+    close. Every subsequent process opened in BM25-only mode.
+    """
+    seg = "seg-hook-burst"
+    _seed_chroma_db(str(tmp_path), sqlite_count=156_597, segment_id=seg, sync_threshold=2)
+    _write_pickle(str(tmp_path), seg, hnsw_count=156_494)
+
+    # No writer is running, so the pickle is well past the staleness grace.
+    pickle_path = tmp_path / seg / "index_metadata.pickle"
+    old = time.time() - 3600.0
+    os.utime(pickle_path, (old, old))
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+
+    assert info["divergence"] == 103
+    assert info["status"] == "ok"
+    assert info["diverged"] is False
+
+
+def test_capacity_status_still_flags_real_corruption_at_palace_scale(tmp_path):
+    """The #1222 shape must stay caught: 91% of the index missing."""
+    seg = "seg-1222-scale"
+    _seed_chroma_db(str(tmp_path), sqlite_count=192_997, segment_id=seg, sync_threshold=2)
+    _write_pickle(str(tmp_path), seg, hnsw_count=16_384)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+
     assert info["status"] == "diverged"
     assert info["diverged"] is True
     assert "repair" in info["message"].lower()
@@ -692,6 +736,6 @@ def test_capacity_status_ok_with_stale_metadata_under_explicit_threshold(tmp_pat
     os.utime(pickle_path, (old, old))
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
     assert info["divergence"] == 1
-    assert info["threshold"] == 4
+    assert info["threshold"] >= 2000
     assert info["status"] == "ok"
     assert info["diverged"] is False

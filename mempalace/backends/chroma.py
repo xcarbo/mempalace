@@ -633,9 +633,16 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
 # Divergence threshold: chromadb's HNSW flushes asynchronously, so HNSW
 # typically lags sqlite by up to ``sync_threshold`` records under active
 # write load — that's the *brute-force batch* that hasn't been compacted
-# into HNSW yet, plus the un-persisted tail beyond the last sync. Two
-# synchronization windows worth (2 × sync_threshold) is a safe steady-
-# state ceiling; anything past that is real divergence, not flush-lag.
+# into HNSW yet, plus the un-persisted tail beyond the last sync.
+#
+# ``sync_threshold`` bounds that lag only *while a writer is open*. It says
+# nothing about how far the on-disk pickle may trail once the writer exits:
+# a process that ends holding a partial batch leaves that tail unflushed
+# until some later writer runs. A palace written by short-lived hooks
+# therefore sits hundreds of rows behind at rest, indefinitely, and that is
+# chromadb behaving correctly. So 2 × sync_threshold is NOT a usable
+# steady-state ceiling — see the floor/fraction below, which both branches
+# of :func:`hnsw_capacity_status` now apply.
 #
 # The threshold floor scales with whatever ``hnsw:sync_threshold`` the
 # collection was created with (read via :func:`_read_sync_threshold`).
@@ -808,19 +815,20 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
         divergence = sqlite_count - hnsw_count
         out["divergence"] = divergence
 
-        # Newer palaces explicitly store mempalace's low sync threshold
-        # (currently 2), so a gap of dozens of rows is far beyond ordinary
-        # flush lag. Older palaces may lack the metadata row; keep the
-        # historical floor for fresh lag there, but do not let a stale pickle
-        # sit below the floor forever (#1816).
-        if has_explicit_sync_threshold:
-            threshold = max(0, 2 * sync_threshold)
-        else:
-            divergence_floor = max(_HNSW_DIVERGENCE_FALLBACK_FLOOR, 2 * sync_threshold)
-            threshold = max(
-                divergence_floor,
-                int(sqlite_count * _HNSW_DIVERGENCE_FRACTION),
-            )
+        # Both branches use the same floor and fraction. Deriving the ceiling
+        # from an explicit low sync_threshold alone gave new palaces a limit of
+        # 4 while the metadata-unreadable path allowed ~10% of the collection
+        # on identical data — ~4000x stricter by accident, on the palaces most
+        # likely to be written by short-lived hooks. Every routine hook write
+        # tripped it and disabled vector search over the whole index to avoid
+        # missing the ~100 rows it had just added. #1222 (176,613 missing of
+        # 192,997) still clears these bounds by orders of magnitude, and the
+        # BM25 half of hybrid search reaches anything the index is missing.
+        divergence_floor = max(_HNSW_DIVERGENCE_FALLBACK_FLOOR, 2 * sync_threshold)
+        threshold = max(
+            divergence_floor,
+            int(sqlite_count * _HNSW_DIVERGENCE_FRACTION),
+        )
 
         out["threshold"] = threshold
         stale_below_threshold = (
