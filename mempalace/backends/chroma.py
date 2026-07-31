@@ -1165,6 +1165,39 @@ def _sqlite_wing_room_counts(
     return total, wing_rooms
 
 
+def is_rust_panic(exc: BaseException) -> bool:
+    """True if ``exc`` is a panic raised out of chromadb's Rust core.
+
+    ``pyo3_runtime.PanicException`` derives from ``BaseException``, not from
+    ``Exception``, so every ``except Exception`` in this module is blind to it.
+    That is not a theoretical gap: a panic inside ``collection.modify`` walked
+    straight through :func:`_pin_hnsw_threads`'s "best-effort" guard and out of
+    the process. Match on the class name rather than importing the module —
+    ``pyo3_runtime`` is synthesised by pyo3 and only exists in ``sys.modules``
+    once a panic has already been raised, so it cannot be imported up front.
+    """
+    return type(exc).__name__ == "PanicException"
+
+
+def _hnsw_threads_already_pinned(collection) -> bool:
+    """True if this collection already reports ``hnsw:num_threads == 1``.
+
+    Checked before writing so the retrofit costs nothing on a palace that never
+    needed it. Reads the resolved configuration first and falls back to the
+    creation metadata; either being 1 means a ``modify()`` would be a no-op
+    write. Unknown shape returns False — pin rather than assume.
+    """
+    try:
+        config = getattr(collection, "configuration_json", None) or {}
+        if isinstance(config, dict) and (config.get("hnsw") or {}).get("num_threads") == 1:
+            return True
+        metadata = getattr(collection, "metadata", None) or {}
+        return isinstance(metadata, dict) and metadata.get("hnsw:num_threads") == 1
+    except Exception:
+        logger.debug("could not read hnsw thread config; pinning anyway", exc_info=True)
+        return False
+
+
 def _pin_hnsw_threads(collection) -> None:
     """Best-effort retrofit: pin ``hnsw:num_threads=1`` on an existing collection.
 
@@ -1174,9 +1207,20 @@ def _pin_hnsw_threads(collection) -> None:
     ``collection.modify(configuration=...)`` lets us re-apply ``num_threads=1``
     in memory at load time so every new process is protected.
 
+    ``modify()`` is a *write*: it issues an UPDATE against the sysdb
+    ``collections`` row. The caller must therefore run this once per
+    ``PersistentClient``, never once per handout — see the ``_hnsw_pinned``
+    gate in :meth:`ChromaBackend.get_collection`. Re-applying it on every
+    handout turned a read-only service into one that wrote to the palace on
+    every request, and those writes ran concurrently with other threads'
+    reads on the same client. chromadb's Rust core does not tolerate that: it
+    panics with ``SqliteError { code: 522 }`` (SQLITE_IOERR_SHORT_READ) or
+    surfaces a torn string as ``ColumnDecode { Utf8Error }``. Once per client
+    is all the docstring below ever required.
+
     Note: in chromadb 1.5.x the modified ``configuration_json["hnsw"]`` does
     not persist to disk across ``PersistentClient`` reopens, so this must
-    run on every ``get_collection`` call, not just once.
+    re-run whenever a new client is built.
     """
     try:
         from chromadb.api.collection_configuration import (
@@ -1186,12 +1230,25 @@ def _pin_hnsw_threads(collection) -> None:
     except ImportError:
         logger.debug("_pin_hnsw_threads skipped: chromadb too old", exc_info=True)
         return
+    if _hnsw_threads_already_pinned(collection):
+        # Nothing to retrofit, so do not spend a write finding that out. On a
+        # palace mempalace created (num_threads=1 at creation, persisted in
+        # collection_metadata) this is every open, which takes the write out
+        # of the read path entirely rather than merely making it rare.
+        return
     try:
         collection.modify(
             configuration=UpdateCollectionConfiguration(hnsw=UpdateHNSWConfiguration(num_threads=1))
         )
     except Exception:
         logger.debug("_pin_hnsw_threads modify failed", exc_info=True)
+    except BaseException as exc:
+        # A Rust panic is not an ``Exception``. This retrofit is an
+        # optimisation, never a correctness requirement, so a panicking
+        # modify must not take the caller's read down with it.
+        if not is_rust_panic(exc):
+            raise
+        logger.warning("_pin_hnsw_threads panicked inside chromadb; continuing unpinned")
 
 
 _BLOB_FIX_MARKER = ".blob_seq_ids_migrated"
@@ -2560,6 +2617,12 @@ class ChromaBackend(BaseBackend):
         self._clients: dict[str, Any] = {}
         # palace_path -> (inode, mtime) of chroma.sqlite3 at cache time.
         self._freshness: dict[str, tuple[int, float]] = {}
+        # palace_path -> {collection_name} already pinned on the CURRENT
+        # client. Cleared whenever that client is replaced, because the
+        # chromadb 1.5.x in-memory hnsw config does not survive a reopen.
+        # Exists so _pin_hnsw_threads' write runs once per client rather
+        # than once per handout.
+        self._hnsw_pinned: dict[str, set[str]] = {}
         self._closed = False
 
     @staticmethod
@@ -2684,6 +2747,20 @@ class ChromaBackend(BaseBackend):
             ):
                 ChromaBackend._quarantined_paths.discard(palace_path)
             ChromaBackend._prepare_palace_for_open(palace_path)
+            # NOTE: do NOT close the client being retired here. A caller may
+            # still be reading through a collection bound to it — this backend
+            # hands the collection out and the caller uses it after the handout
+            # returns, which is exactly what mempalace-api does. close()
+            # releases the rust-side SQLite handles and unmaps its segments
+            # immediately, regardless of who still holds a Python reference, so
+            # closing on rebuild turns a concurrent read into a SIGBUS inside
+            # chromadb_rust_bindings. Dropping the dict entry is enough:
+            # CPython refcounting destroys the client once the last collection
+            # referencing it goes away, which is precisely when it is safe.
+            self._clients.pop(palace_path, None)
+            # The pin lives in the client's memory, not on disk, so a new
+            # client starts unpinned.
+            self._hnsw_pinned.pop(palace_path, None)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
@@ -2861,7 +2938,13 @@ class ChromaBackend(BaseBackend):
         # that the DB exists so the very first writer runs under WAL, not just
         # subsequent processes. Idempotent + marker-gated for existing palaces.
         enable_wal_journal(palace_path)
-        _pin_hnsw_threads(collection)
+        # Once per client, not once per handout: modify() is a sysdb write, and
+        # issuing one on every read made concurrent readers panic inside
+        # chromadb's Rust core. See _pin_hnsw_threads.
+        pinned = self._hnsw_pinned.setdefault(palace_path, set())
+        if collection_name not in pinned:
+            pinned.add(collection_name)
+            _pin_hnsw_threads(collection)
         return ChromaCollection(collection, palace_path=palace_path)
 
     def close_palace(self, palace) -> None:
