@@ -750,6 +750,13 @@ def _bm25_only_via_sqlite(
         candidate_ids: list[int] = []
         use_recency_fallback = not tokens
         if tokens:
+            # OR-joined tokens match anything containing ANY of them, so the
+            # candidate cap has to admit the BEST matches, not the first ones
+            # sqlite happens to reach. Without `ORDER BY rank` the pool is the
+            # oldest N rows containing any query word, and the answer is
+            # dropped before BM25 scores anything — worsening as the palace
+            # grows. Same fix as ChromaBackend._lexical_search_via_sqlite,
+            # which carries the full measurement.
             fts_query = " OR ".join(tokens)
             filter_sql, filter_params = _metadata_filter_sql("embedding_fulltext_search.rowid")
             try:
@@ -763,6 +770,7 @@ def _bm25_only_via_sqlite(
                     WHERE embedding_fulltext_search MATCH ?
                       AND c.name = ?
                     {filter_sql}
+                    ORDER BY rank
                     LIMIT ?
                     """,
                     (fts_query, collection_name, *filter_params, max_candidates),

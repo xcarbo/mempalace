@@ -2324,7 +2324,19 @@ class ChromaCollection(BaseCollection):
                 # If a metadata filter is present, do not cap before filtering:
                 # otherwise a common term can fill the window with wrong-scope
                 # rows and hide valid scoped hits later in the FTS result set.
-                limit_sql = "" if where else "LIMIT ?"
+                #
+                # ORDER BY rank is load-bearing, not a nicety. The OR query
+                # matches anything containing ANY token — 37,577 rows for a
+                # six-word query on a 157k-row palace — and the cap admits only
+                # 500. Without an ordering, sqlite yields them in rowid order,
+                # so the pool is "the 500 oldest rows containing any query
+                # word" and BM25 then ranks that arbitrary sample. The right
+                # answer is dropped before scoring ever runs, and it gets worse
+                # as the palace grows: measured 2026-07-31, the canonical
+                # mempalace roadmap was absent from the pool for its own query,
+                # and entered at position 56 once ranked. `rank` is FTS5's own
+                # bm25 ordering, so the cap now admits the best 500.
+                limit_sql = "" if where else "ORDER BY rank LIMIT ?"
                 params = [fts_query, collection_name]
                 if not where:
                     params.append(max(max_candidates, n_results))
