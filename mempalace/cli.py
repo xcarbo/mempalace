@@ -1823,6 +1823,20 @@ def main():
 
     _reconfigure_stdio_utf8_on_windows()
 
+    # `get-drawer` is a flat api command, so the normal route registers the api
+    # surface and pays ~0.31s for `import chromadb` before it can read a row it
+    # could have read from sqlite. It is also the palace's most-called command
+    # by an order of magnitude (8,416 get_drawer events vs 246 searches in the
+    # retrieval log, 7,068 of them one-shot processes). Serve the plain
+    # `--drawer-id` shape from sqlite instead: ~0.69s -> ~0.12s. The fast path
+    # declines anything it does not fully understand and returns None, so the
+    # full path below stays the authority on every other invocation.
+    from .fastread import try_cli_fast_path
+
+    _fast_rc = try_cli_fast_path(sys.argv[1:])
+    if _fast_rc is not None:
+        return _fast_rc
+
     version_label = f"MemPalace {__version__}"
     parser = argparse.ArgumentParser(
         description="MemPalace — Give your AI a memory. No API key required.",
