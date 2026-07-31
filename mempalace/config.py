@@ -660,7 +660,8 @@ class MempalaceConfig:
 
         Enforces the invariants the miner relies on:
           * ``chunk_size >= 1``
-          * ``0 <= chunk_overlap < chunk_size`` — equality would loop forever
+          * ``0 <= chunk_overlap <= chunk_size // 2``. A larger overlap can
+            loop the miner forever on short-line content (#2056)
           * ``min_chunk_size <= chunk_size`` — otherwise no chunk is ever
             large enough to file, and ingest silently produces 0 drawers
 
@@ -673,12 +674,14 @@ class MempalaceConfig:
             "min_chunk_size", DEFAULT_MIN_CHUNK_SIZE, minimum=0
         )
 
-        if chunk_overlap >= chunk_size:
-            chunk_overlap = (
-                DEFAULT_CHUNK_OVERLAP
-                if DEFAULT_CHUNK_OVERLAP < chunk_size
-                else max(0, chunk_size - 1)
-            )
+        if chunk_overlap > chunk_size // 2:
+            # Overlap past half the chunk size can hang miner.chunk_text's
+            # windowing loop on short-line content (#2056): a boundary pull can
+            # shrink a chunk below chunk_overlap, so
+            # ``start = end - chunk_overlap`` stops advancing. Repair to the
+            # default when it is still at most half, else clamp to the largest
+            # safe overlap.
+            chunk_overlap = min(DEFAULT_CHUNK_OVERLAP, chunk_size // 2)
 
         if min_chunk_size > chunk_size:
             min_chunk_size = (
@@ -694,7 +697,7 @@ class MempalaceConfig:
 
     @property
     def chunk_overlap(self) -> int:
-        """Overlap between adjacent chunks (validated, ``< chunk_size``)."""
+        """Overlap between adjacent chunks (validated, ``<= chunk_size // 2``)."""
         return self._validated_chunk_config()[1]
 
     @property

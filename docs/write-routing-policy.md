@@ -111,9 +111,10 @@ direct write would violate the safety purpose of the policy.
 
 ## Follow-up PRs
 
-PR 2 will apply the policy to hook-triggered writes.
+Hook-triggered writes now consume this policy; see
+`docs/hook-write-routing.md`.
 
-PR 3 will apply the policy to routine CLI writes.
+The remaining rollout PR will apply the policy to routine CLI writes.
 
 Maintenance operations such as repair, migration, and index rebuild are not
 ordinary routed writes. They require a separate exclusive-maintenance policy.

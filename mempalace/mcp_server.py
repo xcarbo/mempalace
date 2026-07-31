@@ -74,6 +74,7 @@ from .backends.chroma import (  # noqa: E402
     _HNSW_BLOAT_GUARD,
     _pin_hnsw_threads,
     hnsw_capacity_status,
+    reset_hnsw_capacity_cache,
 )
 from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
@@ -849,6 +850,12 @@ def _force_chroma_cache_reset() -> None:
     _palace_db_mtime = 0.0
     _metadata_cache = None
     _metadata_cache_time = 0
+    # This runs on the #1315 retry path, which drops caches precisely to
+    # re-observe the palace after a transient index error. The capacity verdict
+    # is another cached view of that same palace, so it must be dropped too, or
+    # the retry could be answered from the pre-error verdict (its 10 s ceiling
+    # outlasts the 2 s retry sleep).
+    reset_hnsw_capacity_cache()
     try:
         from .palace import get_backend_for_palace
 
@@ -3964,7 +3971,10 @@ def tool_reconnect():
     ChromaBackend._quarantined_paths.discard(_config.palace_path)
     # Force probe re-run on next _get_client by clearing the flag now;
     # _refresh_vector_disabled_flag will re-set it if the divergence
-    # still applies after the reconnect.
+    # still applies after the reconnect. The probe keeps its own cache
+    # (#1471), so drop that too — otherwise the "re-run" would be served
+    # from the verdict this reconnect is meant to discard.
+    reset_hnsw_capacity_cache()
     _vector_disabled = False
     _vector_disabled_reason = ""
     # Drain the per-path KnowledgeGraph cache so a replaced sqlite file is
