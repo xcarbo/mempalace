@@ -1179,23 +1179,39 @@ def is_rust_panic(exc: BaseException) -> bool:
     return type(exc).__name__ == "PanicException"
 
 
-def _hnsw_threads_already_pinned(collection) -> bool:
-    """True if this collection already reports ``hnsw:num_threads == 1``.
+def _hnsw_threads_needs_retrofit(collection) -> bool:
+    """True if this collection was NOT created with ``hnsw:num_threads=1``.
 
-    Checked before writing so the retrofit costs nothing on a palace that never
-    needed it. Reads the resolved configuration first and falls back to the
-    creation metadata; either being 1 means a ``modify()`` would be a no-op
-    write. Unknown shape returns False — pin rather than assume.
+    This is the only question the retrofit needs to answer, and it is a
+    question about how the collection was **created**, not about what a given
+    client currently holds in memory. ``collection.metadata`` is the right
+    source precisely because it is the persisted creation record: mempalace
+    passes ``hnsw:num_threads=1`` in ``metadata=`` at create time, and it is
+    still there on disk in ``collection_metadata`` years later. A collection
+    carrying it never had the #974/#965 race and needs no retrofit; one
+    lacking it predates that change and does.
+
+    Reading ``configuration_json`` instead is a trap that was tried and
+    reverted. It reports the *effective in-memory* config, which omits
+    ``num_threads`` on a freshly opened client even for a collection created
+    with it — so the retrofit fires on every client rebuild forever. Client
+    rebuilds are driven by external writes (a miner folding the WAL back into
+    chroma.sqlite3), so on a live read service that reintroduces exactly the
+    write-during-concurrent-reads that panics chromadb's Rust core. Measured
+    against the live palace: metadata-gated, 68,386 requests over 16 minutes
+    with zero failures; configuration-gated, the original
+    ``ColumnDecode { Utf8Error }`` panic returned inside 90 seconds.
+
+    Unknown shape returns True — retrofit rather than assume.
     """
     try:
-        config = getattr(collection, "configuration_json", None) or {}
-        if isinstance(config, dict) and (config.get("hnsw") or {}).get("num_threads") == 1:
-            return True
         metadata = getattr(collection, "metadata", None) or {}
-        return isinstance(metadata, dict) and metadata.get("hnsw:num_threads") == 1
+        if not isinstance(metadata, dict):
+            return True
+        return metadata.get("hnsw:num_threads") != 1
     except Exception:
-        logger.debug("could not read hnsw thread config; pinning anyway", exc_info=True)
-        return False
+        logger.debug("could not read hnsw creation metadata; pinning anyway", exc_info=True)
+        return True
 
 
 def _pin_hnsw_threads(collection) -> None:
@@ -1230,11 +1246,12 @@ def _pin_hnsw_threads(collection) -> None:
     except ImportError:
         logger.debug("_pin_hnsw_threads skipped: chromadb too old", exc_info=True)
         return
-    if _hnsw_threads_already_pinned(collection):
-        # Nothing to retrofit, so do not spend a write finding that out. On a
-        # palace mempalace created (num_threads=1 at creation, persisted in
-        # collection_metadata) this is every open, which takes the write out
-        # of the read path entirely rather than merely making it rare.
+    if not _hnsw_threads_needs_retrofit(collection):
+        # Created with num_threads=1 already, so there is nothing to retrofit
+        # and no reason to spend a write establishing that. On any palace
+        # mempalace made this is every open, which is the point: it keeps the
+        # write off the read path permanently rather than merely making it
+        # rarer. Legacy palaces still get pinned below.
         return
     try:
         collection.modify(

@@ -23,8 +23,14 @@ Two things made it lethal rather than merely noisy:
 * Nothing invalidated the client afterwards, so a single panic wedged the
   service until it was restarted.
 
-The fix is to pin once per ``PersistentClient`` rather than once per handout,
-which is all ``_pin_hnsw_threads``' contract ever required.
+The fix has two halves. The retrofit runs once per ``PersistentClient`` rather
+than once per handout, which is all its contract ever required; and it is
+skipped entirely for a collection created with ``hnsw:num_threads=1``, which is
+every palace mempalace has made. That second half is load-bearing, not an
+optimisation: client rebuilds are driven by external writes, so a retrofit that
+fires per rebuild still writes while readers are live. Gating it on the
+effective in-memory config instead of the creation record was tried and brought
+the panic back within 90 seconds on the live service.
 """
 
 import threading
@@ -124,10 +130,18 @@ def test_client_rebuild_does_not_close_the_client_it_retires(palace_path, monkey
         backend.close()
 
 
-def test_concurrent_handouts_and_reads_do_not_panic(palace_path):
+def test_concurrent_handouts_and_reads_do_not_panic(palace_path, pin_spy):
     """The shape mempalace-api actually runs: the handout is serialised, the
     read is not. Pre-fix this panicked inside chromadb's Rust core within a
-    few dozen reads."""
+    few dozen reads.
+
+    The crash itself is a poor assertion — whether chromadb panics depends on
+    timing, and running another test in this file first was enough to mask it,
+    so this test passed on the broken code in a whole-file run. It therefore
+    asserts the *behaviour* that causes the crash as well: zero writes issued
+    during the concurrent phase. That fails deterministically on reverted code
+    regardless of ordering.
+    """
     backend = ChromaBackend()
     collection = backend.get_collection(palace_path, collection_name="pin_test", create=True)
     ids = [f"drawer_{i:04d}" for i in range(20)]
@@ -157,6 +171,7 @@ def test_concurrent_handouts_and_reads_do_not_panic(palace_path):
             failures.append(f"{'panic' if is_rust_panic(exc) else type(exc).__name__}: {exc}")
             stop.set()
 
+    pin_spy.clear()  # count only what the concurrent phase issues
     threads = [threading.Thread(target=worker, args=(s,)) for s in range(6)]
     for t in threads:
         t.start()
@@ -166,48 +181,73 @@ def test_concurrent_handouts_and_reads_do_not_panic(palace_path):
     try:
         assert not failures, failures[0]
         assert len(reads) == 360
-    finally:
-        backend.close()
-
-
-def test_pin_issues_no_write_when_already_pinned(palace_path):
-    """mempalace creates collections with num_threads=1 already persisted, so
-    the retrofit should cost a read and nothing else."""
-    backend = ChromaBackend()
-    try:
-        wrapper = backend.get_collection(palace_path, collection_name="pin_test", create=True)
-        inner = getattr(wrapper, "_collection", wrapper)
-        assert chroma_mod._hnsw_threads_already_pinned(inner), (
-            "a collection mempalace just created should already report num_threads=1"
+        # The order-independent half: 360 concurrent handouts, zero writes.
+        assert pin_spy == [], (
+            f"{len(pin_spy)} palace writes issued across 360 concurrent read "
+            "handouts; a read handout must never write"
         )
-
-        modified = []
-        inner.modify = lambda *a, **kw: modified.append((a, kw))
-        chroma_mod._pin_hnsw_threads(inner)
-        assert modified == [], "pin issued a write against an already-pinned collection"
     finally:
         backend.close()
 
 
 @pytest.mark.parametrize(
-    "config,metadata,expected",
+    "metadata,needs_retrofit",
     [
-        ({"hnsw": {"num_threads": 1}}, {}, True),
-        ({}, {"hnsw:num_threads": 1}, True),
-        ({"hnsw": {"num_threads": 4}}, {}, False),
-        ({}, {}, False),
-        (None, None, False),
-        ("not-a-dict", None, False),
+        # Created with the safe value — no retrofit, so no write on the read path.
+        ({"hnsw:num_threads": 1, "hnsw:space": "cosine"}, False),
+        # Legacy palace: predates the change, still needs pinning.
+        ({"hnsw:space": "cosine"}, True),
+        ({"hnsw:num_threads": 4}, True),
+        ({}, True),
+        (None, True),
+        ("not-a-dict", True),
     ],
 )
-def test_already_pinned_reads_config_then_metadata(config, metadata, expected):
+def test_retrofit_gate_reads_the_creation_record(metadata, needs_retrofit):
+    """The gate asks how the collection was CREATED, not what a client holds.
+
+    Reading the effective in-memory config instead makes this return True on
+    every freshly opened client, which fires a write on every client rebuild
+    and reintroduces the panic. See _hnsw_threads_needs_retrofit.
+    """
+
     class FakeCollection:
-        configuration_json = config
         metadata = None
 
     fake = FakeCollection()
     fake.metadata = metadata
-    assert chroma_mod._hnsw_threads_already_pinned(fake) is expected
+    assert chroma_mod._hnsw_threads_needs_retrofit(fake) is needs_retrofit
+
+
+def test_legacy_collection_still_gets_retrofitted():
+    """A palace created before num_threads=1 must still be pinned."""
+    modified = []
+
+    class LegacyCollection:
+        metadata = {"hnsw:space": "cosine"}
+
+        def modify(self, *a, **kw):
+            modified.append((a, kw))
+
+    chroma_mod._pin_hnsw_threads(LegacyCollection())
+    assert len(modified) == 1, "legacy collection was not retrofitted"
+
+
+def test_modern_collection_is_never_written_to(palace_path):
+    """End-to-end: a collection mempalace created takes no write, ever."""
+    backend = ChromaBackend()
+    try:
+        wrapper = backend.get_collection(palace_path, collection_name="pin_test", create=True)
+        inner = getattr(wrapper, "_collection", wrapper)
+        assert inner.metadata.get("hnsw:num_threads") == 1
+        assert chroma_mod._hnsw_threads_needs_retrofit(inner) is False
+
+        modified = []
+        inner.modify = lambda *a, **kw: modified.append((a, kw))
+        chroma_mod._pin_hnsw_threads(inner)
+        assert modified == [], "issued a write against a collection that never needed one"
+    finally:
+        backend.close()
 
 
 def test_is_rust_panic_matches_by_name_without_importing_pyo3():
