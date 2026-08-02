@@ -2533,6 +2533,51 @@ class TestWriteTools:
         # The refusal must leave agent A's write intact.
         assert tool_get_drawer("drawer_proj_backend_aaa")["content"] == "agent A wrote this"
 
+    def test_update_drawer_if_unchanged_names_a_truncated_token(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """A shortened digest must be diagnosed, not reported as someone else's write.
+
+        Four of the six check-and-set refusals in the live write log to
+        2026-08-02 were callers passing a 12- or 16-character prefix (the
+        12-char form is exactly what the conflict message itself prints).
+        Told only "the drawer changed", they retried the same bad token until
+        they gave up, while the drawer had not changed at all.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_get_drawer, tool_update_drawer
+
+        digest = tool_get_drawer("drawer_proj_backend_aaa")["content_sha256"]
+
+        result = tool_update_drawer(
+            "drawer_proj_backend_aaa",
+            content="written with a truncated token",
+            if_unchanged=digest[:12],
+        )
+
+        assert result["success"] is False
+        assert result["conflict"] is True
+        assert result["truncated_token"] is True
+        assert "truncated digest" in result["error"]
+        # Still strictly refused — the message changes, the guarantee does not.
+        assert tool_get_drawer("drawer_proj_backend_aaa")["content_sha256"] == digest
+
+    def test_update_drawer_real_conflict_is_not_called_truncated(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_get_drawer, tool_update_drawer
+
+        stale = tool_get_drawer("drawer_proj_backend_aaa")["content_sha256"]
+        tool_update_drawer("drawer_proj_backend_aaa", content="someone else wrote")
+
+        result = tool_update_drawer(
+            "drawer_proj_backend_aaa", content="clobber", if_unchanged=stale
+        )
+
+        assert result["truncated_token"] is False
+        assert "changed since you read it" in result["error"]
+
     def test_update_drawer_if_unchanged_accepts_uppercase_digest(
         self, monkeypatch, config, palace_path, seeded_collection, kg
     ):

@@ -3340,6 +3340,14 @@ def tool_update_drawer(
             expected = str(if_unchanged).strip().lower()
             actual = _content_digest(old_doc)
             if expected != actual:
+                # Distinguish "someone else wrote" from "you sent a truncated
+                # token". Four of the six check-and-set refusals in the write
+                # log to 2026-08-02 were the latter — one caller sent 16 chars,
+                # another sent the 12-char prefix this very message prints with
+                # an ellipsis, and both then retried the identical bad token
+                # until they gave up. A conflict a caller cannot distinguish
+                # from its own malformed input is a conflict it will never fix.
+                truncated = len(expected) < len(actual) and actual.startswith(expected)
                 # A refused check-and-set is a real, actionable event: it means
                 # two writers raced on a singleton. It is not an exception, so
                 # nothing else would ever record it.
@@ -3352,19 +3360,32 @@ def tool_update_drawer(
                     room=old_meta.get("room"),
                     expected_sha256=expected[:16],
                     actual_sha256=actual[:16],
+                    truncated_token=truncated,
                 )
-                return {
-                    "success": False,
-                    "conflict": True,
-                    "drawer_id": drawer_id,
-                    "expected_sha256": expected,
-                    "actual_sha256": actual,
-                    "error": (
+                if truncated:
+                    message = (
+                        f"if_unchanged for drawer {drawer_id} is a truncated digest: "
+                        f"{len(expected)} characters, and a prefix of the drawer's "
+                        "current content_sha256. The drawer did NOT change and nothing "
+                        "was written — retrying this token will fail identically. Pass "
+                        f"the full {len(actual)}-character content_sha256 field from "
+                        "get_drawer verbatim."
+                    )
+                else:
+                    message = (
                         f"Drawer {drawer_id} changed since you read it "
                         f"(expected {expected[:12]}…, found {actual[:12]}…). "
                         "Nothing was written. Re-fetch the drawer, re-apply your "
                         "edit on top of the current content, and retry."
-                    ),
+                    )
+                return {
+                    "success": False,
+                    "conflict": True,
+                    "truncated_token": truncated,
+                    "drawer_id": drawer_id,
+                    "expected_sha256": expected,
+                    "actual_sha256": actual,
+                    "error": message,
                 }
 
         new_doc = old_doc
