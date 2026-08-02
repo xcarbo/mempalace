@@ -204,3 +204,75 @@ def test_hybrid_rank_tiebreak_handles_top_level_authored_at():
     _hybrid_rank(results, "alpha beta gamma")
     assert results[0]["authored_at"] == "2026-06-27T10:00:00.000Z"
     assert results[1]["authored_at"] == "2026-06-21T10:00:00.000Z"
+
+
+# ── the hybrid rank must SEE more than it returns ─────────────────────────
+#
+# Regression for the recall failure found on 2026-08-02: the candidate pool
+# was cut to n_results by vector distance alone *before* `_finalize_candidate_
+# hits` ran the 0.6*vector + 0.4*BM25 hybrid re-rank. The BM25 half could
+# therefore only reorder drawers that vector had already picked, so a drawer
+# whose text literally contained the query words never came back if its
+# embedding distance fell one slot below the cut. On the live palace that lost
+# the `wings-registry` drawer (13th by distance among 158k drawers) for a query
+# whose words it contains verbatim — every night since 2026-07-26.
+
+
+def _seed_many_drawers(palace_path, count=20):
+    col = get_collection(palace_path, create=True)
+    col.upsert(
+        ids=[f"M{i}" for i in range(count)],
+        documents=[
+            f"Deployment note {i}: the service rollout used a canary batch of {i} pods."
+            for i in range(count)
+        ],
+        metadatas=[
+            {"wing": "ops", "room": "deploys", "source_file": f"fixture_M{i}.md"}
+            for i in range(count)
+        ],
+    )
+
+
+def _captured_finalize_pool(monkeypatch):
+    """Record how many candidates reach the ranking stage."""
+    from mempalace import searcher as searcher_mod
+
+    seen = {}
+    original = searcher_mod._finalize_candidate_hits
+
+    def _spy(**kwargs):
+        seen["pool"] = len(kwargs["hits"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(searcher_mod, "_finalize_candidate_hits", _spy)
+    return seen
+
+
+def test_ranking_stage_sees_more_candidates_than_it_returns(tmp_path, monkeypatch):
+    from mempalace import searcher as searcher_mod
+
+    # The bug only showed with the second-stage reranker off — its wider pool
+    # was accidentally masking it.
+    monkeypatch.setattr(searcher_mod, "rerank_enabled", lambda: False)
+    palace = str(tmp_path / "palace")
+    _seed_many_drawers(palace)
+    seen = _captured_finalize_pool(monkeypatch)
+
+    result = search_memories("canary rollout deployment", palace_path=palace, n_results=3)
+
+    assert seen["pool"] > 3, "hybrid rank must rank a wide pool, not the vector top-N"
+    assert len(result["results"]) <= 3, "the caller's result count must not change"
+
+
+def test_ranking_pool_is_not_widened_past_available_candidates(tmp_path, monkeypatch):
+    """A tiny palace must not grow phantom candidates — the pool is a cap, not a quota."""
+    from mempalace import searcher as searcher_mod
+
+    monkeypatch.setattr(searcher_mod, "rerank_enabled", lambda: False)
+    palace = str(tmp_path / "palace")
+    _seed_drawers(palace)  # 4 drawers
+    seen = _captured_finalize_pool(monkeypatch)
+
+    search_memories("auth JWT tokens", palace_path=palace, n_results=2)
+
+    assert seen["pool"] <= 4

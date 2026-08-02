@@ -1452,10 +1452,27 @@ def search_memories(
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
-    # With the reranker on, keep a wider pool alive through hydration and
-    # finalize — the second stage may promote a candidate the first stage
-    # ranked below the cut. Without it, cut to n_results as before.
-    pool_size = max(n_results, MAX_RERANK_POOL) if rerank_enabled() else n_results
+    # Keep a wide pool alive through hydration and finalize. `_finalize_
+    # candidate_hits` is where the *actual* ranking happens — the hybrid
+    # 0.6*vector + 0.4*BM25 re-rank, plus the optional second-stage rerank —
+    # and it can only rank what survives to it. Cutting to n_results here
+    # meant the BM25 half of the hybrid score never saw a candidate that
+    # vector distance alone had already dropped, which silently made the
+    # hybrid rank a re-ordering of the pure-vector top-N rather than a
+    # retrieval stage of its own.
+    #
+    # That cost real recall on the live palace (2026-08-02): the
+    # `wings-registry` drawer — whose text literally contains the query
+    # words — sat 13th by vector distance among 158k drawers, was cut here,
+    # and never reached the BM25 pass that ranks it FIRST. The golden-recall
+    # harness had it failing every night since 2026-07-26. It only ever
+    # passed with the reranker on, because that widened this same pool.
+    # Same defect class as the FTS candidate cap fixed in 4f42d25: rank
+    # before capping, not after.
+    #
+    # The final cut to n_results still happens in `_finalize_candidate_hits`,
+    # so callers see no change in result count.
+    pool_size = max(n_results, MAX_RERANK_POOL)
     hits = _dedupe_by_drawer_id(scored)[:pool_size]
 
     # Drawer-grep enrichment: for closet-boosted hits whose source has
