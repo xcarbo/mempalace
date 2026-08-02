@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import threading
+import time
 from typing import Optional
 
 from .backends import (
@@ -1139,6 +1140,12 @@ def _write_lock_holder(lock_file) -> None:
     write_holder_record(lock_file)
 
 
+# Poll interval for ``mine_palace_lock(wait_seconds=...)``. Short enough that a
+# waiter starts within a second of the holder releasing, long enough that a
+# 90-second wait is ~180 cheap flock probes rather than a spin.
+_PALACE_LOCK_POLL_SECONDS = 0.5
+
+
 def _palace_contention_error(resolved: str, lock_path: str, lock_file) -> "MineAlreadyRunning":
     """Build the rich MineAlreadyRunning for a failed palace-lock acquire.
 
@@ -1186,7 +1193,7 @@ def _palace_contention_error(resolved: str, lock_path: str, lock_file) -> "MineA
 
 
 @contextlib.contextmanager
-def mine_palace_lock(palace_path: str):
+def mine_palace_lock(palace_path: str, wait_seconds: float = 0.0):
     """Per-palace non-blocking lock around the full `mine` pipeline.
 
     The per-file `mine_lock` only protects delete+insert interleave for a
@@ -1206,9 +1213,20 @@ def mine_palace_lock(palace_path: str):
     normcase, `C:\\Palace` and `c:\\palace` would hash to different keys
     on Windows and let two concurrent mines touch the same on-disk palace.
 
-    Non-blocking: if another `mine` is already writing to this palace,
-    raise MineAlreadyRunning so the caller can exit cleanly instead of
-    piling up as a waiting worker.
+    Non-blocking by default: if another `mine` is already writing to this
+    palace, raise MineAlreadyRunning so the caller can exit cleanly instead
+    of piling up as a waiting worker.
+
+    ``wait_seconds`` > 0 turns that into a bounded wait: the non-blocking
+    acquire is retried until the deadline before the contention error is
+    raised. This is for SHORT writers (a single add/update through the tool
+    layer), which have nothing to gain from failing while a legitimate,
+    live, minutes-long `mine` finishes — a mine pass measured at 60-90s here
+    was refusing every one of them (2026-08-02). Mines themselves must keep
+    the default of 0: queueing mine passes behind each other is exactly what
+    this lock exists to prevent. A poll loop rather than a blocking flock so
+    the deadline is honoured on every platform and the inode-currency
+    protocol above still runs on each attempt.
 
     Re-entrant: if the current process already holds the lock for the same
     palace, the context manager passes through without re-acquiring. This
@@ -1247,6 +1265,8 @@ def mine_palace_lock(palace_path: str):
     # between our open() and lock — the same currency protocol as
     # ``_acquire_mine_lock_file``: after any lock outcome, verify the fd still
     # matches the pathname and retry on the fresh file when it doesn't.
+    deadline = time.monotonic() + max(0.0, wait_seconds or 0.0)
+    waited = False
     while True:
         if not os.path.exists(lock_path):
             # Touch atomically: O_CREAT|O_EXCL would fail if a concurrent
@@ -1269,6 +1289,19 @@ def mine_palace_lock(palace_path: str):
                     # phantom holder.
                     lf.close()
                     continue
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    if not waited:
+                        waited = True
+                        logger.info(
+                            "palace %s is busy; waiting up to %.0fs for the write lock (%s)",
+                            resolved,
+                            max(0.0, wait_seconds or 0.0),
+                            describe_holder(lock_path, read_holder_record(lf)),
+                        )
+                    lf.close()
+                    time.sleep(min(_PALACE_LOCK_POLL_SECONDS, remaining))
+                    continue
                 raise _palace_contention_error(resolved, lock_path, lf)
             if not _mine_lock_file_is_current(lf, lock_path):
                 _unlock_mine_lock_file(lf)
@@ -1288,6 +1321,19 @@ def mine_palace_lock(palace_path: str):
     try:
         # Record our own identity for any later contender's diagnostic message.
         _write_lock_holder(lf)
+        if waited:
+            # A wait that ended in a write is a success, but it is also the
+            # signal that holds are getting long. Record it as a fact so the
+            # write-health agent can see queueing without it looking like a
+            # failure.
+            log_write(
+                "lock_acquire",
+                ok=True,
+                palace=resolved,
+                waited_seconds=round(
+                    max(0.0, (wait_seconds or 0.0) - max(0.0, deadline - time.monotonic())), 1
+                ),
+            )
         # Mark the hold from inside the try so it always pairs with
         # _mark_released. If it sat before the try, an async exception
         # (a SIGINT/KeyboardInterrupt) landing in the gap would orphan

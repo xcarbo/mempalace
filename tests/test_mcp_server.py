@@ -5168,7 +5168,7 @@ def test_peer_writer_guard_refuses_mutating_tool_before_handler(monkeypatch):
     monkeypatch.setattr(
         mcp_server,
         "_acquire_mcp_writer_lock",
-        lambda: (False, "busy writer"),
+        lambda tool_name=None: (False, "busy writer"),
     )
 
     response = mcp_server.handle_request(
@@ -5196,7 +5196,7 @@ def test_peer_writer_guard_refuses_mutating_tool_before_handler(monkeypatch):
 def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
     from mempalace import mcp_server
 
-    def forbidden_lock():
+    def forbidden_lock(tool_name=None):
         raise AssertionError("read tools should not acquire the peer-writer lock")
 
     monkeypatch.setitem(
@@ -5225,7 +5225,7 @@ def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
 def test_status_tool_does_not_acquire_peer_writer_lock(monkeypatch):
     from mempalace import mcp_server
 
-    def forbidden_lock():
+    def forbidden_lock(tool_name=None):
         raise AssertionError("status should not acquire the peer-writer lock")
 
     monkeypatch.setattr(mcp_server, "_ensure_sqlite_integrity_status", lambda: None)
@@ -5248,7 +5248,7 @@ def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
 
     calls = {"count": 0}
 
-    def broken_mine_palace_lock(palace_path):
+    def broken_mine_palace_lock(palace_path, wait_seconds=0.0):
         calls["count"] += 1
         raise RuntimeError(f"permission denied for {palace_path}")
 
@@ -5285,7 +5285,7 @@ def test_peer_writer_readonly_self_heals_after_peer_exits(monkeypatch):
 
     calls = {"count": 0}
 
-    def flaky_mine_palace_lock(palace_path):
+    def flaky_mine_palace_lock(palace_path, wait_seconds=0.0):
         calls["count"] += 1
         if calls["count"] == 1:
             # First attempt: a live peer still holds the lease.
@@ -5313,6 +5313,44 @@ def test_peer_writer_readonly_self_heals_after_peer_exits(monkeypatch):
     assert calls["count"] == 2  # retried, not stranded read-only
     assert mcp_server._MCP_WRITER_LOCK_CM is not None
     assert mcp_server._MCP_WRITER_READ_ONLY is False
+
+
+def test_short_writers_wait_for_the_lease_by_default(monkeypatch):
+    """A single-drawer write must queue behind a live mine, not fail on it."""
+    from mempalace import mcp_server
+
+    monkeypatch.delenv(mcp_server._MCP_WRITER_LOCK_WAIT_ENV, raising=False)
+    assert mcp_server._writer_lock_wait_seconds("mempalace_update_drawer") > 0
+
+
+def test_long_writers_never_wait_for_the_lease(monkeypatch):
+    """Mines keep failing fast — queueing them is what the lock prevents."""
+    from mempalace import mcp_server
+
+    monkeypatch.setenv(mcp_server._MCP_WRITER_LOCK_WAIT_ENV, "300")
+    assert mcp_server._writer_lock_wait_seconds("mempalace_mine") == 0.0
+    assert mcp_server._writer_lock_wait_seconds("mempalace_sync") == 0.0
+    assert mcp_server._writer_lock_wait_seconds("mempalace_add_drawer") == 300.0
+
+
+def test_writer_lock_wait_env_can_be_disabled_but_not_typoed_away(monkeypatch):
+    """0 opts out; garbage falls back to the default instead of failing fast."""
+    from mempalace import mcp_server
+
+    monkeypatch.setenv(mcp_server._MCP_WRITER_LOCK_WAIT_ENV, "0")
+    assert mcp_server._writer_lock_wait_seconds("mempalace_add_drawer") == 0.0
+
+    monkeypatch.setenv(mcp_server._MCP_WRITER_LOCK_WAIT_ENV, "sixty")
+    assert (
+        mcp_server._writer_lock_wait_seconds("mempalace_add_drawer")
+        == mcp_server._MCP_WRITER_LOCK_WAIT_DEFAULT
+    )
+
+    monkeypatch.setenv(mcp_server._MCP_WRITER_LOCK_WAIT_ENV, "-5")
+    assert (
+        mcp_server._writer_lock_wait_seconds("mempalace_add_drawer")
+        == mcp_server._MCP_WRITER_LOCK_WAIT_DEFAULT
+    )
 
 
 def test_sqlite_integrity_gate_refuses_non_status_tool(monkeypatch):

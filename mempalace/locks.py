@@ -42,6 +42,12 @@ LOCK_SENTINEL_BYTES = 1
 # pathological argv cannot balloon the error message.
 _PS_COMMAND_MAX_CHARS = 160
 
+# Slack allowed when comparing a live process's elapsed runtime against how long
+# the lock has been held (see ``pid_is_recycled``). Both numbers are truncated to
+# whole seconds and can be read from slightly different clocks, so only a gap
+# wider than this counts as proof that the PID was recycled.
+_RECYCLED_PID_MARGIN_SECONDS = 60.0
+
 ORPHAN_GUIDANCE = (
     "if this PID is an orphan (e.g. dead SSH parent), kill it — the flock releases on process exit."
 )
@@ -178,6 +184,78 @@ def pid_details(pid) -> dict:
         if len(parts) > 1:
             details["command"] = parts[1].strip()[:_PS_COMMAND_MAX_CHARS]
     return details
+
+
+def pid_elapsed_seconds(pid) -> Optional[float]:
+    """How long ``pid`` has been running, or None when unknowable.
+
+    Reads ``ps -o etime=`` (``[[dd-]hh:]mm:ss``) rather than ``lstart``:
+    elapsed time is locale-independent and needs no timezone parsing.
+    """
+    if pid_alive(pid) is not True or os.name == "nt":
+        return None
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "etime="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    raw = result.stdout.strip()
+    if result.returncode != 0 or not raw:
+        return None
+    days = 0
+    if "-" in raw:
+        day_part, _, raw = raw.partition("-")
+        try:
+            days = int(day_part)
+        except ValueError:
+            return None
+    parts = raw.split(":")
+    if not 1 <= len(parts) <= 3:
+        return None
+    try:
+        values = [int(p) for p in parts]
+    except ValueError:
+        return None
+    while len(values) < 3:
+        values.insert(0, 0)
+    hours, minutes, seconds = values
+    return float(days * 86400 + hours * 3600 + minutes * 60 + seconds)
+
+
+def pid_is_recycled(pid, record: Optional[dict]) -> bool:
+    """Whether a *live* ``pid`` provably is NOT the process that took the lock.
+
+    A recycled PID is the one way a dead holder can read as alive: the OS
+    hands the number to an unrelated process and a residual lock file starts
+    naming a live stranger. The test is a start-time comparison — a process
+    that has been running for LESS time than the lock has been held cannot be
+    the one that acquired it.
+
+    Deliberately one-directional and conservative. It returns True only on a
+    positive contradiction; every unknown (legacy record with no
+    ``acquired_at``, unreadable ``ps``, Windows) returns False, i.e. "treat as
+    the real holder". A generous margin absorbs clock skew and the second-level
+    truncation in both ``etime`` and the recorded timestamp — breaking a live
+    lock is far worse than leaving a stale file behind.
+
+    Note this never decides on its own that a lock may be broken: callers reach
+    it only after a non-blocking flock probe has already proved the file unheld.
+    """
+    if not isinstance(record, dict) or not record.get("acquired_at"):
+        return False
+    if pid_alive(record.get("pid")) is not True:
+        return False
+    held = held_duration_seconds("", record)
+    if held is None:
+        return False
+    elapsed = pid_elapsed_seconds(pid)
+    if elapsed is None:
+        return False
+    return elapsed + _RECYCLED_PID_MARGIN_SECONDS < held
 
 
 # ---------------------------------------------------------------------------
@@ -359,13 +437,34 @@ def _gc_one_lock_file(path: str) -> bool:
             size = os.fstat(lock_file.fileno()).st_size
         except OSError:
             return False
+        record = None
+        reason = "empty (0-byte residue)"
         stale = size <= LOCK_SENTINEL_BYTES
         if not stale:
             record = read_holder_record(lock_file)
             pid = record.get("pid") if record else None
-            stale = pid is not None and pid_alive(pid) is False
+            if pid is not None and pid_alive(pid) is False:
+                stale, reason = True, f"recorded holder PID {pid} is dead"
+            elif pid is not None and pid_is_recycled(pid, record):
+                stale, reason = (
+                    True,
+                    f"recorded holder PID {pid} was recycled (the live process "
+                    "started after the lock was taken)",
+                )
         if not stale:
             return False
+        # A broken lock is an event worth reading in a log after the fact — the
+        # 2026-08-02 investigation turned on knowing whether a residue file had
+        # been reclaimed or was still sitting there. Emitted before the unlink so
+        # it survives a failure to remove.
+        logger.info(
+            "lock-residue GC: reclaiming %s — %s%s",
+            path,
+            reason,
+            f"; recorded argv: {' '.join(str(a) for a in record.get('argv') or [])}"
+            if record and record.get("argv")
+            else "",
+        )
 
         if os.name == "nt":
             # Windows generally cannot unlink an open locked file: release

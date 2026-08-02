@@ -385,6 +385,25 @@ _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 
+# How long a mutating tool waits for the palace write lease before it gives up
+# and returns the peer-writer refusal.
+#
+# It used to give up instantly, which is wrong for the shape this process
+# actually has: nearly every writer here is a one-shot `memp add-drawer` /
+# `memp update-drawer`, while the process it loses to is a background convo
+# mine that legitimately holds the lock for 60-90 seconds. Measured on
+# 2026-08-02: the `buzz-watch` agent failed six nights running because all
+# three of its retries (30s apart) landed inside one mine pass. Waiting costs
+# a scheduled writer a minute; refusing costs it the whole night's work.
+#
+# Set to 0 to restore the instant refusal.
+_MCP_WRITER_LOCK_WAIT_ENV = "MEMPALACE_WRITER_LOCK_WAIT_SECONDS"
+_MCP_WRITER_LOCK_WAIT_DEFAULT = 120.0
+
+# Write tools whose critical section is a whole pipeline, not a single row.
+# These keep the historical fail-fast behaviour (see _writer_lock_wait_seconds).
+_LONG_RUNNING_WRITE_TOOLS = frozenset({"mempalace_mine", "mempalace_sync"})
+
 _MUTATING_TOOLS = frozenset(
     {
         "mempalace_kg_add",
@@ -409,7 +428,38 @@ def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _acquire_mcp_writer_lock() -> tuple[bool, str]:
+def _writer_lock_wait_seconds(tool_name: str = None) -> float:
+    """Seconds a mutating tool waits for the write lease before refusing.
+
+    Long writers never wait. Queueing one `mine` behind another is the exact
+    pile-up the palace lock exists to prevent, so those keep failing fast; the
+    wait is for short writers that just want their one drawer written.
+
+    Unparseable or negative values fall back to the default rather than
+    disabling the wait — a typo in the env must not silently reinstate the
+    failure mode this exists to fix. Set it to exactly 0 to opt out.
+    """
+    if tool_name in _LONG_RUNNING_WRITE_TOOLS:
+        return 0.0
+    raw = os.environ.get(_MCP_WRITER_LOCK_WAIT_ENV, "").strip()
+    if not raw:
+        return _MCP_WRITER_LOCK_WAIT_DEFAULT
+    try:
+        seconds = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %.0fs",
+            _MCP_WRITER_LOCK_WAIT_ENV,
+            raw,
+            _MCP_WRITER_LOCK_WAIT_DEFAULT,
+        )
+        return _MCP_WRITER_LOCK_WAIT_DEFAULT
+    if seconds < 0:
+        return _MCP_WRITER_LOCK_WAIT_DEFAULT
+    return seconds
+
+
+def _acquire_mcp_writer_lock(tool_name: str = None) -> tuple[bool, str]:
     """Acquire this process's per-palace MCP writer lease.
 
     Returns (True, "") when this process may write. Returns (False, reason)
@@ -445,7 +495,9 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     try:
         from .palace import MineAlreadyRunning, mine_palace_lock
 
-        lock_cm = mine_palace_lock(_config.palace_path)
+        lock_cm = mine_palace_lock(
+            _config.palace_path, wait_seconds=_writer_lock_wait_seconds(tool_name)
+        )
         lock_cm.__enter__()
     except MineAlreadyRunning as exc:
         _MCP_WRITER_READ_ONLY = True
@@ -478,7 +530,7 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
     if tool_name not in _MUTATING_TOOLS:
         return None
 
-    ok, reason = _acquire_mcp_writer_lock()
+    ok, reason = _acquire_mcp_writer_lock(tool_name)
     if ok:
         return None
 

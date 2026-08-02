@@ -15,6 +15,8 @@ import os
 import subprocess
 import sys
 import threading
+import time
+from datetime import datetime, timezone
 
 from unittest import mock
 
@@ -254,6 +256,169 @@ def test_palace_lock_acquire_sweeps_residues(tmp_path, monkeypatch):
         pass
 
     assert not os.path.exists(residue)
+
+
+# ---------------------------------------------------------------------------
+# Dead vs live holders on the real palace-lock path (2026-08-02)
+#
+# The failure under investigation was "orphaned lock blocks every writer". The
+# asymmetry that matters: a lock whose holder is dead must be reclaimed, and a
+# lock whose holder is alive must NEVER be broken — breaking a live one
+# corrupts concurrent writes into a 158k-drawer palace, which is far worse than
+# leaving a stale file lying around.
+# ---------------------------------------------------------------------------
+
+
+def _palace_lock_path(lock_dir: str, palace: str) -> str:
+    """The lock file ``mine_palace_lock(palace)`` will use — same key formula."""
+    import hashlib
+
+    resolved = os.path.realpath(os.path.expanduser(palace))
+    key = hashlib.sha256(os.path.normcase(resolved).encode()).hexdigest()[:16]
+    return os.path.join(lock_dir, f"mine_palace_{key}.lock")
+
+
+def test_dead_holder_palace_lock_is_broken_and_reclaimed(tmp_path, monkeypatch):
+    """A lock file naming a dead PID must not keep the next writer out."""
+    lock_dir = _set_home(monkeypatch, tmp_path)
+    _reset_gc_throttle(monkeypatch)
+    palace = str(tmp_path / "palace")
+    lock_path = _palace_lock_path(lock_dir, palace)
+    _write_record_file(
+        lock_path,
+        {
+            "pid": _dead_pid(),
+            "ppid": 1,
+            "argv": ["/repo/mempalace/__main__.py", "mine", "/transcripts", "--mode", "convos"],
+            "acquired_at": "2026-08-02T16:31:00+00:00",
+        },
+    )
+
+    with mine_palace_lock(palace):
+        # Reclaimed: the record now names us, not the dead miner.
+        with open(lock_path, "rb") as fh:
+            record = parse_holder_record(fh.read()[1:].decode("utf-8"))
+        assert record["pid"] == os.getpid()
+
+
+def test_live_holder_palace_lock_is_still_respected(tmp_path, monkeypatch):
+    """The liveness check must not overcorrect into breaking real locks."""
+    lock_dir = _set_home(monkeypatch, tmp_path)
+    _reset_gc_throttle(monkeypatch)
+    palace = str(tmp_path / "palace")
+    lock_path = _palace_lock_path(lock_dir, palace)
+
+    with _hold_palace_lock(palace):
+        with pytest.raises(MineAlreadyRunning):
+            with mine_palace_lock(palace):
+                pytest.fail("a live holder's lock must never be broken")
+        assert os.path.exists(lock_path), "a held lock file must survive contention"
+        with open(lock_path, "rb") as fh:
+            record = parse_holder_record(fh.read()[1:].decode("utf-8"))
+        assert record["pid"] == os.getpid(), "holder record must still name the live holder"
+
+
+def test_gc_removes_recycled_pid_residue(tmp_path, monkeypatch):
+    """A live PID younger than the lock it supposedly holds is a recycled PID."""
+    lock_dir = _set_home(monkeypatch, tmp_path)
+    residue = os.path.join(lock_dir, "recycled.lock")
+    # This process is alive but was certainly not running in 2020.
+    _write_record_file(
+        residue,
+        {"pid": os.getpid(), "argv": ["memp", "mine"], "acquired_at": "2020-01-01T00:00:00+00:00"},
+    )
+
+    assert gc_stale_locks() == 1
+    assert not os.path.exists(residue)
+
+
+def test_gc_keeps_live_holder_that_predates_the_lock(tmp_path, monkeypatch):
+    """The recycled-PID test must only fire on a positive contradiction."""
+    lock_dir = _set_home(monkeypatch, tmp_path)
+    keeper = os.path.join(lock_dir, "genuinely-live.lock")
+    _write_record_file(
+        keeper,
+        {
+            "pid": os.getpid(),
+            "argv": ["memp", "mine"],
+            # Acquired a moment ago: consistent with this process being the holder.
+            "acquired_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        },
+    )
+
+    assert gc_stale_locks() == 0
+    assert os.path.exists(keeper)
+
+
+def test_gc_keeps_live_holder_with_no_acquire_timestamp(tmp_path, monkeypatch):
+    """Legacy records carry no acquire time — unknown must mean 'leave it alone'."""
+    lock_dir = _set_home(monkeypatch, tmp_path)
+    keeper = os.path.join(lock_dir, "legacy-format.lock")
+    with open(keeper, "wb") as fh:
+        fh.write(b"\0" + f"{os.getpid()} memp mine /some/dir".encode())
+
+    assert gc_stale_locks() == 0
+    assert os.path.exists(keeper)
+
+
+# ---------------------------------------------------------------------------
+# Bounded wait for short writers
+# ---------------------------------------------------------------------------
+
+
+def test_wait_seconds_acquires_once_the_holder_releases(tmp_path, monkeypatch):
+    """A short writer queues behind a live mine instead of failing outright."""
+    _set_home(monkeypatch, tmp_path)
+    _reset_gc_throttle(monkeypatch)
+    palace = str(tmp_path / "palace")
+    acquired = threading.Event()
+    holder_done = threading.Event()
+
+    def _hold():
+        with mine_palace_lock(palace):
+            acquired.set()
+            time.sleep(0.6)
+        holder_done.set()
+
+    thread = threading.Thread(target=_hold)
+    thread.start()
+    try:
+        assert acquired.wait(timeout=10)
+        with mock.patch.object(palace_mod, "_held_by_this_process", return_value=False):
+            started = time.monotonic()
+            with mine_palace_lock(palace, wait_seconds=10):
+                waited = time.monotonic() - started
+        assert holder_done.is_set(), "waiter must not acquire before the holder released"
+        assert waited >= 0.3, "the waiter should have actually waited, not raced through"
+    finally:
+        thread.join(timeout=10)
+
+
+def test_wait_seconds_zero_still_refuses_immediately(tmp_path, monkeypatch):
+    """The default stays non-blocking: mines must not queue behind each other."""
+    _set_home(monkeypatch, tmp_path)
+    palace = str(tmp_path / "palace")
+
+    with _hold_palace_lock(palace):
+        started = time.monotonic()
+        with pytest.raises(MineAlreadyRunning):
+            with mine_palace_lock(palace):
+                pytest.fail("wait_seconds=0 must refuse a contended lock")
+        assert time.monotonic() - started < 5
+
+
+def test_wait_seconds_gives_up_at_the_deadline(tmp_path, monkeypatch):
+    """A bounded wait is bounded — it must raise, not hang, when the deadline passes."""
+    _set_home(monkeypatch, tmp_path)
+    palace = str(tmp_path / "palace")
+
+    with _hold_palace_lock(palace):
+        started = time.monotonic()
+        with pytest.raises(MineAlreadyRunning):
+            with mine_palace_lock(palace, wait_seconds=1):
+                pytest.fail("the wait must end in the usual contention error")
+        elapsed = time.monotonic() - started
+        assert 0.9 <= elapsed < 10
 
 
 # ---------------------------------------------------------------------------
