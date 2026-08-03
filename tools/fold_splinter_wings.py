@@ -7,11 +7,22 @@ notation-prefixed wings (``wing_cc``) instead of the canonical bare wing
 drawers (and closets, defensively) so the splinters merge into their twins.
 
 Folding rule for a wing named ``wing_X``:
+  0. -> an explicit ``--map wing_X=target`` if one was given (see below)
   1. -> ``X``                    if a bare wing ``X`` already exists
   2. -> ``X.replace("_", "-")``  if THAT bare wing already exists
   3. -> SKIP (never create a new wing; no-twin splinters are left untouched
      for a human mapping decision — see the follow-up drawer in
      wing ``mempalace`` / room ``follow-ups``)
+
+``--map`` exists because rules 1-2 only find a twin whose name is the splinter
+minus the prefix. Most of the no-twin splinters belong to a wing under a
+DIFFERENT name — ``wing_iptv`` belongs to ``utilities-iptv``, ``wing_router`` to
+``mail-router`` — which no automatic rule can infer. That is the human mapping
+decision rule 3 defers, so this is how the answer gets supplied once made.
+
+A mapped target must ALREADY EXIST as a bare wing; an unknown target aborts the
+run rather than silently creating a wing. That keeps the original invariant:
+this script never invents a wing, it only merges into one you already have.
 
 "Exists" means: appears as a ``wing`` value on at least one drawer in the
 drawer collection and does not itself start with ``wing_``.
@@ -26,6 +37,8 @@ Rooms, content, and drawer IDs are untouched. KG triples are notation-only
 Usage:
     python tools/fold_splinter_wings.py             # dry-run (default)
     python tools/fold_splinter_wings.py --apply     # perform the fold
+    python tools/fold_splinter_wings.py \
+        --map wing_iptv=utilities-iptv --map wing_router=mail-router --apply
 """
 
 import argparse
@@ -48,10 +61,19 @@ LOCK_RETRIES = 8
 LOCK_WAIT_SECONDS = 15
 
 
-def fold_target(wing, existing_bare_wings):
+def fold_target(wing, existing_bare_wings, explicit_map=None, only=None):
     """Return the bare twin for a splinter wing, or None to skip."""
     if not isinstance(wing, str) or not wing.startswith(SPLINTER_PREFIX):
         return None
+    # Allowlist, when given, wins over every rule below. A fold is a bulk
+    # metadata rewrite on a live palace, so "exactly the wings I approved" has
+    # to be expressible — rules 1-2 will otherwise happily fold a splinter whose
+    # target is still an open question (wing_fsra has a 3-drawer bare twin, but
+    # its drawers may belong in fsra-fsp or fsra-risk instead).
+    if only and wing not in only:
+        return None
+    if explicit_map and wing in explicit_map:
+        return explicit_map[wing]
     bare = wing[len(SPLINTER_PREFIX) :]
     if not bare:
         return None
@@ -63,7 +85,25 @@ def fold_target(wing, existing_bare_wings):
     return None
 
 
-def plan_fold(items, existing_bare_wings):
+def parse_map(pairs):
+    """Parse ``--map wing_x=target`` arguments into {splinter: target}."""
+    out = {}
+    for pair in pairs or []:
+        if "=" not in pair:
+            raise SystemExit(f"--map expects wing_x=target, got: {pair!r}")
+        src, _, dst = pair.partition("=")
+        src, dst = src.strip(), dst.strip()
+        if not src.startswith(SPLINTER_PREFIX):
+            raise SystemExit(f"--map source must start with {SPLINTER_PREFIX!r}: {src!r}")
+        if not dst:
+            raise SystemExit(f"--map target is empty for {src!r}")
+        if dst.startswith(SPLINTER_PREFIX):
+            raise SystemExit(f"--map target must be a bare wing, not a splinter: {dst!r}")
+        out[src] = dst
+    return out
+
+
+def plan_fold(items, existing_bare_wings, explicit_map=None, only=None):
     """Pure planner over ``(id, metadata)`` pairs.
 
     Returns ``(summary, updates, skipped, sample_ids)`` where ``summary`` is
@@ -80,7 +120,7 @@ def plan_fold(items, existing_bare_wings):
         wing = meta.get("wing")
         if not isinstance(wing, str) or not wing.startswith(SPLINTER_PREFIX):
             continue
-        target = fold_target(wing, existing_bare_wings)
+        target = fold_target(wing, existing_bare_wings, explicit_map, only)
         if target is None:
             skipped[wing] += 1
             continue
@@ -124,7 +164,25 @@ def main(argv=None):
         default=None,
         help="palace path (default: configured palace)",
     )
+    parser.add_argument(
+        "--map",
+        action="append",
+        dest="maps",
+        metavar="wing_x=target",
+        help="explicit fold for a no-twin splinter; repeatable. Target must "
+        "already exist as a bare wing.",
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        dest="only",
+        metavar="wing_x",
+        help="fold ONLY these splinter wings; repeatable. Everything else is "
+        "left untouched even if rules 1-2 would match it.",
+    )
     args = parser.parse_args(argv)
+    explicit_map = parse_map(args.maps)
+    only = set(args.only or [])
 
     palace_path = args.palace or MempalaceConfig().palace_path
     print(f"Palace: {palace_path}")
@@ -143,7 +201,25 @@ def main(argv=None):
         and not (m or {}).get("wing").startswith(SPLINTER_PREFIX)
     }
 
-    d_summary, d_updates, d_skipped, sample_ids = plan_fold(d_items, existing_bare_wings)
+    # Validate explicit targets BEFORE planning: a typo here would otherwise
+    # scatter drawers into a wing that does not exist, and this script's whole
+    # safety story is that it never creates one.
+    if explicit_map:
+        unknown = {src: dst for src, dst in explicit_map.items() if dst not in existing_bare_wings}
+        if unknown:
+            print("ERROR: --map targets that are not existing bare wings:")
+            for src, dst in sorted(unknown.items()):
+                print(f"  {src} -> {dst}")
+            print("\nNo changes made. Register the wing first, or fix the spelling.")
+            return 2
+        print("Explicit mappings:")
+        for src, dst in sorted(explicit_map.items()):
+            print(f"  {src:30} -> {dst}")
+        print()
+
+    d_summary, d_updates, d_skipped, sample_ids = plan_fold(
+        d_items, existing_bare_wings, explicit_map, only
+    )
 
     # Closets: same rule, judged against the same drawer-derived bare wings.
     closets = None
@@ -152,7 +228,7 @@ def main(argv=None):
     try:
         closets = get_closets_collection(palace_path, create=False)
         c_summary, c_updates, c_skipped, _ = plan_fold(
-            _iter_collection_items(closets), existing_bare_wings
+            _iter_collection_items(closets), existing_bare_wings, explicit_map, only
         )
     except Exception:
         closets = None
@@ -165,7 +241,7 @@ def main(argv=None):
         tbw = _load_known_entities_raw().get("topics_by_wing")
         if isinstance(tbw, dict):
             for key in tbw:
-                target = fold_target(key, existing_bare_wings)
+                target = fold_target(key, existing_bare_wings, explicit_map, only)
                 if target is not None:
                     topic_renames[key] = target
     except Exception:
