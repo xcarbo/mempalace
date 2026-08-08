@@ -9,8 +9,11 @@ The ``"union"`` strategy also pulls top-K BM25-only candidates from sqlite
 FTS5 and merges them into the rerank pool. Both signal sources contribute
 candidates; the hybrid rerank picks the best from a richer pool.
 
-Default behavior is unchanged ("vector") — these tests exercise opt-in
-"union" mode.
+Since 2026-08-08 "union" is also the DEFAULT: vector-only retrieval cannot
+find a drawer whose embedding is poor even when its text matches the query
+word for word, and BM25 was only ever re-ranking what vector had already
+chosen. Passing ``candidate_strategy="vector"`` still selects the vector-only
+lane; passing nothing now gets both.
 """
 
 from mempalace.palace import get_collection
@@ -58,17 +61,53 @@ _NARRATIVE_QUERY = (
 
 
 class TestCandidateUnion:
-    def test_default_vector_strategy_unchanged(self, tmp_path):
-        """Default behavior must be identical to omitting the parameter."""
+    def test_the_default_now_includes_the_lexical_lane(self, tmp_path):
+        """Omitting the parameter must get the union lane, not vector-only.
+
+        The BM25-strong, vector-distant doc is the whole point: a caller that
+        does not choose a strategy should still find it.
+        """
         palace = str(tmp_path / "palace")
         _seed_drawers(palace)
-        without = search_memories(_NARRATIVE_QUERY, palace, n_results=5)
-        with_default = search_memories(
-            _NARRATIVE_QUERY, palace, n_results=5, candidate_strategy="vector"
+        default = search_memories(_NARRATIVE_QUERY, palace, n_results=5)
+        union = search_memories(_NARRATIVE_QUERY, palace, n_results=5, candidate_strategy="union")
+        assert "brand_voice_D4.md" in {h["source_file"] for h in default["results"]}
+        assert [h["source_file"] for h in default["results"]] == [
+            h["source_file"] for h in union["results"]
+        ], "the default must behave as union"
+
+    def test_explicit_vector_strategy_still_means_vector_only(self, tmp_path):
+        """The opt-out has to keep working, or the change is not reversible."""
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+        vector = search_memories(_NARRATIVE_QUERY, palace, n_results=2, candidate_strategy="vector")
+        assert all(h.get("distance") is not None for h in vector["results"])
+
+    def test_default_degrades_when_the_backend_has_no_lexical_search(self, tmp_path, monkeypatch):
+        """Taking the default on a lexical-less backend must not fail the search.
+
+        An explicit ``union`` still raises — the caller asked for a capability
+        that is not there — but nobody should lose search by not choosing.
+        """
+        from mempalace.backends import UnsupportedCapabilityError
+        import mempalace.searcher as searcher_mod
+
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+
+        def _no_lexical(*a, **k):
+            raise UnsupportedCapabilityError("supports_lexical_search")
+
+        monkeypatch.setitem(searcher_mod._CANDIDATE_MERGERS, "union", _no_lexical)
+
+        default = search_memories(_NARRATIVE_QUERY, palace, n_results=5)
+        assert default.get("results"), "default must degrade to vector candidates, not fail"
+        assert "error" not in default
+
+        explicit = search_memories(
+            _NARRATIVE_QUERY, palace, n_results=5, candidate_strategy="union"
         )
-        ids_a = [h["source_file"] for h in without["results"]]
-        ids_b = [h["source_file"] for h in with_default["results"]]
-        assert ids_a == ids_b, "explicit candidate_strategy='vector' must match default"
+        assert explicit.get("unsupported_capability") == "supports_lexical_search"
 
     def test_union_surfaces_bm25_strong_vector_distant_doc(self, tmp_path):
         """The brand-voice doc has strong BM25 signal for the query but is
@@ -141,11 +180,16 @@ class TestCandidateUnion:
             f"union must trim to n_results=2; got {len(result['results'])} results"
         )
 
-    def test_union_skipped_when_max_distance_set(self, tmp_path):
-        """``max_distance`` is a vector-distance threshold; BM25-only
-        candidates have ``distance=None`` and cannot satisfy it. Union
-        must not silently inject them when a strict threshold is set,
-        otherwise the existing ``max_distance`` guarantee regresses."""
+    def test_max_distance_bounds_the_vector_lane_only(self, tmp_path):
+        """``max_distance`` is a VECTOR-distance threshold (changed 2026-08-08).
+
+        It used to skip the lexical lane entirely whenever a threshold was
+        set, which meant the lane never ran for any default caller — the CLI
+        and tool paths both pass 1.5. A lexical hit has no vector distance, so
+        it can neither satisfy nor violate a vector bound; it is admitted on
+        lexical relevance and marked ``matched_via="bm25_backend"``. The
+        threshold still does its real job: every hit that HAS a distance
+        respects it."""
         palace = str(tmp_path / "palace")
         _seed_drawers(palace)
         # Sanity: without max_distance, union surfaces the BM25-strong doc.
@@ -154,8 +198,8 @@ class TestCandidateUnion:
         )
         assert "brand_voice_D4.md" in {h["source_file"] for h in unfiltered["results"]}
 
-        # With a tight max_distance, union must NOT inject BM25-only hits —
-        # every returned hit must have a real (non-None) distance.
+        # With a tight max_distance the lexical lane still runs, and every
+        # hit carrying a distance still respects the bound.
         filtered = search_memories(
             _NARRATIVE_QUERY,
             palace,
@@ -164,11 +208,16 @@ class TestCandidateUnion:
             max_distance=0.5,
         )
         for h in filtered["results"]:
-            assert h.get("distance") is not None, (
-                f"union under max_distance must not inject BM25-only "
-                f"(distance=None) candidates; offending hit: {h}"
-            )
+            if h.get("distance") is None:
+                assert h["matched_via"] == "bm25_backend", (
+                    f"a hit without a vector distance must be identifiable as "
+                    f"lexical-lane; offending hit: {h}"
+                )
+                continue
             assert h["distance"] <= 0.5, f"hit violates max_distance=0.5: distance={h['distance']}"
+        assert "brand_voice_D4.md" in {h["source_file"] for h in filtered["results"]}, (
+            "the lexical lane must still contribute under a distance threshold"
+        )
 
     def test_union_dedup_is_chunk_precise_not_basename(self, tmp_path):
         """Two files with the same basename in different directories must

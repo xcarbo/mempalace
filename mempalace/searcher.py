@@ -265,11 +265,38 @@ def _hybrid_rank(
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
 
+    # A candidate the vector lane never returned has no distance. Scoring that
+    # as similarity 0.0 conflates "not measured" with "maximally far", and
+    # since the vector term carries 60% of the weight it made a lexical-only
+    # candidate structurally unable to win: its ceiling was 0.4, below any
+    # decent vector hit. That is not a ranking, it is an exclusion wearing one.
+    #
+    # Impute the WEAKEST similarity actually observed among the vector
+    # candidates instead. Conservative by construction — the imputed candidate
+    # is treated as no better than the worst thing that did qualify — so BM25
+    # decides among them, which is the entire reason the lexical lane exists.
+    # Strictly BELOW the weakest observed similarity, not equal to it: a
+    # candidate with a real vector signal must still outrank a vector-unknown
+    # one when lexical overlap is equal (pinned by
+    # test_hybrid_rank_l2_keeps_far_candidate_ranked_above_unknown). The shrink
+    # is small enough that BM25 remains the deciding term in every realistic
+    # pool, which is the point of admitting these candidates at all.
+    known = [
+        _distance_to_similarity(r.get("distance"), metric)
+        for r in results
+        if r.get("distance") is not None
+    ]
+    imputed_sim = min(known) * 0.999 if known else 0.0
+
     archive = archive_wings()
     penalty = archive_rank_penalty()
     scored = []
     for r, raw, norm in zip(results, bm25_raw, bm25_norm):
-        vec_sim = _distance_to_similarity(r.get("distance"), metric)
+        vec_sim = (
+            imputed_sim
+            if r.get("distance") is None
+            else _distance_to_similarity(r.get("distance"), metric)
+        )
         r["bm25_score"] = round(raw, 3)
         score = vector_weight * vec_sim + bm25_weight * norm
         # Attenuate, never exclude (decision f6639c96). An archive drawer that
@@ -952,6 +979,35 @@ def _bm25_only_via_sqlite(
     }
 
 
+# Floor on how many lexical candidates to pull when the archive is in play.
+#
+# The archive dominates the lexical lane even harder than the vector one:
+# measured 2026-08-08, 27 of the top 30 FTS hits and 90% of the top 400 were
+# `sessions` rows. Asking for n*3 therefore bought ~3 curated candidates and
+# the demotion downstream had nothing to promote.
+#
+# Over-fetching is close to free here, which is what makes this the right
+# lever rather than a filtered query: FTS cost is flat in n — 88ms at n=30 and
+# 87ms at n=500 on this 173k-drawer palace — because the work is the index
+# scan, not the row count. The obvious alternative, excluding the archive in
+# the query itself, costs 1,188ms: chromadb's metadata filter is an EXISTS
+# subquery per row and there is no index for it.
+_LEXICAL_CANDIDATE_FLOOR = 300
+
+
+def _lexical_candidate_count(n_results: int, wing: str) -> int:
+    """How many lexical candidates to fetch.
+
+    The floor applies only when the archive can actually crowd the lane. A
+    wing-scoped search is already past that problem, so it keeps the cheap
+    proportional fetch.
+    """
+    proportional = n_results * 3
+    if wing or not archive_wings():
+        return proportional
+    return max(proportional, _LEXICAL_CANDIDATE_FLOOR)
+
+
 def _merge_bm25_union_candidates(
     hits: list,
     drawers_col,
@@ -976,22 +1032,26 @@ def _merge_bm25_union_candidates(
     only when full-path/chunk metadata is absent.
 
     BM25-only additions carry ``distance=None`` so ``_hybrid_rank`` scores
-    them on BM25 contribution alone.
+    them on BM25 contribution alone, and ``matched_via="bm25_backend"`` so a
+    caller can tell which lane found them.
 
-    When ``max_distance > 0.0`` (a strict vector-distance threshold is
-    set), BM25-only candidates are skipped entirely — they have no vector
-    distance to satisfy the threshold, and silently injecting them would
-    break the existing ``max_distance`` guarantee that hybrid results lie
-    within the requested vector-distance bound.
+    ``max_distance`` bounds the VECTOR lane only (changed 2026-08-08). This
+    used to skip the lexical lane entirely whenever a threshold was set,
+    which meant it never ran for any default caller — the CLI and tool paths
+    both pass ``max_distance=1.5``. The cost of that was a drawer whose first
+    chunk contains the query words verbatim being unfindable: mempalace's own
+    roadmap, 306th of 173k by embedding distance because its opening chunk is
+    mostly drawer IDs, yet rank 3 lexically. A lexical hit has no vector
+    distance to compare, so it cannot satisfy a vector threshold and cannot
+    meaningfully violate one either; it is admitted on lexical relevance, which
+    is a different and equally valid signal. The threshold still does its real
+    job, which is keeping distant *vector* matches out.
     """
-    if max_distance > 0.0:
-        return
-
     where = build_where_filter(wing, room, source_file)
     try:
         lexical = drawers_col.lexical_search(
             query=query,
-            n_results=n_results * 3,
+            n_results=_lexical_candidate_count(n_results, wing),
             where=where or None,
         )
     except UnsupportedCapabilityError:
@@ -1051,9 +1111,20 @@ def _merge_bm25_union_candidates(
 # project's complexity ceiling (C901 max-complexity=25). New strategies
 # register here.
 _CANDIDATE_MERGERS = {
-    "vector": None,  # default no-op
+    "vector": None,  # vector candidates only
     "union": _merge_bm25_union_candidates,
 }
+
+# What a caller gets when it does not choose. "union" — vector candidates plus
+# lexical ones — because vector-only retrieval cannot find a drawer whose
+# embedding is poor even when its text matches the query word for word, and
+# BM25 was only ever re-ranking what vector had already chosen.
+#
+# The difference between this and asking for "union" explicitly is failure
+# handling: a backend without lexical search degrades to vector-only here,
+# silently, while an explicit request still raises. Nobody should lose search
+# because they took the default on a backend that cannot do half of it.
+DEFAULT_CANDIDATE_STRATEGY = "union"
 
 
 def _validate_candidate_strategy(strategy: str) -> None:
@@ -1067,6 +1138,19 @@ def _validate_candidate_strategy(strategy: str) -> None:
         raise ValueError(
             f"candidate_strategy must be one of {tuple(_CANDIDATE_MERGERS)}, got {strategy!r}"
         )
+
+
+def _resolve_candidate_strategy(candidate_strategy) -> tuple:
+    """Return ``(strategy, was_explicit)``, validating the strategy.
+
+    ``None`` means the caller did not choose, which selects
+    ``DEFAULT_CANDIDATE_STRATEGY`` and marks the choice implicit so an
+    unsupported backend degrades instead of erroring.
+    """
+    explicit = candidate_strategy is not None
+    strategy = candidate_strategy if explicit else DEFAULT_CANDIDATE_STRATEGY
+    _validate_candidate_strategy(strategy)
+    return strategy, explicit
 
 
 def _apply_candidate_strategy(
@@ -1110,6 +1194,7 @@ def _finalize_candidate_hits(
     n_results: int,
     max_distance: float,
     source_file: str = None,
+    strategy_was_explicit: bool = True,
 ) -> tuple:
     try:
         _apply_candidate_strategy(
@@ -1124,11 +1209,16 @@ def _finalize_candidate_hits(
             source_file=source_file,
         )
     except UnsupportedCapabilityError:
-        return [], {
-            "error": "candidate_strategy='union' requires a backend with lexical_search support",
-            "unsupported_capability": "supports_lexical_search",
-            "hint": "Use candidate_strategy='vector' or select a backend that supports lexical search.",
-        }
+        if not strategy_was_explicit:
+            # Took the default on a backend without lexical search: use the
+            # vector candidates we already have rather than failing the search.
+            logger.debug("lexical lane unavailable on this backend; vector candidates only")
+        else:
+            return [], {
+                "error": "candidate_strategy='union' requires a backend with lexical_search support",
+                "unsupported_capability": "supports_lexical_search",
+                "hint": "Use candidate_strategy='vector' or select a backend that supports lexical search.",
+            }
 
     ranked = _hybrid_rank(hits, query, metric=_metric_for_collection(drawers_col))
     # Optional second-stage rerank on the deduped pool (opt-in, local,
@@ -1341,7 +1431,7 @@ def search_memories(
     n_results: int = 5,
     max_distance: float = 0.0,
     vector_disabled: bool = False,
-    candidate_strategy: str = "vector",
+    candidate_strategy: str = None,
     collection_name: str = None,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
@@ -1384,7 +1474,7 @@ def search_memories(
     # Validate the strategy eagerly so invalid values fail the same way
     # regardless of whether the call routes through the vector path or
     # the BM25-only fallback below.
-    _validate_candidate_strategy(candidate_strategy)
+    candidate_strategy, strategy_was_explicit = _resolve_candidate_strategy(candidate_strategy)
 
     if vector_disabled:
         return _vector_disabled_search(
@@ -1627,6 +1717,7 @@ def search_memories(
         n_results=n_results,
         max_distance=max_distance,
         source_file=source_file,
+        strategy_was_explicit=strategy_was_explicit,
     )
     if strategy_error:
         return strategy_error

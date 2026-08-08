@@ -580,6 +580,11 @@ class TestSearchMemoriesHybrid:
             max_distance=0.001,
         )
         for hit in result["results"]:
+            # max_distance bounds the vector lane; lexical-lane hits carry no
+            # distance and are admitted on lexical relevance (2026-08-08).
+            if hit.get("distance") is None:
+                assert hit["matched_via"] == "bm25_backend"
+                continue
             assert hit["distance"] <= 0.001
 
 
