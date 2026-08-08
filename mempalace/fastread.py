@@ -221,6 +221,81 @@ def get_drawer(palace_path: str, collection_name: str, drawer_id: str) -> Option
         conn.close()
 
 
+def get_rows(
+    palace_path: str,
+    collection_name: str,
+    *,
+    row_id: Optional[str] = None,
+    parent_id: Optional[str] = None,
+) -> "Optional[list[dict]]":
+    """Raw stored rows for one drawer id, straight from sqlite.
+
+    The layer under :func:`get_drawer`, for callers that need the rows as
+    chromadb's ``get()`` would return them rather than a stitched
+    ``get_drawer`` payload — notably the local HTTP API, whose
+    ``/drawers/{id}`` contract is one row and whose ``/drawers/{id}/full``
+    contract reports per-chunk completeness. Metadata is returned **verbatim**
+    (no ``source_file`` basenaming), because those endpoints have always
+    exposed the stored value and a client may hand it back as a
+    ``source_file`` filter, which only matches the full path.
+
+    Pass exactly one of ``row_id`` (exact ``embedding_id``) or ``parent_id``
+    (every chunk whose ``parent_drawer_id`` matches). Rows come back sorted by
+    ``(chunk_index, id)`` — the ordering ``mcp_server._logical_chunk_group``
+    uses — each as ``{'id', 'document', 'metadata', 'chunk_index'}``.
+
+    Returns ``None`` when this reader declines (unopenable palace, unknown
+    collection, array-valued metadata) and the caller must fall back to
+    chromadb. An empty list means "read fine, matched nothing" — still fall
+    back before reporting a miss, since a sqlite reader must never be the
+    thing that declares a drawer lost.
+    """
+    if (row_id is None) == (parent_id is None):
+        raise ValueError("pass exactly one of row_id or parent_id")
+
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    conn = _connect(db_path)
+    if conn is None:
+        return None
+    try:
+        segment_id = _metadata_segment_id(conn, collection_name)
+        if segment_id is None:
+            return None
+
+        if row_id is not None:
+            found = _fetch(conn, segment_id, "e.embedding_id = ?", (row_id,))
+        else:
+            found = _fetch(
+                conn,
+                segment_id,
+                """e.id IN (SELECT m2.id FROM embedding_metadata m2
+                            WHERE m2.key = 'parent_drawer_id' AND m2.string_value = ?)""",
+                (parent_id,),
+            )
+        if not found:
+            return []
+        if _has_array_metadata(conn, segment_id, list(found)):
+            return None
+
+        rows = []
+        for stored_id, raw_meta in found.items():
+            document, meta = _split_document(raw_meta)
+            rows.append(
+                {
+                    "id": stored_id,
+                    "document": document,
+                    "metadata": meta,
+                    "chunk_index": _chunk_index(meta),
+                }
+            )
+        rows.sort(key=lambda r: (r["chunk_index"], r["id"]))
+        return rows
+    except (sqlite3.Error, KeyError, TypeError, ValueError):
+        return None
+    finally:
+        conn.close()
+
+
 def _payload(drawer_id: str, content: str, meta: dict, chunk_ids: Optional[list]) -> dict:
     """Build the payload ``mcp_server._drawer_payload`` would have returned."""
     safe_meta = _response_safe_meta(meta)

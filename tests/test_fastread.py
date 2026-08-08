@@ -188,3 +188,83 @@ def test_cli_fast_path_honours_pretty(cli_seeded, capsys):
     out = capsys.readouterr().out
     assert "\n  " in out, "--pretty must indent"
     assert json.loads(out)["drawer_id"] == cli_seeded["short_id"]
+
+
+# ── get_rows: raw rows, chromadb-get parity ──────────────────────────────
+#
+# The local HTTP API serves /drawers/{id} and /drawers/{id}/full off these
+# rows so a by-id read never touches chromadb. That matters beyond speed:
+# a long-lived chromadb reader whose database is truncate-checkpointed
+# underneath it starts answering "database disk image is malformed" and
+# cannot recover in-process, which took the session-start hook down on
+# 2026-08-08. A short-lived sqlite connection opened per request cannot
+# hold a stale view.
+
+
+def _chroma_rows(palace, collection, **kwargs):
+    """The same rows through chromadb, as the endpoints used to read them."""
+    import mempalace.mcp_server as m
+
+    col = m._get_collection()
+    return col.get(include=["documents", "metadatas"], **kwargs)
+
+
+def test_get_rows_matches_chromadb_for_an_exact_row(seeded):
+    rows = fastread.get_rows(seeded["palace"], seeded["collection"], row_id=seeded["short_id"])
+    slow = _chroma_rows(seeded["palace"], seeded["collection"], ids=[seeded["short_id"]])
+
+    assert rows is not None and len(rows) == 1
+    assert rows[0]["id"] == (slow["ids"] or [None])[0]
+    assert rows[0]["document"] == (slow["documents"] or [None])[0]
+    assert rows[0]["metadata"] == (slow["metadatas"] or [None])[0]
+
+
+def test_get_rows_returns_metadata_verbatim(seeded):
+    """No source_file basenaming — the API has always exposed the stored value,
+    and it is the only form the source_file filter matches."""
+    import mempalace.mcp_server as m
+
+    col = m._get_collection()
+    slow = col.get(ids=[seeded["short_id"]], include=["metadatas"])
+    stored = (slow["metadatas"] or [{}])[0].get("source_file")
+
+    rows = fastread.get_rows(seeded["palace"], seeded["collection"], row_id=seeded["short_id"])
+    assert rows[0]["metadata"].get("source_file") == stored
+
+
+def test_get_rows_returns_every_chunk_in_index_order(seeded):
+    rows = fastread.get_rows(seeded["palace"], seeded["collection"], parent_id=seeded["long_id"])
+    slow = _chroma_rows(
+        seeded["palace"], seeded["collection"], where={"parent_drawer_id": seeded["long_id"]}
+    )
+
+    assert rows is not None and len(rows) > 1, "fixture did not chunk; the test proves nothing"
+    assert len(rows) == len(slow["ids"])
+    assert sorted(r["id"] for r in rows) == sorted(slow["ids"])
+    assert [r["chunk_index"] for r in rows] == list(range(len(rows)))
+    assert "".join(r["document"] for r in rows) == seeded["long_content"]
+
+
+def test_get_rows_reports_an_empty_match_not_a_decline(seeded):
+    """[] and None mean different things: nothing matched vs I could not read.
+
+    Both make the caller fall back, but only None means the palace was
+    unreadable — conflating them would let a sqlite quirk report a drawer lost.
+    """
+    assert fastread.get_rows(seeded["palace"], seeded["collection"], row_id="drawer_nope") == []
+    assert fastread.get_rows(seeded["palace"], "no_such_collection", row_id="x") is None
+    assert fastread.get_rows(str(object()), seeded["collection"], row_id="x") is None
+
+
+def test_get_rows_declines_array_metadata(seeded, monkeypatch):
+    monkeypatch.setattr(fastread, "_has_array_metadata", lambda *a, **k: True)
+    assert (
+        fastread.get_rows(seeded["palace"], seeded["collection"], row_id=seeded["short_id"]) is None
+    )
+
+
+def test_get_rows_requires_exactly_one_selector(seeded):
+    with pytest.raises(ValueError):
+        fastread.get_rows(seeded["palace"], seeded["collection"])
+    with pytest.raises(ValueError):
+        fastread.get_rows(seeded["palace"], seeded["collection"], row_id="a", parent_id="b")
