@@ -276,3 +276,96 @@ def test_ranking_pool_is_not_widened_past_available_candidates(tmp_path, monkeyp
     search_memories("auth JWT tokens", palace_path=palace, n_results=2)
 
     assert seen["pool"] <= 4
+
+
+# ── archive demotion (the "dim" state of decision f6639c96) ───────────────
+#
+# The palace holds two things in one index: drawers written deliberately, and
+# whole transcripts mined automatically as a backup for the ~half of sessions
+# that never get a deliberate save. Both are verbatim and neither is ever
+# destroyed. They are not equally relevant, and on 2026-08-08 the archive was
+# 62% of the palace and 70% of every result set — it had crowded the curated
+# layer out of its own search. Demotion attenuates, it never excludes.
+
+
+def _seed_archive_and_curated(palace_path):
+    """One archive drawer and one curated drawer, both matching the query."""
+    col = get_collection(palace_path, create=True)
+    col.upsert(
+        ids=["ARCH", "CUR"],
+        documents=[
+            "We talked about the deploy rollback policy in passing during the session.",
+            "Decision: the deploy rollback policy is two-stage with a manual gate.",
+        ],
+        metadatas=[
+            {"wing": "sessions", "room": "technical", "source_file": "transcript.jsonl"},
+            {"wing": "ops", "room": "decisions", "source_file": "decisions.md"},
+        ],
+    )
+
+
+def test_archive_drawer_is_demoted_below_a_curated_one(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_ARCHIVE_WINGS", raising=False)
+    monkeypatch.delenv("MEMPALACE_ARCHIVE_RANK_PENALTY", raising=False)
+    palace = str(tmp_path / "palace")
+    _seed_archive_and_curated(palace)
+
+    hits = search_memories("deploy rollback policy", palace_path=palace, n_results=5)["results"]
+    ids = [h["drawer_id"] for h in hits]
+
+    assert "ARCH" in ids, "demotion must never drop the archive from the results"
+    assert ids.index("CUR") < ids.index("ARCH")
+    assert next(h for h in hits if h["drawer_id"] == "ARCH")["archive_demoted"] is True
+
+
+def test_archive_still_wins_when_it_is_clearly_the_better_answer(tmp_path, monkeypatch):
+    """The check the golden set cannot make: no golden case has a transcript answer.
+
+    A demotion that buried the archive outright would pass every golden query
+    and still be wrong — the archive is the only record for half the sessions.
+    """
+    monkeypatch.delenv("MEMPALACE_ARCHIVE_WINGS", raising=False)
+    monkeypatch.delenv("MEMPALACE_ARCHIVE_RANK_PENALTY", raising=False)
+    palace = str(tmp_path / "palace")
+    col = get_collection(palace, create=True)
+    col.upsert(
+        ids=["ARCH", "CUR"],
+        documents=[
+            "The kafka consumer rebalance timeout was raised to 45 seconds after the incident.",
+            "Unrelated note about frontend state management libraries.",
+        ],
+        metadatas=[
+            {"wing": "sessions", "room": "technical", "source_file": "transcript.jsonl"},
+            {"wing": "ops", "room": "decisions", "source_file": "decisions.md"},
+        ],
+    )
+
+    hits = search_memories("kafka consumer rebalance timeout", palace_path=palace, n_results=5)
+    assert hits["results"][0]["drawer_id"] == "ARCH"
+
+
+def test_archive_demotion_is_fully_reversible(tmp_path, monkeypatch):
+    """One env var restores the flat corpus — nothing is written to any drawer."""
+    monkeypatch.setenv("MEMPALACE_ARCHIVE_WINGS", "")
+    palace = str(tmp_path / "palace")
+    _seed_archive_and_curated(palace)
+
+    hits = search_memories("deploy rollback policy", palace_path=palace, n_results=5)["results"]
+    assert not any(h.get("archive_demoted") for h in hits)
+
+
+def test_archive_penalty_env_rejects_nonsense(monkeypatch):
+    from mempalace.searcher import ARCHIVE_PENALTY_DEFAULT, archive_rank_penalty
+
+    for bad in ("", "banana", "-1", "0", "1.5"):
+        monkeypatch.setenv("MEMPALACE_ARCHIVE_RANK_PENALTY", bad)
+        assert archive_rank_penalty() == ARCHIVE_PENALTY_DEFAULT
+    monkeypatch.setenv("MEMPALACE_ARCHIVE_RANK_PENALTY", "0.5")
+    assert archive_rank_penalty() == 0.5
+
+
+def test_archive_wings_env_accepts_a_list(monkeypatch):
+    from mempalace.searcher import archive_wings
+
+    monkeypatch.setenv("MEMPALACE_ARCHIVE_WINGS", "sessions, diary ,")
+    assert archive_wings() == {"sessions", "diary"}

@@ -265,11 +265,22 @@ def _hybrid_rank(
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
 
+    archive = archive_wings()
+    penalty = archive_rank_penalty()
     scored = []
     for r, raw, norm in zip(results, bm25_raw, bm25_norm):
         vec_sim = _distance_to_similarity(r.get("distance"), metric)
         r["bm25_score"] = round(raw, 3)
-        scored.append((vector_weight * vec_sim + bm25_weight * norm, r))
+        score = vector_weight * vec_sim + bm25_weight * norm
+        # Attenuate, never exclude (decision f6639c96). An archive drawer that
+        # is clearly the best answer still wins; one that merely ties a curated
+        # drawer no longer takes the slot. This is the whole "dim" state: a
+        # multiplier on the score, no metadata written, no drawer touched, and
+        # reversible by one env var.
+        if archive and penalty < 1.0 and r.get("wing") in archive:
+            score *= penalty
+            r["archive_demoted"] = True
+        scored.append((score, r))
 
     # Break exact score ties toward the more recently authored drawer so equal-score
     # candidates rank chronologically instead of in arbitrary backend order. ISO-8601
@@ -1207,6 +1218,71 @@ def _open_search_collection(palace_path: str, collection_name: str):
             "error": "No palace found",
             "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
         }
+
+
+ARCHIVE_WINGS_ENV = "MEMPALACE_ARCHIVE_WINGS"
+ARCHIVE_WINGS_DEFAULT = "sessions"
+
+
+def archive_wings() -> set:
+    """Wings holding auto-mined transcript backup rather than curated memory.
+
+    The palace stores two different things in one index. Curated drawers are
+    written deliberately — decisions, roadmaps, follow-ups, gotchas. Archive
+    drawers are whole conversation transcripts, mined automatically, and they
+    exist so nothing is lost on the ~half of sessions that never get a
+    deliberate save. Both are verbatim and neither may ever be destroyed.
+
+    They are not equally *relevant*, and treating them as one corpus is what
+    degraded recall here: the archive outgrew the curated layer 3:1 and then
+    crowded it out of every candidate pool.
+
+    Set ``MEMPALACE_ARCHIVE_WINGS`` to a comma-separated list to change the
+    set, or to an empty string to disable the whole mechanism and restore a
+    single flat corpus.
+    """
+    raw = os.environ.get(ARCHIVE_WINGS_ENV)
+    if raw is None:
+        raw = ARCHIVE_WINGS_DEFAULT
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+ARCHIVE_PENALTY_ENV = "MEMPALACE_ARCHIVE_RANK_PENALTY"
+ARCHIVE_PENALTY_DEFAULT = 0.75
+
+
+def archive_rank_penalty() -> float:
+    """Score multiplier applied to archive-wing candidates. 1.0 disables it.
+
+    A multiplier rather than a filter or a hard tier, deliberately. A hard tier
+    ("curated always outranks archive") is easy to justify against the golden
+    set — every golden target is a curated drawer — but the golden set cannot
+    observe the harm, because it has no case whose right answer lives in a
+    transcript. A multiplier degrades gracefully instead: the archive keeps
+    competing and still wins when it is clearly better.
+
+    Unparseable or out-of-range values fall back to the default rather than
+    silently disabling the mechanism.
+    """
+    raw = os.environ.get(ARCHIVE_PENALTY_ENV, "").strip()
+    if not raw:
+        return ARCHIVE_PENALTY_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using %.2f", ARCHIVE_PENALTY_ENV, raw, ARCHIVE_PENALTY_DEFAULT
+        )
+        return ARCHIVE_PENALTY_DEFAULT
+    if not 0.0 < value <= 1.0:
+        logger.warning(
+            "%s=%r out of range (0, 1]; using %.2f",
+            ARCHIVE_PENALTY_ENV,
+            raw,
+            ARCHIVE_PENALTY_DEFAULT,
+        )
+        return ARCHIVE_PENALTY_DEFAULT
+    return value
 
 
 def _query_drawers_with_filter_fallback(
