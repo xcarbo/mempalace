@@ -84,6 +84,12 @@ CONVO_SKIP_DIRS = SKIP_DIRS | {"tool-results"}
 # normalize.strip_noise, never by a length floor over the user's words.
 MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
+# Overlap between consecutive slices when a single exchange is force-split
+# past CHUNK_SIZE. Convo drawers are standalone rows (never reassembled by
+# parent id), so stored overlap is safe here — unlike the deliberate path,
+# where chunks must concatenate back to the original. 120 sits in the
+# 100–150 band the 2026-08 audit recommended; miner.py uses 100.
+CHUNK_OVERLAP = 120
 _LINE_GROUP_SIZE = 25  # lines per fallback group when no paragraph breaks
 _LINE_FALLBACK_MIN_NEWLINES = 20  # trigger line-group fallback above this newline count
 DRAWER_UPSERT_BATCH_SIZE = 1000
@@ -197,39 +203,56 @@ def chunk_exchanges(
     content: str,
     chunk_size: int = None,
     min_chunk_size: int = None,
+    chunk_overlap: int = None,
 ) -> list:
     """
     Chunk by exchange pair: one > turn + AI response = one unit.
     Falls back to paragraph chunking if no > markers.
 
     Optional params override module-level defaults when provided.
+    ``chunk_overlap`` applies only when a single exchange is force-split
+    past ``chunk_size``: consecutive slices then share that many trailing
+    chars so a sentence torn at the boundary is still searchable whole.
 
-    Raises ``ValueError`` if ``chunk_size`` is not a positive integer or
-    ``min_chunk_size`` is negative. A non-positive ``chunk_size`` would
-    cause ``_chunk_by_exchange`` below to loop forever — ``content[:0]``
-    is empty, ``content[0:]`` is the whole string, and the remainder
-    never shrinks.
+    Raises ``ValueError`` if ``chunk_size`` is not a positive integer,
+    ``min_chunk_size`` is negative, or ``chunk_overlap`` is negative or
+    above ``chunk_size // 2`` (a larger overlap stalls the slice loop —
+    same invariant as miner.chunk_text, #2056). A non-positive
+    ``chunk_size`` would cause ``_chunk_by_exchange`` below to loop
+    forever — ``content[:0]`` is empty, ``content[0:]`` is the whole
+    string, and the remainder never shrinks.
     """
     if chunk_size is None:
         chunk_size = CHUNK_SIZE
     if min_chunk_size is None:
         min_chunk_size = MIN_CHUNK_SIZE
+    if chunk_overlap is None:
+        chunk_overlap = min(CHUNK_OVERLAP, chunk_size // 2)
 
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
     if min_chunk_size < 0:
         raise ValueError(f"min_chunk_size must be >= 0, got {min_chunk_size}")
+    if chunk_overlap < 0:
+        raise ValueError(f"chunk_overlap must be >= 0, got {chunk_overlap}")
+    if chunk_overlap > chunk_size // 2:
+        raise ValueError(
+            f"chunk_overlap ({chunk_overlap}) must be at most chunk_size // 2 "
+            f"({chunk_size // 2}); a larger overlap stalls the slice loop"
+        )
 
     lines = content.split("\n")
     quote_lines = sum(1 for line in lines if line.strip().startswith(">"))
 
     if quote_lines >= 3:
-        return _chunk_by_exchange(lines, chunk_size, min_chunk_size)
+        return _chunk_by_exchange(lines, chunk_size, min_chunk_size, chunk_overlap)
     else:
-        return _chunk_by_paragraph(content, chunk_size, min_chunk_size)
+        return _chunk_by_paragraph(content, chunk_size, min_chunk_size, chunk_overlap)
 
 
-def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> list:
+def _chunk_by_exchange(
+    lines: list, chunk_size: int, min_chunk_size: int, chunk_overlap: int = 0
+) -> list:
     """One user turn (>) + the AI response that follows = one or more chunks.
 
     The full AI response is preserved verbatim.  When the combined
@@ -261,7 +284,7 @@ def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> lis
             ai_response = "\n".join(ai_lines).rstrip("\n")
             content = f"{user_turn}\n{ai_response}" if ai_response else user_turn
 
-            _emit_bounded(chunks, content, chunk_size, min_chunk_size)
+            _emit_bounded(chunks, content, chunk_size, min_chunk_size, chunk_overlap)
         else:
             i += 1
 
@@ -273,23 +296,44 @@ def _emit_bounded(
     content: str,
     chunk_size: int,
     min_chunk_size: int,
+    chunk_overlap: int = 0,
 ) -> None:
     """Append ``content`` as one or more drawers, none exceeding ``chunk_size``.
 
     The ``min_chunk_size`` floor gates the WHOLE call (drops the input if
     its stripped length is at or below the floor, treated as noise). Once
-    the input passes the floor, every slice is emitted verbatim so a
-    small trailing remainder is preserved instead of silently dropped.
-    The index-based loop avoids the O(N^2) repeated-substring allocation
-    of a ``while content: content = content[chunk_size:]`` shape.
+    the input passes the floor, everything is emitted so a small trailing
+    remainder is preserved instead of silently dropped.
+
+    Forced splits (one exchange past ``chunk_size``) pull the boundary back
+    to a line break or space in the trailing half of the window instead of
+    tearing mid-word, and consecutive slices share ``chunk_overlap``
+    trailing chars — convo drawers are standalone search rows (never
+    reassembled by parent id), so stored overlap is safe on THIS path only.
+    Callers must keep ``chunk_overlap <= chunk_size // 2`` (validated in
+    ``chunk_exchanges``) or the window stops advancing.
     """
     if len(content.strip()) <= min_chunk_size:
         return
-    for i in range(0, len(content), chunk_size):
-        chunks.append({"content": content[i : i + chunk_size], "chunk_index": len(chunks)})
+    n = len(content)
+    start = 0
+    while start < n:
+        end = min(start + chunk_size, n)
+        if end < n:
+            # Boundary pull: prefer a newline, then a space, in the trailing
+            # half of the window (same guard as miner.chunk_text).
+            pos = content.rfind("\n", start, end)
+            if pos <= start + chunk_size // 2:
+                pos = content.rfind(" ", start, end)
+            if pos > start + chunk_size // 2:
+                end = pos + 1  # keep the separator with the leading slice
+        chunks.append({"content": content[start:end], "chunk_index": len(chunks)})
+        start = end - chunk_overlap if end < n else end
 
 
-def _chunk_by_paragraph(content: str, chunk_size: int, min_chunk_size: int) -> list:
+def _chunk_by_paragraph(
+    content: str, chunk_size: int, min_chunk_size: int, chunk_overlap: int = 0
+) -> list:
     """Fallback: chunk by paragraph breaks."""
     chunks = []
     paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
@@ -299,11 +343,11 @@ def _chunk_by_paragraph(content: str, chunk_size: int, min_chunk_size: int) -> l
         lines = content.split("\n")
         for i in range(0, len(lines), _LINE_GROUP_SIZE):
             group = "\n".join(lines[i : i + _LINE_GROUP_SIZE]).strip()
-            _emit_bounded(chunks, group, chunk_size, min_chunk_size)
+            _emit_bounded(chunks, group, chunk_size, min_chunk_size, chunk_overlap)
         return chunks
 
     for para in paragraphs:
-        _emit_bounded(chunks, para, chunk_size, min_chunk_size)
+        _emit_bounded(chunks, para, chunk_size, min_chunk_size, chunk_overlap)
 
     return chunks
 
@@ -936,6 +980,7 @@ def _mine_convos_impl(
                 content,
                 chunk_size=cfg_chunk_size,
                 min_chunk_size=cfg_min_chunk_size,
+                chunk_overlap=palace_config.chunk_overlap,
             )
 
         if not chunks:

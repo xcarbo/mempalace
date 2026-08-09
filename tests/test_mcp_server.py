@@ -5908,3 +5908,108 @@ def test_ensure_sqlite_integrity_status_joins_inflight_probe(monkeypatch):
         release_probe.set()
         background.join(5)
         consumer_thread.join(5)
+
+
+class TestChunkSpans:
+    """_chunk_spans is the deliberate-path chunker (add-drawer, update-drawer,
+    diary). Contract: chunks partition the content EXACTLY (get-drawer
+    reassembles with "".join), every chunk fits chunk_size, and boundaries
+    prefer markdown headings, then paragraphs, then lines, then words.
+    The old fixed content[i:i+chunk_size] slice is why the canonical roadmap
+    was 23 anonymous mid-table windows (2026-08 audit)."""
+
+    def _spans(self, content, chunk_size=800):
+        from mempalace.mcp_server import _chunk_spans
+
+        return _chunk_spans(content, chunk_size)
+
+    def test_partition_is_byte_identical(self):
+        content = "# Title\n\n" + ("Lorem ipsum dolor sit amet. " * 200)
+        spans = self._spans(content)
+        assert "".join(spans) == content
+        assert all(len(s) <= 800 for s in spans)
+
+    def test_prefers_markdown_heading_boundary(self):
+        section_a = "# Section A\n" + "alpha content line. " * 30  # ~600 chars
+        section_b = "# Section B\n" + "beta content line. " * 30
+        content = section_a + "\n" + section_b
+        spans = self._spans(content, chunk_size=800)
+        assert "".join(spans) == content
+        # The second section's heading must OPEN a chunk, not be torn
+        # mid-window: some span starts with the heading line.
+        assert any(s.startswith("# Section B\n") for s in spans), (
+            f"heading not chosen as boundary: {[s[:30] for s in spans]}"
+        )
+
+    def test_falls_back_to_paragraph_then_line_then_word(self):
+        # No headings: paragraph break inside the trailing half wins.
+        para = ("p" * 500) + "\n\n" + ("q" * 500)
+        spans = self._spans(para, chunk_size=800)
+        assert "".join(spans) == para
+        assert spans[0].endswith("\n\n")
+        # No paragraphs/newlines: word boundary wins over a mid-word tear.
+        words = "word " * 300  # 1500 chars
+        spans = self._spans(words, chunk_size=800)
+        assert "".join(spans) == words
+        assert spans[0].endswith(" ")
+
+    def test_hard_slice_fallback_for_boundaryless_content(self):
+        content = "x" * 2000
+        spans = self._spans(content, chunk_size=800)
+        assert "".join(spans) == content
+        assert [len(s) for s in spans] == [800, 800, 400]
+
+    def test_no_chunk_below_half_window_except_last(self):
+        content = ("line of text here\n" * 400).strip()
+        spans = self._spans(content, chunk_size=800)
+        assert "".join(spans) == content
+        assert all(len(s) > 400 for s in spans[:-1])
+
+    def test_empty_content_yields_single_empty_chunk(self):
+        assert self._spans("", chunk_size=800) == [""]
+
+
+def test_add_drawer_idempotency_covers_legacy_fixed_slice_rows(
+    monkeypatch, config, palace_path, kg
+):
+    """A drawer chunked by the OLD fixed-slice chunker must still read as
+    already_exists: boundary-aware chunking changed chunk counts, so the
+    probe now checks chunk 0 (present under every chunker version) instead
+    of a computed last-chunk id. Re-adding identical content must not
+    write a differently-split chunk set beside the legacy rows."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, col = _get_collection(palace_path, create=True)
+    del _client
+
+    from mempalace.ids import make_drawer_id_from_content
+    from mempalace.mcp_server import tool_add_drawer
+
+    # Content whose boundary-aware split count differs from the fixed-slice
+    # count: spaces let the new chunker pull boundaries early.
+    content = "word " * 500  # 2500 chars
+    drawer_id = make_drawer_id_from_content("w", "r", content)
+    chunk_size = config.chunk_size
+    legacy_ids = []
+    legacy_docs = []
+    legacy_metas = []
+    for i in range(0, len(content), chunk_size):
+        idx = i // chunk_size
+        legacy_ids.append(f"{drawer_id}_chunk_{idx:06d}")
+        legacy_docs.append(content[i : i + chunk_size])
+        legacy_metas.append(
+            {
+                "wing": "w",
+                "room": "r",
+                "chunk_index": idx,
+                "parent_drawer_id": drawer_id,
+            }
+        )
+    col.upsert(ids=legacy_ids, documents=legacy_docs, metadatas=legacy_metas)
+
+    result = tool_add_drawer(wing="w", room="r", content=content)
+    assert result["success"] is True
+    assert result.get("reason") == "already_exists"
+
+    _client2, col2 = _get_collection(palace_path)
+    del _client2
+    assert col2.count() == len(legacy_ids), "legacy rows must not gain siblings"

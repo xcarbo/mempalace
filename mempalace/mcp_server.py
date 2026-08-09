@@ -2581,28 +2581,83 @@ def _collapse_drawer_rows(ids, documents, metadatas):
     return drawers
 
 
-def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int):
-    chunk_size = max(1, int(chunk_size or 1))
+# A heading line right after a newline — the preferred split point for
+# curated markdown drawers (the heading opens the NEXT chunk, so a section
+# and its heading stay together).
+_CHUNK_HEADING_RX = re.compile(r"\n(?=#{1,6} )")
 
+
+def _chunk_spans(content: str, chunk_size: int) -> list:
+    """Partition ``content`` into chunks of at most ``chunk_size`` chars.
+
+    The chunks CONCATENATE BACK TO ``content`` byte-identically — get-drawer
+    reassembles chunk groups with ``"".join`` (see ``_logical_chunk_group``),
+    so this must stay a partition: no overlap, no trimming. Retrieval-side
+    overlap/context belongs in the embedding input (``embedding_input.py``),
+    never in the stored documents.
+
+    Boundaries are pulled, in preference order, to: a markdown heading start,
+    a paragraph break, a line break, a space — searched in the trailing half
+    of the window so no chunk shrinks below ``chunk_size // 2`` — falling
+    back to a hard slice. The old implementation was a bare
+    ``content[i : i + chunk_size]``: the canonical roadmap drawer became 23
+    anonymous mid-table windows, which is why its exact-search ranks spanned
+    91→108,768.
+    """
+    chunk_size = max(1, int(chunk_size or 1))
+    if content == "":
+        return [""]
+
+    spans = []
+    n = len(content)
+    start = 0
+    while start < n:
+        end = min(start + chunk_size, n)
+        if end < n:
+            window = content[start:end]
+            floor = chunk_size // 2
+            cut = None
+            # 1. Markdown heading — cut BEFORE the heading line.
+            heading_cuts = [m.start() + 1 for m in _CHUNK_HEADING_RX.finditer(window)]
+            heading_cuts = [c for c in heading_cuts if c > floor]
+            if heading_cuts:
+                cut = heading_cuts[-1]
+            # 2. Paragraph break — cut after the blank line.
+            if cut is None:
+                pos = window.rfind("\n\n")
+                if pos + 2 > floor and pos != -1:
+                    cut = pos + 2
+            # 3. Line break.
+            if cut is None:
+                pos = window.rfind("\n")
+                if pos + 1 > floor and pos != -1:
+                    cut = pos + 1
+            # 4. Word boundary.
+            if cut is None:
+                pos = window.rfind(" ")
+                if pos + 1 > floor and pos != -1:
+                    cut = pos + 1
+            # 5. Hard slice.
+            if cut is None:
+                cut = len(window)
+            spans.append(window[:cut])
+            start += cut
+        else:
+            spans.append(content[start:end])
+            start = end
+    return spans
+
+
+def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int):
     base_meta = _safe_meta(meta)
     base_meta.pop("chunk_index", None)
     base_meta["parent_drawer_id"] = drawer_id
-
-    spans = (
-        [(0, "")]
-        if content == ""
-        else [
-            (start, content[start : start + chunk_size])
-            for start in range(0, len(content), chunk_size)
-        ]
-    )
 
     chunk_ids = []
     chunk_docs = []
     chunk_metas = []
 
-    for start, chunk_doc in spans:
-        chunk_index = start // chunk_size
+    for chunk_index, chunk_doc in enumerate(_chunk_spans(content, chunk_size)):
         chunk_ids.append(f"{drawer_id}_chunk_{chunk_index:06d}")
         chunk_docs.append(chunk_doc)
 
@@ -2679,8 +2734,13 @@ def tool_add_drawer(
     if len(content) <= chunk_size:
         idempotency_probe_ids = [drawer_id]
     else:
-        last_chunk_idx = (len(content) - 1) // chunk_size
-        idempotency_probe_ids = [drawer_id, f"{drawer_id}_chunk_{last_chunk_idx:06d}"]
+        # Probe chunk 0 — present for ANY prior chunked write of this content
+        # regardless of chunker version. Boundary-aware chunking changed chunk
+        # COUNTS, so a computed last-chunk probe would miss rows written by
+        # the old fixed-slice chunker and re-add a differently-split set
+        # beside the stale tail. The batched upsert is all-or-nothing, so
+        # chunk 0 present implies the whole prior batch landed.
+        idempotency_probe_ids = [drawer_id, f"{drawer_id}_chunk_{0:06d}"]
     try:
         existing = col.get(ids=idempotency_probe_ids, include=[])
         if _get_result_ids(existing):
@@ -2728,19 +2788,14 @@ def tool_add_drawer(
 
         # Oversized content: split into bounded per-chunk drawers so the
         # embedding model never sees a document above ``chunk_size``.
+        # Boundary-aware partition via _build_chunk_rows (headings/paragraphs
+        # preferred; concatenation stays byte-identical for get-drawer).
         # Single batched ``upsert`` so the embedding pass either commits
         # every chunk or none — no half-written palace if the embedding
         # model fails mid-loop (#1539).
-        chunk_ids: list[str] = []
-        chunk_docs: list[str] = []
-        chunk_metas: list[dict] = []
-        for i in range(0, len(content), chunk_size):
-            chunk_idx = i // chunk_size
-            chunk_ids.append(f"{drawer_id}_chunk_{chunk_idx:06d}")
-            chunk_docs.append(content[i : i + chunk_size])
-            chunk_metas.append(
-                {**base_meta, "chunk_index": chunk_idx, "parent_drawer_id": drawer_id}
-            )
+        chunk_ids, chunk_docs, chunk_metas = _build_chunk_rows(
+            drawer_id, content, base_meta, chunk_size
+        )
         assert_no_collisions(list(zip(chunk_ids, chunk_metas)), col)
         col.upsert(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
         # Probe the LAST chunk id, not the first — its presence confirms
@@ -3790,10 +3845,9 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         chunk_ids: list[str] = []
         chunk_docs: list[str] = []
         chunk_metas: list[dict] = []
-        for i in range(0, len(entry), chunk_size):
-            chunk_idx = i // chunk_size
+        for chunk_idx, chunk_doc in enumerate(_chunk_spans(entry, chunk_size)):
             chunk_ids.append(f"{entry_id}_chunk_{chunk_idx:06d}")
-            chunk_docs.append(entry[i : i + chunk_size])
+            chunk_docs.append(chunk_doc)
             chunk_metas.append(
                 {
                     **base_metadata,
