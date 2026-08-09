@@ -81,7 +81,14 @@ _EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 #
 # v2 (2026-04): introduced strip_noise() for Claude Code JSONL; previous
 #               drawers stored system tags / hook chrome verbatim.
-NORMALIZE_VERSION = 2
+# v3 (2026-08): retroactive stamp for the _emit_bounded 800-char cap fix,
+#               which shipped WITHOUT a bump and left 6,066 oversized drawers
+#               frozen (the version+mtime skip meant already-stamped files
+#               were never rebuilt). Also covers: <local-command-caveat> in
+#               _NOISE_TAGS, indent-tolerant noise anchors, the zero-content
+#               mine gate, overlap on forced convo splits, and mine-time
+#               spellcheck defaulting off. One re-mine heals all of it.
+NORMALIZE_VERSION = 3
 
 
 # (palace_id, collection_name, model_name) tuples already validated this

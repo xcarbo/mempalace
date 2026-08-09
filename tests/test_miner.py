@@ -1225,6 +1225,49 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
 # rebuilt on the next mine. These tests pin that contract.
 
 
+def test_normalize_version_is_at_least_3():
+    """The 2026-08 audit found the _emit_bounded 800-char cap fix shipped
+    WITHOUT bumping NORMALIZE_VERSION, freezing 6,066 oversized drawers:
+    file_already_mined's version+mtime check skipped every already-stamped
+    file forever, so the backlog could never self-heal. Pin the floor so a
+    merge or revert can't silently reintroduce the frozen state."""
+    assert NORMALIZE_VERSION >= 3
+
+
+def test_version_bump_unfreezes_previously_stamped_files(tmp_path):
+    """The exact frozen-backlog scenario: drawers stamped at the PREVIOUS
+    version, with a matching on-disk mtime, must read as not-mined in both
+    skip paths (per-file recheck AND the bulk prefetch), so the next mine
+    falls through to the purge-before-insert rebuild."""
+    src = tmp_path / "session.jsonl"
+    src.write_text("{}\n")
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.get_or_create_collection("mempalace_drawers")
+    try:
+        col.add(
+            ids=["d_prev_version"],
+            documents=["stamped at the previous schema version"],
+            metadatas=[
+                {
+                    "source_file": str(src),
+                    "normalize_version": NORMALIZE_VERSION - 1,
+                    "source_mtime": os.path.getmtime(src),
+                }
+            ],
+        )
+        # Per-file recheck (the lock-held path in _file_chunks_locked):
+        # matching mtime alone must NOT rescue a stale-version drawer.
+        assert file_already_mined(col, str(src), check_mtime=True) is False
+        # Bulk skip path (the mined_mtimes dict the convo miner iterates):
+        # stale-version rows must be absent entirely, or the miner would
+        # treat the file as unchanged and skip the rebuild.
+        assert str(src) not in prefetch_mined_set(col)
+    finally:
+        del col, client
+
+
 def test_file_already_mined_returns_false_for_stale_normalize_version():
     """Pre-v2 drawers (no field, or older integer) must not short-circuit."""
     tmpdir = tempfile.mkdtemp()
