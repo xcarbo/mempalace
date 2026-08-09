@@ -558,17 +558,34 @@ class SQLiteExactCollection(BaseCollection):
                 (self._embedder_meta_key(), str(identity.model_name)),
             )
 
-    def _replace_fts(self, cur, collection_id: int, doc_id: str, document: str) -> None:
+    def _insert_fts(self, cur, collection_id: int, doc_id: str, document: str, rowid: int) -> None:
+        """Insert a fresh FTS row keyed to the documents rowid.
+
+        ``docs_fts`` rowids mirror ``documents`` rowids (enforced by the
+        one-time rebuild in ``_init_schema``), so removal is an O(1) rowid
+        delete instead of a full FTS scan over the UNINDEXED columns — the
+        latter made batch ingest O(n²) (observed live: 333 → 150 rows/s and
+        falling within the first 20k rows of a 174k build).
+        """
         if not self._fts_available(cur):
             return
         cur.execute(
-            "DELETE FROM docs_fts WHERE collection_id = ? AND doc_id = ?",
+            "INSERT INTO docs_fts(rowid, collection_id, doc_id, document) VALUES (?, ?, ?, ?)",
+            (rowid, collection_id, doc_id, document),
+        )
+
+    def _replace_fts(self, cur, collection_id: int, doc_id: str, document: str, rowid: int) -> None:
+        if not self._fts_available(cur):
+            return
+        cur.execute("DELETE FROM docs_fts WHERE rowid = ?", (rowid,))
+        self._insert_fts(cur, collection_id, doc_id, document, rowid)
+
+    def _document_rowid(self, cur, collection_id: int, doc_id: str) -> Optional[int]:
+        row = cur.execute(
+            "SELECT rowid FROM documents WHERE collection_id = ? AND id = ?",
             (collection_id, doc_id),
-        )
-        cur.execute(
-            "INSERT INTO docs_fts(collection_id, doc_id, document) VALUES (?, ?, ?)",
-            (collection_id, doc_id, document),
-        )
+        ).fetchone()
+        return int(row[0]) if row else None
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         _validate_write_batch(
@@ -606,7 +623,8 @@ class SQLiteExactCollection(BaseCollection):
                         now,
                     ),
                 )
-                self._replace_fts(cur, collection_id, doc_id, doc)
+                # Plain INSERT: the row is new, so no stale FTS row can exist.
+                self._insert_fts(cur, collection_id, doc_id, doc, cur.lastrowid)
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
         _validate_write_batch(
@@ -626,10 +644,11 @@ class SQLiteExactCollection(BaseCollection):
                 arr = _as_vector_array(emb)
                 prepared.append((doc_id, doc, meta, arr.tobytes(), int(arr.size)))
             self._ensure_collection_dimension(cur, collection_id, [item[4] for item in prepared])
+            existing = self._existing_rowids(cur, collection_id, [item[0] for item in prepared])
             # An upsert that overwrites an existing row changes that row's
             # embedding in place (same rowid), which append detection cannot
             # see — bump the generation. Pure-insert upserts stay append-only.
-            if self._any_ids_exist(cur, collection_id, [item[0] for item in prepared]):
+            if existing:
                 self._bump_vec_generation(cur, collection_id)
             for doc_id, doc, meta, emb_blob, dim in prepared:
                 cur.execute(
@@ -655,7 +674,14 @@ class SQLiteExactCollection(BaseCollection):
                         now,
                     ),
                 )
-                self._replace_fts(cur, collection_id, doc_id, doc)
+                rowid = existing.get(doc_id)
+                if rowid is not None:
+                    self._replace_fts(cur, collection_id, doc_id, doc, rowid)
+                else:
+                    # Record the fresh rowid so a duplicate id later in the
+                    # same batch replaces its FTS row instead of doubling it.
+                    existing[doc_id] = cur.lastrowid
+                    self._insert_fts(cur, collection_id, doc_id, doc, cur.lastrowid)
 
     def update(self, *, ids, documents=None, metadatas=None, embeddings=None):
         if documents is None and metadatas is None and embeddings is None:
@@ -674,7 +700,7 @@ class SQLiteExactCollection(BaseCollection):
             for idx, doc_id in enumerate(ids):
                 row = cur.execute(
                     """
-                    SELECT document, metadata_json, embedding, dim
+                    SELECT document, metadata_json, embedding, dim, rowid
                     FROM documents
                     WHERE collection_id = ? AND id = ?
                     """,
@@ -693,14 +719,14 @@ class SQLiteExactCollection(BaseCollection):
                 else:
                     emb_blob = row[2]
                     dim = row[3]
-                updates.append((doc_id, doc, meta, emb_blob, dim))
+                updates.append((doc_id, doc, meta, emb_blob, dim, int(row[4])))
             if embeddings is not None:
                 self._ensure_collection_dimension(cur, collection_id, [item[4] for item in updates])
                 if updates:
                     # Only an embedding change invalidates the vector cache;
                     # document/metadata updates are read live from SQL.
                     self._bump_vec_generation(cur, collection_id)
-            for doc_id, doc, meta, emb_blob, dim in updates:
+            for doc_id, doc, meta, emb_blob, dim, rowid in updates:
                 cur.execute(
                     """
                     UPDATE documents
@@ -709,7 +735,7 @@ class SQLiteExactCollection(BaseCollection):
                     """,
                     (doc, _json_dumps(meta), emb_blob, dim, _utcnow(), collection_id, doc_id),
                 )
-                self._replace_fts(cur, collection_id, doc_id, doc)
+                self._replace_fts(cur, collection_id, doc_id, doc, rowid)
 
     def _rows(self, cur, *, where=None, where_document=None, limit=None, offset=None) -> list[dict]:
         _validate_where(where)
@@ -1145,32 +1171,35 @@ class SQLiteExactCollection(BaseCollection):
                 rows = self._rows(cur, where=where)
                 ids = [row["id"] for row in rows]
             deleted = 0
+            fts = self._fts_available(cur)
             for doc_id in ids or []:
+                # Resolve the rowid before deleting so the FTS row (which
+                # mirrors it) can be removed with an O(1) rowid delete.
+                rowid = self._document_rowid(cur, collection_id, doc_id)
+                if rowid is None:
+                    continue
                 cur.execute(
                     "DELETE FROM documents WHERE collection_id = ? AND id = ?",
                     (collection_id, doc_id),
                 )
                 deleted += max(0, cur.rowcount)
-                if self._fts_available(cur):
-                    cur.execute(
-                        "DELETE FROM docs_fts WHERE collection_id = ? AND doc_id = ?",
-                        (collection_id, doc_id),
-                    )
+                if fts:
+                    cur.execute("DELETE FROM docs_fts WHERE rowid = ?", (rowid,))
             if deleted:
                 self._bump_vec_generation(cur, collection_id)
 
-    def _any_ids_exist(self, cur, collection_id: int, ids: list[str]) -> bool:
+    def _existing_rowids(self, cur, collection_id: int, ids: list[str]) -> dict[str, int]:
+        found: dict[str, int] = {}
         for start in range(0, len(ids), 900):
             chunk = ids[start : start + 900]
             placeholders = ",".join("?" for _ in chunk)
-            row = cur.execute(
-                f"SELECT 1 FROM documents "
-                f"WHERE collection_id = ? AND id IN ({placeholders}) LIMIT 1",
+            for doc_id, rowid in cur.execute(
+                f"SELECT id, rowid FROM documents "
+                f"WHERE collection_id = ? AND id IN ({placeholders})",
                 (collection_id, *chunk),
-            ).fetchone()
-            if row is not None:
-                return True
-        return False
+            ).fetchall():
+                found[doc_id] = int(rowid)
+        return found
 
     def count(self) -> int:
         with self._cursor() as cur:
@@ -1522,6 +1551,23 @@ class SQLiteExactBackend(BaseBackend):
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )
+            # One-time migration: align docs_fts rowids with documents rowids
+            # so FTS maintenance is a rowid delete, not a full-table scan over
+            # the UNINDEXED columns. Palaces written by the pre-alignment code
+            # have arbitrary FTS rowids; rebuild once and mark it done.
+            aligned = conn.execute(
+                "SELECT value FROM meta WHERE key = 'fts_rowid_aligned'"
+            ).fetchone()
+            if not aligned or aligned[0] != "1":
+                conn.execute("DELETE FROM docs_fts")
+                conn.execute(
+                    "INSERT INTO docs_fts(rowid, collection_id, doc_id, document) "
+                    "SELECT rowid, collection_id, id, document FROM documents"
+                )
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('fts_rowid_aligned', '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                )
         except sqlite3.OperationalError:
             conn.execute(
                 """

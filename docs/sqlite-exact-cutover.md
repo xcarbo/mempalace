@@ -1,0 +1,128 @@
+# Cutover runbook: chroma → sqlite_exact
+
+**Status: NOT EXECUTED. This is the plan the controller follows deliberately —
+nothing here runs automatically.**
+
+Why: HNSW at the live `ef=100` drops the true top-1 out of its top-10 on 5.1%
+of queries (593-query exact-vs-ANN comparison, 2026-08-08 audit); `ef=500`
+still loses 1.9% at 4× the query cost. Exact cosine over the full 174k matrix
+costs ~4 ms — invisible against the ~82 ms pipeline — and removes the entire
+chroma crash class (SIGBUS, `Error finding id`, `link_lists.bin` runaway,
+death under 2 concurrent accesses, 27% dead tombstones in the segment).
+
+Prerequisites: the `sqlite_exact` backend with the matmul query path, SQL
+filters, FTS5 lexical lane, and the multi-process concurrency test — all
+landed on branch `feat/memaudit2-exact-backend`, merged.
+
+Throughout, `$PALACE` = `~/.mempalace/palace` (resolve the symlink with
+`pwd -P` before any tar/rsync — the palace lives on `/Volumes/xData` and a
+tar of the symlink BY NAME archives the link, not the data).
+
+## Interim zero-code option (only if the cutover is deferred)
+
+Setting `hnsw:search_ef=500` on the live collection cuts real top-1 loss from
+~5.1% to ~1.9% for ~+2 ms/query, with zero code. **Caveat that makes it a
+quiesced operation, not a quick win:** it is a `collection.modify()` sysdb
+**write** — the exact operation class that caused the concurrent-read panics
+fixed in `c45c1b0`. If used: stop the `:4109` service and the cron fleet,
+apply, restart. Do not apply while readers are live. Skip it entirely if the
+cutover happens this week.
+
+## Phase 1 — Build the exact palace (live palace untouched)
+
+1. Quiesce writers only for the snapshot instant: take a consistent copy of
+   the live palace (sqlite online backup of `chroma.sqlite3` + `cp -R` of the
+   two segment dirs, exactly as the audit spike did). Readers can stay up.
+2. Extract vectors from the copy (~2.4 s):
+   `hnswlib.Index(space="cosine", dim=384).load_index(<vector segment dir>,
+   is_persistent_index=True, max_elements=<slot count>)`, then batched
+   `get_items(labels)`; `index_metadata.pickle` in the segment dir carries
+   `id_to_label` — no sqlite join needed. Or reuse the verified artifacts at
+   `/Volumes/xData/codeXD/.reports/mempalace-audit/spike-artifacts/`
+   (`vectors.npy` + `vector_ids.json`) if the palace has not been written
+   since 2026-08-08 — verify with a row-count comparison first.
+3. Build the exact store into a **new directory** (never inside the chroma
+   palace dir — mixed backend artifacts are rejected by design):
+   `scratchpad/ab/build_exact.py` from the 2026-08-09 A/B run is the working
+   template. It reads docs+metadata from the copied `chroma.sqlite3`
+   (`embedding_metadata`, key `chroma:document`), inserts in 2 000-row
+   batches with explicit embeddings, and records the embedder identity
+   (`minilm`, 384).
+4. Copy `mempalace_embedder.json` and `palace_format.json` from the live
+   palace into the new directory.
+
+## Phase 2 — Verify parity (gate: all three must pass)
+
+5. **Row count:** backend `count()` on the new store == number of extracted
+   vector ids == chroma `collection.count()` on the copy. (Note: the raw
+   `embeddings` sqlite table over-counts — 176,823 rows vs 174,272 active at
+   audit time; compare against the *collection* count, not the table.)
+6. **Id parity:** the sorted id set of the new store equals
+   `vector_ids.json` exactly. Spot-check 20 random ids: document text
+   byte-identical to chroma's `chroma:document`, metadata dict equal.
+7. **Vector parity:** for 20 random ids, the stored blob decodes to the same
+   float32 vector extracted from HNSW (cosine 1.0 within fp32 epsilon).
+
+## Phase 3 — A/B (gate: recall must not regress)
+
+8. Run the A/B harness (`scratchpad/ab/eval_ab.py` shape): both palace
+   copies, production `search_memories`, 9 goldens + the 300-case set at
+   `~/.local/state/herdr-spawn/ma-code-260808-224241/harness/`.
+9. Pass criteria: sqlite_exact R@1/R@5/R@10/MRR ≥ chroma on the 300-case set
+   (exact retrieval is a superset by construction — a regression means a
+   build bug, not a property of exact search); goldens not worse per-case;
+   end-to-end latency within ~4× of chroma (measured 2026-08-09: exact was
+   *faster* end-to-end — p50 63 ms vs 82 ms — so any big slowdown is a bug).
+10. **If the A/B regresses: stop.** Do not cut over. Diagnose against the
+    2026-08-09 baseline in `eval_ab_results.json` (scratchpad `ab/`); the
+    regression is in the build (id misalignment, metadata loss, wrong
+    embedder identity), not in exactness.
+
+## Phase 4 — Flip the default
+
+11. Quiesce everything that touches the palace: `launchctl` stop
+    `mempalace-api` (:4109), pause the cron fleet (00:40–05:58 window —
+    flip outside it), no active `memp` sessions.
+12. Final delta sync: re-run Phase 1–2 if the live palace changed since the
+    snapshot (drawer adds since the build → re-extract or re-mine the delta;
+    id parity gate must pass again).
+13. Move the exact store into place as its own palace dir and point config at
+    it: set `"backend": "sqlite_exact"` and the palace path in
+    `~/.mempalace/config.json`. Do NOT mix artifacts in one dir; keep the
+    chroma palace dir intact as the rollback.
+14. Restart `:4109` and the hooks. Smoke: `memp search` (unfiltered), a
+    wing-filtered search (the class that crashed :4109 — must return, not
+    500), `memp get-drawer` on a known id, one `add-drawer` + search-back on
+    a scratch wing... then delete the scratch drawer.
+15. Watch the first cron fleet window end-to-end (`/agents-status` next
+    morning): mining writes, gnome curation reads, no lock errors. WAL +
+    `busy_timeout=10000` absorbs writer contention; single-writer discipline
+    from `locks.py` still applies at the palace layer.
+
+## Phase 5 — Rollback (keep alive ≥ 2 weeks)
+
+16. Rollback = flip `~/.mempalace/config.json` back to `"backend": "chroma"`
+    / the old palace path and restart `:4109`. The chroma palace was never
+    modified. **Caveat:** any drawers written *after* the cutover exist only
+    in the exact store — before rolling back, export them
+    (`updated_at > <cutover timestamp>` in `sqlite_exact.sqlite3`) and
+    re-add after rollback, or accept the gap.
+17. Do not delete the chroma segment dirs until the exact backend has
+    survived two full weeks of cron windows + a laptop SMB session.
+
+## Transition-window caveats
+
+- **One version everywhere.** The vector-cache invalidation protocol
+  (`vec_gen` counter in the `meta` table) assumes every writer bumps it on
+  non-append mutations. Old-code writers (a stale laptop checkout, an
+  un-synced cron env) mutating the store won't bump it and readers may serve
+  a stale cache. Merge first, sync both machines, then cut over.
+- **SMB from the laptop:** the backend deliberately sets no `mmap_size`, so
+  SQLite uses plain reads — safe over SMB. WAL over SMB is still not
+  multi-host-safe; the laptop should keep going through `:4109` / `memp`
+  against the Mini (as it does today), never open the palace file directly
+  over SMB while the Mini has it open.
+- The re-embed decision (nomic-v1.5, measured rank 91 → 7 on the failing
+  golden) is a **separate migration** — do not fold it into this cutover.
+  Sequencing per the audit: cut over on MiniLM vectors (bit-identical A/B),
+  then re-embed into the same store as its own verified step.

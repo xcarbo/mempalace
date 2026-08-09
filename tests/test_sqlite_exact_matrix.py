@@ -425,3 +425,83 @@ def test_legacy_palace_without_generated_columns_migrates(tmp_path):
         assert result.ids[0] == ["old1"]
     finally:
         backend.close()
+
+
+# ---------------------------------------------------------------------------
+# 4. FTS rowid alignment (O(1) maintenance instead of full-table scans)
+# ---------------------------------------------------------------------------
+
+
+def _fts_rows(col):
+    return col._handle.conn.execute(
+        "SELECT rowid, doc_id, document FROM docs_fts ORDER BY rowid"
+    ).fetchall()
+
+
+def test_fts_rowids_mirror_documents_rowids(tmp_path):
+    backend, col = _mk_collection(tmp_path)
+    try:
+        _seed(col, n=10)
+        col.upsert(
+            documents=["replaced body"],
+            ids=["d003"],
+            metadatas=[{"wing": "w0"}],
+            embeddings=[[1.0] + [0.0] * (DIM - 1)],
+        )
+        col.delete(ids=["d005"])
+        doc_rows = dict(
+            col._handle.conn.execute("SELECT rowid, id FROM documents ORDER BY rowid").fetchall()
+        )
+        fts_rows = {row[0]: row[1] for row in _fts_rows(col)}
+        assert fts_rows == doc_rows  # exactly one FTS row per document, same rowid
+        hits = col.lexical_search(query="replaced", n_results=5)
+        assert [h.id for h in hits.hits] == ["d003"]
+    finally:
+        backend.close()
+
+
+def test_upsert_same_id_twice_in_one_batch_keeps_single_fts_row(tmp_path):
+    backend, col = _mk_collection(tmp_path)
+    try:
+        vec = [1.0] + [0.0] * (DIM - 1)
+        col.upsert(
+            documents=["first version", "second version"],
+            ids=["dup", "dup"],
+            metadatas=[{}, {}],
+            embeddings=[vec, vec],
+        )
+        rows = _fts_rows(col)
+        assert len(rows) == 1
+        assert rows[0][2] == "second version"
+    finally:
+        backend.close()
+
+
+def test_legacy_misaligned_fts_table_is_rebuilt_on_connect(tmp_path):
+    """A palace written by the pre-alignment code (arbitrary FTS rowids) is
+    realigned once on first connect, then marked so it never rebuilds again."""
+    backend, col = _mk_collection(tmp_path)
+    _seed(col, n=6)
+    conn = col._handle.conn
+    # Simulate the old layout: shift every FTS rowid away from its document's.
+    conn.execute("DELETE FROM docs_fts")
+    conn.execute(
+        "INSERT INTO docs_fts(rowid, collection_id, doc_id, document) "
+        "SELECT rowid + 1000, collection_id, id, document FROM documents"
+    )
+    conn.execute("DELETE FROM meta WHERE key = 'fts_rowid_aligned'")
+    conn.commit()
+    backend.close()
+
+    backend2 = SQLiteExactBackend()
+    try:
+        col2 = backend2.get_collection(str(tmp_path), "drawers", create=False)
+        doc_rows = dict(col2._handle.conn.execute("SELECT rowid, id FROM documents").fetchall())
+        fts_rows = {row[0]: row[1] for row in _fts_rows(col2)}
+        assert fts_rows == doc_rows
+        marker = col2._handle.conn.execute(
+            "SELECT value FROM meta WHERE key = 'fts_rowid_aligned'"
+        ).fetchone()
+        assert marker[0] == "1"
+    finally:
+        backend2.close()
