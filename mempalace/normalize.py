@@ -52,24 +52,36 @@ _NOISE_TAGS = (
     "task-notification",
     "user-prompt-submit-hook",
     "hook_output",
+    # Claude Code prepends this boilerplate to every local-command message.
+    # Measured 2026-08-08: 1,196 drawers in the live palace were this caveat
+    # verbatim (it was absent from the list since the list was written).
+    "local-command-caveat",
+    # Echoed stdout of local slash commands — chrome, usually "(no content)".
+    "local-command-stdout",
 )
 
 
 def _tag_pattern(name: str) -> "re.Pattern[str]":
-    # Opening tag must begin a line (optionally after a `> ` blockquote marker,
-    # since _messages_to_transcript prefixes lines with `> `). Body is lazy but
-    # forbidden from crossing a blank line, so a dangling open tag can't span
-    # multiple messages. Closing tag eats optional trailing whitespace + newline.
+    # Opening tag must begin a line — optionally indented, optionally after a
+    # `> ` blockquote marker (since _messages_to_transcript prefixes lines
+    # with `> `). Indentation tolerance matters: Claude Code writes command
+    # continuation tags indented ("\n            <command-message>..."), and
+    # a bare line-start anchor left that residue in 368 live drawers. Body is
+    # lazy but forbidden from crossing a blank line, so a dangling open tag
+    # can't span multiple messages. Closing tag eats optional trailing
+    # whitespace + newline.
     return re.compile(
-        rf"(?m)^(?:> )?<{name}(?:\s[^>]*)?>" rf"(?:(?!\n\s*\n)[\s\S])*?" rf"</{name}>[ \t]*\n?"
+        rf"(?m)^[ \t]*(?:> )?<{name}(?:\s[^>]*)?>"
+        rf"(?:(?!\n\s*\n)[\s\S])*?"
+        rf"</{name}>[ \t]*\n?"
     )
 
 
 _NOISE_TAG_PATTERNS = [_tag_pattern(t) for t in _NOISE_TAGS]
 
 # Strings that identify an entire noise line when found at its start.
-# Matched case-sensitively and anchored to line-start so user prose mentioning
-# e.g. "current time:" in a sentence is untouched.
+# Matched case-sensitively and anchored to line-start (modulo indentation) so
+# user prose mentioning e.g. "current time:" in a sentence is untouched.
 _NOISE_LINE_PREFIXES = (
     "CURRENT TIME:",
     "VERIFIED FACTS (do not contradict)",
@@ -84,7 +96,7 @@ _NOISE_LINE_PREFIXES = (
 )
 
 _NOISE_LINE_PATTERNS = [
-    re.compile(rf"(?m)^(?:> )?{re.escape(p)}.*\n?") for p in _NOISE_LINE_PREFIXES
+    re.compile(rf"(?m)^[ \t]*(?:> )?{re.escape(p)}.*\n?") for p in _NOISE_LINE_PREFIXES
 ]
 
 # ─── Agent-harness scaffolding ───────────────────────────────────────────
@@ -100,24 +112,24 @@ _NOISE_LINE_PATTERNS = [
 # that merely discusses being skeptical or verifying claims is untouched.
 _SCAFFOLDING_LINE_RES = [
     # "Be SKEPTICAL. Try to REFUTE this claim. ≥2/3 refutations kill it."
-    re.compile(r"(?m)^(?:> )?Be SKEPTICAL\. Try to REFUTE this claim\..*\n?"),
+    re.compile(r"(?m)^[ \t]*(?:> )?Be SKEPTICAL\. Try to REFUTE this claim\..*\n?"),
     # "## Adversarial Claim Verifier (voter 1/3)"
-    re.compile(r"(?m)^(?:> )?#*\s*Adversarial Claim Verifier \(voter \d+/\d+\).*\n?"),
+    re.compile(r"(?m)^[ \t]*(?:> )?#*\s*Adversarial Claim Verifier \(voter \d+/\d+\).*\n?"),
     # "Fetch the complete documentation index at: https://code.claude.com/..."
-    re.compile(r"(?m)^(?:> )?Fetch the complete documentation index at:.*\n?"),
+    re.compile(r"(?m)^[ \t]*(?:> )?Fetch the complete documentation index at:.*\n?"),
     # "Work from: /path/to/dir" — the seeded cwd line in spawned-agent briefs.
-    re.compile(r"(?m)^(?:> )?Work from: /\S*\s*\n?"),
+    re.compile(r"(?m)^[ \t]*(?:> )?Work from: /\S*\s*\n?"),
 ]
 
 # Claude Code TUI hook-run chrome, e.g. "Ran 2 Stop hook", "Ran 1 PreCompact hook".
 # Line-anchored, case-sensitive, explicit hook names — prose like
 # "our CI has a stop hook" stays intact.
 _HOOK_LINE_RE = re.compile(
-    r"(?m)^(?:> )?Ran \d+ (?:Stop|PreCompact|PreToolUse|PostToolUse|UserPromptSubmit|Notification|SessionStart|SessionEnd) hook[s]?.*\n?"
+    r"(?m)^[ \t]*(?:> )?Ran \d+ (?:Stop|PreCompact|PreToolUse|PostToolUse|UserPromptSubmit|Notification|SessionStart|SessionEnd) hook[s]?.*\n?"
 )
 
 # "… +N lines" collapsed-output marker, line-anchored.
-_COLLAPSED_LINES_RE = re.compile(r"(?m)^(?:> )?…\s*\+\d+ lines.*\n?")
+_COLLAPSED_LINES_RE = re.compile(r"(?m)^[ \t]*(?:> )?…\s*\+\d+ lines.*\n?")
 
 # ─── Hook-injected context & search-result echoes ────────────────────────
 # The MemPalace SessionStart hook injects palace context ("MEMPALACE SESSION
@@ -133,7 +145,7 @@ _INJECTED_CONTEXT_MARKER = "MEMPALACE SESSION CONTEXT"
 # Allowed to cross blank lines ONLY because the marker gates it; bounded by
 # the nearest closing tag so a dangling open tag can't eat unrelated text.
 _INJECTED_REMINDER_RE = re.compile(
-    r"(?m)^(?:> )?<system-reminder(?:\s[^>]*)?>"
+    r"(?m)^[ \t]*(?:> )?<system-reminder(?:\s[^>]*)?>"
     r"(?:(?!</system-reminder>)[\s\S])*?"
     + re.escape(_INJECTED_CONTEXT_MARKER)
     + r"[\s\S]*?</system-reminder>[ \t]*\n?"
@@ -141,7 +153,7 @@ _INJECTED_REMINDER_RE = re.compile(
 
 # Superpowers/plugin injection block — machine-generated, always tag-closed.
 _INJECTED_IMPORTANT_RE = re.compile(
-    r"(?m)^(?:> )?<EXTREMELY_IMPORTANT>[\s\S]*?</EXTREMELY_IMPORTANT>[ \t]*\n?"
+    r"(?m)^[ \t]*(?:> )?<EXTREMELY_IMPORTANT>[\s\S]*?</EXTREMELY_IMPORTANT>[ \t]*\n?"
 )
 
 # Rendered `memp search` dump: a `====...` banner line immediately followed by
@@ -258,7 +270,10 @@ def normalize(filepath: str) -> str:
     ext = Path(filepath).suffix.lower()
     if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
         normalized = _try_normalize_json(content)
-        if normalized:
+        # "" is a real verdict, not a miss: a recognized chat session whose
+        # turns were all chrome. Propagate it so the miner files nothing —
+        # falling through here would paragraph-chunk raw JSON as drawers.
+        if normalized is not None:
             return normalized
 
     return content
@@ -268,7 +283,7 @@ def _try_normalize_json(content: str) -> Optional[str]:
     """Try all known JSON chat schemas."""
 
     normalized = _try_claude_code_jsonl(content)
-    if normalized:
+    if normalized is not None:  # "" = recognized chrome-only session
         return normalized
 
     normalized = _try_codex_jsonl(content)
@@ -303,10 +318,19 @@ def _try_normalize_json(content: str) -> Optional[str]:
 
 
 def _try_claude_code_jsonl(content: str) -> Optional[str]:
-    """Claude Code JSONL sessions."""
+    """Claude Code JSONL sessions.
+
+    Returns the transcript, or ``""`` for a RECOGNIZED session whose every
+    turn stripped to chrome (mine-gate: the caller files nothing and
+    registers a sentinel), or ``None`` when the content is not Claude Code
+    JSONL at all. The empty-string sentinel matters: without it a
+    chrome-only session (e.g. a bare ``/clear``) falls through to raw
+    passthrough and the miner files raw JSONL as drawers.
+    """
     lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
     messages = []
     tool_use_map = {}  # tool_use_id → tool_name
+    saw_convo_entry = False  # any structurally-valid user/assistant entry
 
     for line in lines:
         try:
@@ -320,6 +344,8 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
         if not isinstance(message, dict):
             continue
         msg_content = message.get("content", "")
+        if msg_type in ("human", "user", "assistant") and msg_content:
+            saw_convo_entry = True
 
         # Build tool_use_map from assistant messages
         if msg_type == "assistant" and isinstance(msg_content, list):
@@ -361,6 +387,12 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
 
     if len(messages) >= 2:
         return _messages_to_transcript(messages)
+    if saw_convo_entry:
+        # Recognized Claude Code session, but zero or one non-chrome turns
+        # survived noise stripping (a /clear-only session strips to nothing).
+        # "" tells the miner "recognized format, nothing to file" so it
+        # registers the sentinel instead of paragraph-chunking raw JSONL.
+        return ""
     return None
 
 
