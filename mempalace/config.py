@@ -632,7 +632,7 @@ class MempalaceConfig:
 
     @property
     def embed_context_headers_min_chunks(self) -> int:
-        """Minimum chunk count before contextual headers apply (default 12).
+        """Minimum chunk count before contextual headers apply (default 16).
 
         A drawer split into fewer chunks than this embeds its stored
         documents unprefixed, exactly as before headers existed. Measured
@@ -640,21 +640,23 @@ class MempalaceConfig:
         on every chunked drawer moved golden failures 5 → 10 because a
         ~40-60-char breadcrumb is a large fraction of a small drawer's
         already-self-contained chunk (best-chunk cosine −0.02..−0.08 on
-        2-5-chunk drawers), while 14+-chunk drawers — whose chunks are
-        anonymous windows — consistently gained (+0.04..+0.07, flagship
-        roadmap exact rank 91 → 6). 12 sits in the observed sign-flip band
-        (8..14). 0 = headers for every chunked drawer."""
+        2-5-chunk drawers), while big drawers — whose chunks are anonymous
+        windows — consistently gained (+0.04..+0.07, flagship roadmap exact
+        rank 91 → 6). Gate 12 left one real click-through case (a 15-chunk
+        drawer) failing; gate 16 restored the full baseline pass set while
+        keeping the flagship gain intact. 0 = headers for every chunked
+        drawer."""
         return self._config_int(
             "embed_context_headers_min_chunks",
             "MEMPALACE_EMBED_CONTEXT_HEADERS_MIN_CHUNKS",
-            12,
+            16,
             minimum=0,
         )
 
     @property
     def chunk_boundary_min_chunks(self) -> int:
         """Minimum hard-slice chunk count before boundary-aware chunking
-        applies (default 12).
+        applies (default 16).
 
         Content that would span fewer chunks than this keeps the historical
         fixed ``content[i : i + chunk_size]`` layout. Boundary snapping on
@@ -664,11 +666,13 @@ class MempalaceConfig:
         chunk at cosine 0.295 rebalanced into a 762-char window at 0.149,
         and re-laying-out 8.6k chunk rows reshuffled every wing's ranking),
         while large drawers keep their gain at any threshold that includes
-        them. 0 = boundary-aware for all content."""
+        them (measured at 16: golden back to the 5-failure baseline,
+        flagship unchanged vs treating everything). 0 = boundary-aware for
+        all content."""
         return self._config_int(
             "chunk_boundary_min_chunks",
             "MEMPALACE_CHUNK_BOUNDARY_MIN_CHUNKS",
-            12,
+            16,
             minimum=0,
         )
 

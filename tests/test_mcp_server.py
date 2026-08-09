@@ -6049,7 +6049,7 @@ def test_add_drawer_idempotency_covers_legacy_fixed_slice_rows(
 
 def test_write_path_treatment_gates_preserve_verbatim(monkeypatch, config, palace_path, kg):
     """The 2026-08-09 recall fix gates boundary chunking and contextual
-    headers behind min-chunk thresholds (default 12): small drawers keep
+    headers behind min-chunk thresholds (default 16): small drawers keep
     the historical fixed-slice layout and plain stored-document vectors.
     Whichever side of the gate content lands on, the stored chunk rows
     must concatenate back to the caller's bytes exactly, and get-drawer
@@ -6060,7 +6060,7 @@ def test_write_path_treatment_gates_preserve_verbatim(monkeypatch, config, palac
 
     from mempalace.mcp_server import tool_add_drawer, tool_get_drawer
 
-    assert config.chunk_boundary_min_chunks == 12  # documented default
+    assert config.chunk_boundary_min_chunks == 16  # documented default
 
     # Under the gate (~3 hard chunks): fixed-slice layout, verbatim.
     small = "# Small doc\n" + "alpha beta gamma delta epsilon. " * 70  # ~2.2k chars
@@ -6072,9 +6072,9 @@ def test_write_path_treatment_gates_preserve_verbatim(monkeypatch, config, palac
     got = tool_get_drawer(drawer_id=res["drawer_id"])
     assert got.get("content") == small
 
-    # Over the gate (>= 12 hard chunks): boundary-aware layout, verbatim.
-    big = ("# Section head\n" + "body text line for the section. " * 20 + "\n") * 16
-    assert len(big) > 12 * 800
+    # Over the gate (>= 16 hard chunks): boundary-aware layout, verbatim.
+    big = ("# Section head\n" + "body text line for the section. " * 20 + "\n") * 22
+    assert len(big) > 16 * 800
     res_big = tool_add_drawer(wing="w", room="r", content=big)
     assert res_big["success"] is True
     rows_big = col.get(ids=res_big["chunk_ids"], include=["documents"])
@@ -6122,7 +6122,7 @@ def test_add_drawer_contextual_headers_change_the_vector(monkeypatch, config, pa
     """The chunk vector must be the embedding of the header-prefixed text,
     not of the bare stored chunk — otherwise the feature is a no-op."""
     pytest.importorskip("onnxruntime")
-    # This doc is 3 chunks — under the min-chunks gate (default 12) headers
+    # This doc is 3 chunks — under the min-chunks gate (default 16) headers
     # would rightly be skipped. Zero the gate: the subject here is the header
     # mechanism itself, not the gate (which has its own tests).
     monkeypatch.setenv("MEMPALACE_EMBED_CONTEXT_HEADERS_MIN_CHUNKS", "0")

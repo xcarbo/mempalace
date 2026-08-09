@@ -990,10 +990,10 @@ def test_explicit_palace_path_overrides_env_and_file_config(monkeypatch, tmp_pat
 # env-overridable so recall passes can A/B them without editing config.
 
 
-def test_treatment_gates_default_to_twelve(tmp_path):
+def test_treatment_gates_default_to_sixteen(tmp_path):
     cfg = MempalaceConfig(config_dir=str(tmp_path))
-    assert cfg.embed_context_headers_min_chunks == 12
-    assert cfg.chunk_boundary_min_chunks == 12
+    assert cfg.embed_context_headers_min_chunks == 16
+    assert cfg.chunk_boundary_min_chunks == 16
 
 
 def test_treatment_gates_file_overrides_honored(tmp_path):
@@ -1018,5 +1018,5 @@ def test_treatment_gates_garbage_env_falls_through_to_file(tmp_path, monkeypatch
 
 def test_treatment_gates_negative_falls_back_to_default(tmp_path):
     cfg = _write_config(tmp_path, embed_context_headers_min_chunks=-1, chunk_boundary_min_chunks=-3)
-    assert cfg.embed_context_headers_min_chunks == 12
-    assert cfg.chunk_boundary_min_chunks == 12
+    assert cfg.embed_context_headers_min_chunks == 16
+    assert cfg.chunk_boundary_min_chunks == 16
