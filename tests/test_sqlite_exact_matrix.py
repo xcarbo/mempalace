@@ -505,3 +505,101 @@ def test_legacy_misaligned_fts_table_is_rebuilt_on_connect(tmp_path):
         assert marker[0] == "1"
     finally:
         backend2.close()
+
+
+# ---------------------------------------------------------------------------
+# 5. Freshness fast path + filter memoization + covering indexes
+# ---------------------------------------------------------------------------
+
+
+def test_warm_query_skips_all_freshness_sql(tmp_path, monkeypatch):
+    """With no commits since the snapshot, the warm path must not even read
+    the generation counter — data_version + total_changes prove freshness."""
+    backend, col = _mk_collection(tmp_path)
+    try:
+        _, _, _, vecs = _seed(col, n=10)
+        q = vecs[0].tolist()
+        col.query(query_embeddings=[q], n_results=3)  # build snapshot
+
+        gen_calls = []
+        orig = SQLiteExactCollection._read_vec_generation
+
+        def spy(self, cur, collection_id):
+            gen_calls.append(collection_id)
+            return orig(self, cur, collection_id)
+
+        monkeypatch.setattr(SQLiteExactCollection, "_read_vec_generation", spy)
+        for _ in range(5):
+            col.query(query_embeddings=[q], n_results=3)
+        assert gen_calls == []  # tier-1 fast path only
+
+        # a write re-arms the recheck exactly once
+        col.add(documents=["x"], ids=["late"], metadatas=[{}], embeddings=[vecs[0].tolist()])
+        col.query(query_embeddings=[q], n_results=3)
+        assert len(gen_calls) == 1
+        gen_calls.clear()
+        col.query(query_embeddings=[q], n_results=3)
+        assert gen_calls == []  # fast path re-established
+    finally:
+        backend.close()
+
+
+def test_repeated_filters_are_memoized_and_dropped_on_commit(tmp_path, monkeypatch):
+    backend, col = _mk_collection(tmp_path)
+    try:
+        _, _, _, vecs = _seed(col, n=12)
+        q = vecs[0].tolist()
+        calls = []
+        orig = SQLiteExactCollection._candidate_indices
+
+        def spy(self, cur, collection_id, dim, cache, where, where_document):
+            calls.append(where)
+            return orig(self, cur, collection_id, dim, cache, where, where_document)
+
+        monkeypatch.setattr(SQLiteExactCollection, "_candidate_indices", spy)
+
+        for _ in range(4):
+            col.query(query_embeddings=[q], n_results=3, where={"wing": "w1"})
+        assert len(calls) == 1  # computed once, memoized after
+
+        # metadata change (no vector change) must drop the memo and be visible
+        col.update(ids=["d000"], metadatas=[{"wing": "w1"}])
+        result = col.query(query_embeddings=[q], n_results=12, where={"wing": "w1"})
+        assert len(calls) == 2
+        assert "d000" in result.ids[0]
+    finally:
+        backend.close()
+
+
+def test_index_v2_covers_dim_and_migrates_v1(tmp_path):
+    backend, col = _mk_collection(tmp_path)
+    conn = col._handle.conn
+    _seed(col, n=4)
+
+    def wing_index_columns():
+        return [row[2] for row in conn.execute("PRAGMA index_info(idx_documents_wing)")]
+
+    assert wing_index_columns() == ["collection_id", "wing", "dim"]
+    names = {row[1] for row in conn.execute("PRAGMA index_list(documents)")}
+    assert "idx_documents_collection_dim" in names
+
+    # Simulate a v1 palace: old two-column index, no version marker.
+    conn.execute("DROP INDEX idx_documents_wing")
+    conn.execute("CREATE INDEX idx_documents_wing ON documents(collection_id, wing)")
+    conn.execute("DELETE FROM meta WHERE key = 'index_version'")
+    conn.commit()
+    backend.close()
+
+    backend2 = SQLiteExactBackend()
+    try:
+        col2 = backend2.get_collection(str(tmp_path), "drawers", create=False)
+        conn = col2._handle.conn
+        assert [row[2] for row in conn.execute("PRAGMA index_info(idx_documents_wing)")] == [
+            "collection_id",
+            "wing",
+            "dim",
+        ]
+        marker = conn.execute("SELECT value FROM meta WHERE key = 'index_version'").fetchone()
+        assert marker[0] == "2"
+    finally:
+        backend2.close()

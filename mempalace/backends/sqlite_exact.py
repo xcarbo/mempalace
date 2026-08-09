@@ -428,17 +428,40 @@ def _validate_write_batch(
 
 
 class _VectorCache:
-    """Immutable-ish snapshot of one collection's vectors for the matmul path.
+    """Snapshot of one collection's vectors for the matmul path.
 
     ``matrix`` is an L2-row-normalized float32 array in ``rowid`` order (so
     ``rowids`` is strictly ascending — required by the ``searchsorted`` mask
     mapping). ``count`` / ``max_rowid`` are the DB-side values at snapshot
     time; ``generation`` is the persisted ``vec_gen:<collection_id>`` counter,
-    bumped by every mutating write (in this or any other process), so a cache
-    can prove itself current with three indexed point reads per query.
+    bumped by every mutating write (in this or any other process).
+
+    Freshness is two-tier. The O(1) tier: ``data_version`` (moves when another
+    connection commits) plus the connection's ``total_changes`` (moves on own
+    writes) — both unchanged proves *nothing anywhere committed*, so the warm
+    read path touches no tables at all. Only when one of them moved does the
+    generation / MAX(rowid) / COUNT protocol run, against covering indexes.
+
+    ``filters`` memoizes candidate index arrays per compiled filter, bounded
+    at ``_MAX_CACHED_FILTERS``. It is cleared on *any* observed commit —
+    metadata can change without vectors changing, and clearing is cheaper than
+    proving which writes were metadata-neutral — while the matrix survives
+    unless the vector protocol says otherwise.
     """
 
-    __slots__ = ("generation", "max_rowid", "count", "rowids", "ids", "matrix")
+    __slots__ = (
+        "generation",
+        "max_rowid",
+        "count",
+        "rowids",
+        "ids",
+        "matrix",
+        "data_version",
+        "total_changes",
+        "filters",
+    )
+
+    _MAX_CACHED_FILTERS = 32
 
     def __init__(self, generation, max_rowid, count, rowids, ids, matrix):
         self.generation = generation
@@ -447,6 +470,9 @@ class _VectorCache:
         self.rowids = rowids
         self.ids = ids
         self.matrix = matrix
+        self.data_version = -1
+        self.total_changes = -1
+        self.filters: dict[str, np.ndarray] = {}
 
 
 class _SQLiteExactHandle:
@@ -848,11 +874,19 @@ class SQLiteExactCollection(BaseCollection):
             matrix = np.empty((0, dim), dtype=np.float32)
         return np.asarray(rowids, dtype=np.int64), ids, matrix, fetched
 
+    def _data_version(self, cur) -> int:
+        return int(cur.execute("PRAGMA data_version").fetchone()[0])
+
     def _vector_cache(self, cur, collection_id: int, dim: int) -> _VectorCache:
         """Return a current vector cache for ``(collection_id, dim)``.
 
-        Freshness protocol, all inside the caller's read transaction so the
-        snapshot is consistent with any candidate-id SELECT that follows:
+        Tier 1 — O(1), the warm path: if the connection's ``total_changes``
+        and the DB's ``data_version`` both match the snapshot, no commit has
+        happened anywhere (own writes move total_changes, foreign commits move
+        data_version) — return the cache without touching a table.
+
+        Tier 2 — after an observed commit (memoized filters dropped first,
+        since metadata may have changed without vectors changing):
 
         * generation changed → a mutation happened somewhere; full rebuild.
         * generation same, MAX(rowid)/COUNT(*) unchanged → cache is current.
@@ -862,33 +896,50 @@ class SQLiteExactCollection(BaseCollection):
           writers, which bump the generation on every non-append mutation).
         """
         key = (collection_id, dim)
-        generation = self._read_vec_generation(cur, collection_id)
         cache = self._handle.vec_caches.get(key)
-        if cache is not None and cache.generation == generation:
-            row = cur.execute(
-                "SELECT COALESCE(MAX(rowid), 0), COUNT(*) FROM documents "
-                "WHERE collection_id = ? AND dim = ?",
-                (collection_id, dim),
-            ).fetchone()
-            max_rowid, count = int(row[0]), int(row[1])
-            if max_rowid == cache.max_rowid and count == cache.count:
-                return cache
-            if max_rowid > cache.max_rowid and count > cache.count:
-                rowids, ids, matrix, fetched = self._load_vector_rows(
-                    cur, collection_id, dim, cache.max_rowid
-                )
-                if cache.count + fetched == count:
-                    cache = _VectorCache(
-                        generation,
-                        max_rowid,
-                        count,
-                        np.concatenate([cache.rowids, rowids]),
-                        cache.ids + ids,
-                        np.concatenate([cache.matrix, matrix]) if ids else cache.matrix,
-                    )
-                    self._handle.vec_caches[key] = cache
+        total_changes = self._handle.conn.total_changes
+        data_version: Optional[int] = None
+        if cache is not None:
+            if total_changes == cache.total_changes:
+                data_version = self._data_version(cur)
+                if data_version == cache.data_version:
                     return cache
+            if data_version is None:
+                data_version = self._data_version(cur)
+            cache.filters.clear()
+            generation = self._read_vec_generation(cur, collection_id)
+            if cache.generation == generation:
+                row = cur.execute(
+                    "SELECT COALESCE(MAX(rowid), 0), COUNT(*) FROM documents "
+                    "WHERE collection_id = ? AND dim = ?",
+                    (collection_id, dim),
+                ).fetchone()
+                max_rowid, count = int(row[0]), int(row[1])
+                if max_rowid == cache.max_rowid and count == cache.count:
+                    cache.data_version = data_version
+                    cache.total_changes = total_changes
+                    return cache
+                if max_rowid > cache.max_rowid and count > cache.count:
+                    rowids, ids, matrix, fetched = self._load_vector_rows(
+                        cur, collection_id, dim, cache.max_rowid
+                    )
+                    if cache.count + fetched == count:
+                        cache = _VectorCache(
+                            generation,
+                            max_rowid,
+                            count,
+                            np.concatenate([cache.rowids, rowids]),
+                            cache.ids + ids,
+                            np.concatenate([cache.matrix, matrix]) if ids else cache.matrix,
+                        )
+                        cache.data_version = data_version
+                        cache.total_changes = total_changes
+                        self._handle.vec_caches[key] = cache
+                        return cache
             # fall through to a full rebuild
+        generation = self._read_vec_generation(cur, collection_id)
+        if data_version is None:
+            data_version = self._data_version(cur)
         rowids, ids, matrix, fetched = self._load_vector_rows(cur, collection_id, dim, 0)
         cache = _VectorCache(
             generation,
@@ -898,8 +949,36 @@ class SQLiteExactCollection(BaseCollection):
             ids,
             matrix,
         )
+        cache.data_version = data_version
+        cache.total_changes = self._handle.conn.total_changes
         self._handle.vec_caches[key] = cache
         return cache
+
+    def _cached_candidate_indices(
+        self, cur, collection_id: int, dim: int, cache: _VectorCache, where, where_document
+    ) -> Optional[np.ndarray]:
+        """Memoizing wrapper around :meth:`_candidate_indices`.
+
+        The memo lives on the cache snapshot and is cleared by
+        ``_vector_cache`` on any observed commit, so a hit is always computed
+        against current data. Unfiltered queries bypass it entirely.
+        """
+        if where is None and where_document is None:
+            return None
+        try:
+            filter_key = json.dumps([where, where_document], sort_keys=True)
+        except (TypeError, ValueError):
+            filter_key = None
+        if filter_key is not None:
+            hit = cache.filters.get(filter_key)
+            if hit is not None:
+                return hit
+        cand = self._candidate_indices(cur, collection_id, dim, cache, where, where_document)
+        if filter_key is not None and cand is not None:
+            if len(cache.filters) >= cache._MAX_CACHED_FILTERS:
+                cache.filters.pop(next(iter(cache.filters)))
+            cache.filters[filter_key] = cand
+        return cand
 
     def _candidate_indices(
         self, cur, collection_id: int, dim: int, cache: _VectorCache, where, where_document
@@ -992,7 +1071,7 @@ class SQLiteExactCollection(BaseCollection):
                 dim = int(q.size)
                 cache = self._vector_cache(cur, collection_id, dim)
                 try:
-                    cand_idx = self._candidate_indices(
+                    cand_idx = self._cached_candidate_indices(
                         cur, collection_id, dim, cache, where, where_document
                     )
                 except _WhereNotTranslatable:
@@ -1533,9 +1612,28 @@ class SQLiteExactBackend(BaseBackend):
                     f"ALTER TABLE documents ADD COLUMN {col} TEXT "
                     f"GENERATED ALWAYS AS (json_extract(metadata_json, '$.\"{col}\"')) VIRTUAL"
                 )
+        # Index version 2: every hot-path index carries `dim` so the vector
+        # cache's freshness recheck (MAX(rowid)/COUNT per (collection_id, dim))
+        # and the filtered candidate scans are index-only. Without `dim` in the
+        # index, each of the ~n entries costs a table probe — measured at
+        # 134 ms p50 per query on a 174k palace, ~30× the matmul it guards.
+        version_row = conn.execute("SELECT value FROM meta WHERE key = 'index_version'").fetchone()
+        if not version_row or version_row[0] != "2":
+            for col in _GENERATED_META_COLUMNS:
+                conn.execute(f"DROP INDEX IF EXISTS idx_documents_{col}")
         for col in _GENERATED_META_COLUMNS:
             conn.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_documents_{col} ON documents(collection_id, {col})"
+                f"CREATE INDEX IF NOT EXISTS idx_documents_{col} "
+                f"ON documents(collection_id, {col}, dim)"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_documents_collection_dim "
+            "ON documents(collection_id, dim)"
+        )
+        if not version_row or version_row[0] != "2":
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('index_version', '2') "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
             )
         try:
             conn.execute(
