@@ -6122,6 +6122,10 @@ def test_add_drawer_contextual_headers_change_the_vector(monkeypatch, config, pa
     """The chunk vector must be the embedding of the header-prefixed text,
     not of the bare stored chunk — otherwise the feature is a no-op."""
     pytest.importorskip("onnxruntime")
+    # This doc is 3 chunks — under the min-chunks gate (default 12) headers
+    # would rightly be skipped. Zero the gate: the subject here is the header
+    # mechanism itself, not the gate (which has its own tests).
+    monkeypatch.setenv("MEMPALACE_EMBED_CONTEXT_HEADERS_MIN_CHUNKS", "0")
     _patch_mcp_server(monkeypatch, config, kg)
     _client, _col = _get_collection(palace_path, create=True)
     del _client
