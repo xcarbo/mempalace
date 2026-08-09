@@ -37,6 +37,114 @@ def test_convo_mining():
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+SHARED_EXCHANGES = (
+    "> What is memory?\nMemory is persistence.\n\n"
+    "> Why does it matter?\nIt enables continuity.\n\n"
+    "> How do we build it?\nWith structured storage.\n"
+)
+
+
+def test_mine_convos_content_dedup_skips_cross_file_duplicates(capsys):
+    """Fork/resume copies conversation history into a new file; each copy is
+    'never mined before' so file idempotency cannot see it (measured
+    2026-08-08: 16,384 surplus duplicate rows). The content-hash gate must
+    store each exchange once per wing and record lineage for the skips."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        # a_parent holds 3 exchanges; b_fork is a fork: same 3 + 1 unique.
+        (Path(tmpdir) / "a_parent.txt").write_text(SHARED_EXCHANGES)
+        (Path(tmpdir) / "b_fork.txt").write_text(
+            SHARED_EXCHANGES + "\n> What changed?\nThe fork added this.\n"
+        )
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test")
+        capsys.readouterr()
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        rows = col.get(include=["documents", "metadatas"])
+        drawers = [
+            (doc, meta)
+            for doc, meta in zip(rows["documents"], rows["metadatas"])
+            if (meta or {}).get("ingest_mode") == "convos"
+        ]
+        # 4 distinct exchanges exist; the 3 shared ones must be stored ONCE.
+        assert len(drawers) == 4, f"expected 4 unique drawers, got {len(drawers)}"
+        assert len({doc for doc, _ in drawers}) == 4
+        # Every stored convo drawer carries its content hash for future gates.
+        assert all(meta.get("content_hash") for _, meta in drawers)
+        del col, client
+
+        # Lineage: 3 skipped copies, each pointing at the canonical drawer.
+        lineage_path = Path(palace_path) / "dedup_lineage.jsonl"
+        assert lineage_path.exists()
+        import json as _json
+
+        records = [_json.loads(ln) for ln in lineage_path.read_text().splitlines()]
+        assert len(records) == 3
+        for record in records:
+            assert record["duplicate_of_drawer"]
+            assert record["duplicate_of_source"] != record["source_file"]
+
+        # Both files skip on the next mine (stored rows or sentinel).
+        mine_convos(tmpdir, palace_path, wing="test")
+        out = capsys.readouterr().out
+        assert "Files skipped (already filed): 2" in out
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_content_dedup_disabled_stores_all_copies(capsys, monkeypatch):
+    """MEMPALACE_CONVO_DEDUP=false restores the old content-blind behaviour."""
+    monkeypatch.setenv("MEMPALACE_CONVO_DEDUP", "false")
+    tmpdir = tempfile.mkdtemp()
+    try:
+        (Path(tmpdir) / "a_parent.txt").write_text(SHARED_EXCHANGES)
+        (Path(tmpdir) / "b_fork.txt").write_text(SHARED_EXCHANGES)
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test")
+        capsys.readouterr()
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        rows = col.get(include=["metadatas"])
+        convo_rows = [m for m in rows["metadatas"] if (m or {}).get("ingest_mode") == "convos"]
+        assert len(convo_rows) == 6  # 3 exchanges × 2 files, no gate
+        del col, client
+        assert not (Path(palace_path) / "dedup_lineage.jsonl").exists()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_all_duplicate_file_registers_sentinel(capsys):
+    """A file whose every chunk is a cross-file duplicate stores nothing —
+    it must still get a registry sentinel so it isn't re-processed on every
+    future mine."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        (Path(tmpdir) / "a_parent.txt").write_text(SHARED_EXCHANGES)
+        (Path(tmpdir) / "b_copy.txt").write_text(SHARED_EXCHANGES)
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test")
+        capsys.readouterr()
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        for name in ("a_parent.txt", "b_copy.txt"):
+            resolved = str(Path(tmpdir).resolve() / name)
+            assert file_already_mined(col, resolved), f"{name} not registered"
+        rows = col.get(include=["metadatas"])
+        convo_rows = [m for m in rows["metadatas"] if (m or {}).get("ingest_mode") == "convos"]
+        assert len(convo_rows) == 3
+        del col, client
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        out = capsys.readouterr().out
+        assert "Files skipped (already filed): 2" in out
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_mine_convos_chrome_only_session_files_zero_drawers(capsys):
     """End-to-end pin of the abe96ede trace: a Claude Code session that is
     a bare /clear (one local-command-caveat message + one indented

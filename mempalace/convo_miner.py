@@ -8,6 +8,7 @@ Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
 Same palace as project mining. Different ingest strategy.
 """
 
+import hashlib
 import os
 import sys
 import json
@@ -492,8 +493,53 @@ def _extract_authored_at(filepath):
     return latest
 
 
+def _chunk_content_hash(content: str) -> str:
+    """sha256 hex of a chunk's exact content — the dedup identity."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+_DEDUP_LOOKUP_BATCH = 200  # hashes per $in query — keeps the where clause bounded
+
+
+def _existing_content_hashes(collection, wing: str, hashes: list, source_file: str) -> dict:
+    """Map content_hash → (drawer_id, source_file) for chunks already stored
+    in ``wing`` from a DIFFERENT source file.
+
+    Fail-open: any lookup error returns what was found so far — a failed
+    dedup probe must never block a mine (worst case is a duplicate row,
+    which is the pre-existing behaviour).
+    """
+    found: dict = {}
+    unique = list(dict.fromkeys(hashes))
+    for i in range(0, len(unique), _DEDUP_LOOKUP_BATCH):
+        batch = unique[i : i + _DEDUP_LOOKUP_BATCH]
+        try:
+            result = collection.get(
+                where={"$and": [{"wing": wing}, {"content_hash": {"$in": batch}}]},
+                include=["metadatas"],
+            )
+        except Exception:
+            logger.debug("content-hash dedup lookup failed for %s", source_file, exc_info=True)
+            return found
+        for drawer_id, meta in zip(result.get("ids") or [], result.get("metadatas") or []):
+            meta = meta or {}
+            stored_hash = meta.get("content_hash")
+            stored_src = meta.get("source_file")
+            if stored_hash and stored_src and stored_src != source_file:
+                found.setdefault(stored_hash, (drawer_id, stored_src))
+    return found
+
+
 def _file_chunks_locked(
-    collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None
+    collection,
+    source_file,
+    chunks,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    authored_at=None,
+    content_dedup=True,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -505,16 +551,27 @@ def _file_chunks_locked(
     since a Claude Code session keeps appending to its own file while
     active and /compact or /clear can rewrite one in place.
 
-    Returns (drawers_added, room_counts_delta, skipped).
+    When ``content_dedup`` is on, a chunk whose exact content already exists
+    in this wing from a DIFFERENT source file is skipped instead of stored —
+    Claude Code fork/resume copies history into new JSONL files, and each
+    copy is legitimately "never mined before" so file idempotency cannot see
+    it. Skips are returned as lineage records so provenance survives. Known
+    accepted edge: if the canonical copy's source file is later rewritten in
+    place (/compact) and re-mined smaller, a skipped twin is not re-checked
+    until the next global re-mine (schema bump), which self-heals the gap;
+    the on-disk transcript remains the verbatim record throughout.
+
+    Returns (drawers_added, room_counts_delta, skipped, dedup_lineage).
     """
     room_counts_delta: dict = defaultdict(int)
     drawers_added = 0
+    dedup_lineage: list = []
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
         # still fall through to the purge+rebuild path below.
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
-            return 0, room_counts_delta, True
+            return 0, room_counts_delta, True, dedup_lineage
 
         # Purge stale drawers first. Fires both on a normalize-schema bump
         # (file_already_mined() returned False for pre-v2 drawers) and on a
@@ -536,11 +593,39 @@ def _file_chunks_locked(
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
+
+        # Content-hash dedup gate: one bulk lookup for this file's hashes,
+        # then O(1) skip decisions per chunk. Same-file rows never match
+        # (they were just purged above, and the helper excludes them anyway).
+        chunk_hashes = [_chunk_content_hash(chunk["content"]) for chunk in chunks]
+        duplicate_map = (
+            _existing_content_hashes(collection, wing, chunk_hashes, source_file)
+            if content_dedup
+            else {}
+        )
+
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
             batch_ids: list = []
             batch_metas: list = []
-            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+            for offset, chunk in enumerate(
+                chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+            ):
+                content_hash = chunk_hashes[batch_start + offset]
+                duplicate = duplicate_map.get(content_hash)
+                if duplicate is not None:
+                    dedup_lineage.append(
+                        {
+                            "source_file": source_file,
+                            "chunk_index": chunk["chunk_index"],
+                            "content_hash": content_hash,
+                            "duplicate_of_drawer": duplicate[0],
+                            "duplicate_of_source": duplicate[1],
+                            "wing": wing,
+                            "skipped_at": filed_at,
+                        }
+                    )
+                    continue
                 chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
                 if extract_mode == "general":
                     room_counts_delta[chunk_room] += 1
@@ -563,10 +648,13 @@ def _file_chunks_locked(
                     "extract_mode": extract_mode,
                     "normalize_version": NORMALIZE_VERSION,
                     "id_recipe": ID_RECIPE,
+                    "content_hash": content_hash,
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
                 batch_metas.append(meta)
+            if not batch_ids:
+                continue
             assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
             try:
                 collection.upsert(
@@ -578,7 +666,7 @@ def _file_chunks_locked(
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise
-    return drawers_added, room_counts_delta, False
+    return drawers_added, room_counts_delta, False, dedup_lineage
 
 
 def _is_ai_tool_path(path: Path) -> bool:
@@ -711,6 +799,23 @@ def mine_convos(
         )
 
 
+def _append_dedup_lineage(palace_path: str, records: list) -> None:
+    """Append dedup-skip lineage records to ``<palace>/dedup_lineage.jsonl``.
+
+    The skipped copy's provenance (which file held it, which drawer is the
+    canonical copy) would otherwise be lost — the transcript stays on disk
+    but nothing in the palace would say "this exchange also appeared here".
+    Best-effort: lineage is forensics, never worth failing a mine over.
+    """
+    try:
+        path = Path(palace_path).expanduser() / "dedup_lineage.jsonl"
+        with open(path, "a", encoding="utf-8") as fh:
+            for record in records:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        logger.debug("dedup lineage append failed for %s", palace_path, exc_info=True)
+
+
 def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None):
     """Auto-populate the associative graph from the entities just mined.
 
@@ -781,6 +886,7 @@ def _mine_convos_impl(
     )
 
     total_drawers = 0
+    total_dedup_skipped = 0
     files_mined = 0
     files_skipped = 0
     files_processed = 0
@@ -869,7 +975,7 @@ def _mine_convos_impl(
 
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
-        drawers_added, room_delta, skipped = _file_chunks_locked(
+        drawers_added, room_delta, skipped, dedup_lineage = _file_chunks_locked(
             collection,
             source_file,
             chunks,
@@ -878,16 +984,26 @@ def _mine_convos_impl(
             agent,
             extract_mode,
             authored_at=_extract_authored_at(filepath),
+            content_dedup=palace_config.convo_content_dedup,
         )
         if skipped:
             files_skipped += 1
             continue
+        if dedup_lineage:
+            _append_dedup_lineage(palace_path, dedup_lineage)
+            total_dedup_skipped += len(dedup_lineage)
+            if drawers_added == 0:
+                # Every chunk was a cross-file duplicate — nothing was stored,
+                # so nothing carries this file's mtime. Register the sentinel
+                # or the file gets fully re-processed on every future mine.
+                _register_file(collection, source_file, wing, agent, extract_mode)
         for r, n in room_delta.items():
             room_counts[r] += n
 
         total_drawers += drawers_added
         files_mined += 1
-        print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+        dedup_note = f" (dedup: {len(dedup_lineage)} skipped)" if dedup_lineage else ""
+        print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}{dedup_note}")
         if limit > 0 and files_mined >= limit:
             break
 
@@ -903,6 +1019,8 @@ def _mine_convos_impl(
     print(f"  Files processed: {files_processed - files_skipped}")
     print(f"  Files skipped (already filed): {files_skipped}")
     print(f"  Drawers filed: {total_drawers}")
+    if total_dedup_skipped:
+        print(f"  Duplicate chunks skipped (cross-file dedup): {total_dedup_skipped}")
     if room_counts:
         print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):

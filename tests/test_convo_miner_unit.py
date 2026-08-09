@@ -538,13 +538,14 @@ class TestFileChunksLocked:
         monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
         monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
 
-        drawers, room_counts, skipped = _file_chunks_locked(
+        drawers, room_counts, skipped, dedup_lineage = _file_chunks_locked(
             col, "chat.txt", chunks, "wing", "general", "agent", "exchange"
         )
 
         assert drawers == 5
         assert dict(room_counts) == {}
         assert skipped is False
+        assert dedup_lineage == []
         assert col.batch_sizes == [2, 2, 1]
 
     def test_populates_entities_metadata(self, monkeypatch):
