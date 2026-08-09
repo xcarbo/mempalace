@@ -475,9 +475,7 @@ def test_blend_keeps_fused_winner_when_rerank_disagrees_mildly(monkeypatch):
         {"text": "H2", "_fused_raw": 0.5, "wing": "w"},
         {"text": "H3", "_fused_raw": 0.0, "wing": "w"},
     ]
-    monkeypatch.setattr(
-        searcher_mod, "annotate_rerank_scores", _annotate_with([0.80, 0.85, 0.0])
-    )
+    monkeypatch.setattr(searcher_mod, "annotate_rerank_scores", _annotate_with([0.80, 0.85, 0.0]))
     out = searcher_mod._blend_rerank("q", hits)
     assert [h["text"] for h in out] == ["H1", "H2", "H3"]
 
@@ -493,9 +491,7 @@ def test_blend_reapplies_archive_demotion_after_reranking(monkeypatch):
         {"text": "CUR", "_fused_raw": 0.98, "wing": "mempalace"},
         {"text": "PAD", "_fused_raw": 0.0, "wing": "mempalace"},
     ]
-    monkeypatch.setattr(
-        searcher_mod, "annotate_rerank_scores", _annotate_with([1.0, 0.98, 0.0])
-    )
+    monkeypatch.setattr(searcher_mod, "annotate_rerank_scores", _annotate_with([1.0, 0.98, 0.0]))
     out = searcher_mod._blend_rerank("q", hits)
     assert [h["text"] for h in out] == ["CUR", "ARCH", "PAD"]
 
@@ -522,3 +518,33 @@ def test_blend_weight_env_parses_and_rejects_nonsense(monkeypatch):
         assert _rerank_blend_weight() == RERANK_BLEND_DEFAULT
     monkeypatch.setenv("MEMPALACE_RERANK_BLEND", "0.3")
     assert _rerank_blend_weight() == 0.3
+
+
+# ── vector-lane candidate floor (demotion needs curated material) ────────────
+
+
+def test_vector_candidate_floor_applies_only_when_archive_can_crowd(monkeypatch):
+    """The archive demotion runs on the candidate pool; with a fetch of only
+    n*3 chunks the pool was ~90% sessions rows and a curated drawer at
+    vector rank 16+ was cut before demotion could promote it (agent-03,
+    2026-08-08). The floor mirrors _LEXICAL_CANDIDATE_FLOOR: unscoped
+    searches over an archive-bearing palace fetch at least
+    _VECTOR_CANDIDATE_FLOOR chunks; wing-scoped searches and palaces with
+    the mechanism disabled keep the cheap proportional fetch."""
+    from mempalace import searcher as searcher_mod
+    from mempalace.searcher import _VECTOR_CANDIDATE_FLOOR, _vector_candidate_count
+
+    monkeypatch.delenv("MEMPALACE_ARCHIVE_WINGS", raising=False)
+    monkeypatch.setattr(searcher_mod, "rerank_enabled", lambda: False)
+    assert _vector_candidate_count(5, None) == _VECTOR_CANDIDATE_FLOOR
+    assert _vector_candidate_count(30, None) == 90  # proportional once past the floor
+    assert _vector_candidate_count(5, "mempalace") == 15
+
+    monkeypatch.setenv("MEMPALACE_ARCHIVE_WINGS", "")
+    assert _vector_candidate_count(5, None) == 15
+
+    monkeypatch.delenv("MEMPALACE_ARCHIVE_WINGS", raising=False)
+    monkeypatch.setattr(searcher_mod, "rerank_enabled", lambda: True)
+    assert _vector_candidate_count(5, None) == max(
+        _VECTOR_CANDIDATE_FLOOR, searcher_mod.MAX_RERANK_POOL * 2
+    )

@@ -1100,6 +1100,34 @@ def _bm25_only_via_sqlite(
 # subquery per row and there is no index for it.
 _LEXICAL_CANDIDATE_FLOOR = 300
 
+# Floor on how many vector candidates to fetch when the archive is in play —
+# the vector-lane sibling of _LEXICAL_CANDIDATE_FLOOR, and the fix for the
+# demotion ordering gap agent-03 flagged (2026-08-08): the archive demotion
+# runs on the candidate pool, but with a fetch of only n*3 (=15) chunks the
+# pool was ~90% sessions rows, so a curated drawer at vector rank 16+ was cut
+# before the demotion could promote it and could only re-enter through the
+# lexical floor. 60 chunks ≈ the reranker's widened fetch, keeps HNSW cost
+# trivial, and gives the demotion actual curated candidates to work with.
+_VECTOR_CANDIDATE_FLOOR = 60
+
+
+def _vector_candidate_count(n_results: int, wing: str) -> int:
+    """How many vector-lane chunks to fetch for the rank pool.
+
+    Same shape as :func:`_lexical_candidate_count`: proportional (n*3) when
+    the search is wing-scoped or the archive mechanism is disabled, floored
+    at ``_VECTOR_CANDIDATE_FLOOR`` otherwise so the demotion has curated
+    candidates to promote. When the second-stage reranker is enabled the
+    fetch is additionally widened so its pool holds ~MAX_RERANK_POOL
+    distinct drawers even after chunk dedup.
+    """
+    proportional = n_results * 3
+    if not wing and archive_wings():
+        proportional = max(proportional, _VECTOR_CANDIDATE_FLOOR)
+    if rerank_enabled():
+        proportional = max(proportional, MAX_RERANK_POOL * 2)
+    return proportional
+
 
 def _lexical_candidate_count(n_results: int, wing: str) -> int:
     """How many lexical candidates to fetch.
@@ -1745,14 +1773,13 @@ def search_memories(
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
     try:
+        vector_fetch_n = _vector_candidate_count(n_results, wing)
         dkwargs = {
             "query_texts": [query],
-            # Over-fetch for hybrid re-ranking; wider still when the local
-            # reranker is on so its pool holds ~MAX_RERANK_POOL distinct
-            # drawers even after chunk dedup.
-            "n_results": max(n_results * 3, MAX_RERANK_POOL * 2)
-            if rerank_enabled()
-            else n_results * 3,
+            # Over-fetch for hybrid re-ranking; floored when the archive can
+            # crowd the lane, wider still when the local reranker is on. See
+            # _vector_candidate_count.
+            "n_results": vector_fetch_n,
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
@@ -1881,7 +1908,12 @@ def search_memories(
     #
     # The final cut to n_results still happens in `_finalize_candidate_hits`,
     # so callers see no change in result count.
-    pool_size = max(n_results, MAX_RERANK_POOL)
+    # The cut must never truncate the vector lane below what was fetched for
+    # it — cutting to MAX_RERANK_POOL here re-created the demotion gap at 30
+    # that _VECTOR_CANDIDATE_FLOOR exists to fix at 15 (the demotion can only
+    # promote what survives to _hybrid_rank). Dedup alone shrinks the pool;
+    # hydration cost is bounded by closet-boosted hits, not pool width.
+    pool_size = max(n_results, MAX_RERANK_POOL, vector_fetch_n)
     hits = _dedupe_by_drawer_id(scored)[:pool_size]
 
     # Drawer-grep enrichment: for closet-boosted hits whose source has
