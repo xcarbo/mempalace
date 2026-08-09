@@ -123,12 +123,18 @@ cutover happens this week.
      `dup-tie-cjc1295-hair`, `ct-thewill-adgm`); each is individually
      subject to the 2 s max.
    * **Query-plan preflight (catches the ANALYZE / missing-index class).**
-     On the freshly built store, before the A/B: run
-     `EXPLAIN QUERY PLAN` for the two hydration filter shapes
+     On the freshly built store, before the A/B: trace the SQL that `get()`
+     **actually emits** for the two hydration filter shapes
      (`{"source_file": X}` and `{"$and": [{"source_file": X},
-     {"parent_drawer_id": Y}]}` compiled via `get()`), and assert the plan
-     uses a generated-column index — not a bare `(collection_id)` index
-     walk. A freshly bulk-built store has **no `sqlite_stat1`**; code whose
+     {"parent_drawer_id": Y}]}`) and run `EXPLAIN QUERY PLAN` on those
+     traced statements; assert the plan uses a generated-column index — not
+     a bare `(collection_id)` index walk. Do not hand-write the probe SQL:
+     the stat-less planner's choice is decided by whether the emitted
+     statement carries `ORDER BY rowid` (measured 2026-08-09: with ORDER BY
+     every filter shape, including bare equality, full-walks on a
+     `sqlite_stat1`-free store; without it every shape picks the selective
+     index), so a probe that differs from the shipped SQL by only that
+     clause proves nothing. A freshly bulk-built store has **no `sqlite_stat1`**; code whose
      plan is correct only after `ANALYZE` will pass every warm benchmark on
      a hand-tuned store and silently regress ~30× on the next fresh build
      (measured 2026-08-09: p95 110 ms with stats vs 3,004 ms without, same

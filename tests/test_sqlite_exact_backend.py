@@ -187,23 +187,25 @@ def test_sqlite_exact_get_filtered_page_compiles_without_sql_page(tmp_path):
     _backend, col = _collection(tmp_path)
     _seed(col, 6)
 
-    # A translatable filter compiles to SQL, but the compiled scan is fetched
-    # unordered (no ORDER BY — see the planner note in _rows) and sorted in
-    # Python, so LIMIT/OFFSET must not reach SQL; the page is taken in Python
-    # over the rowid-sorted filtered rows.
+    # A translatable filter with a page compiles to a two-phase read: a
+    # narrow rowid scan for the match set (no ORDER BY — see the planner note
+    # in _rows — and no SQL LIMIT/OFFSET, which would page an unordered set),
+    # then a hydration fetch of only the page rows by rowid.
     result, statements = _traced_sql(
         col,
         lambda: col.get(where={"wing": "w"}, limit=2, offset=1, include=["metadatas"]),
     )
-    scans = [s for s in statements if "metadata_json" in s and "FROM documents" in s]
+    rowid_scans = [s for s in statements if "SELECT rowid FROM documents" in s and "wing" in s]
+    hydrations = [s for s in statements if "metadata_json" in s and "rowid IN" in s]
 
     assert result.ids == ["d1", "d2"]
-    assert len(scans) == 1
-    assert "ORDER BY" not in scans[0]
-    assert "LIMIT" not in scans[0]
-    assert "OFFSET" not in scans[0]
-    # The compiled predicate reached SQL (no Python fallback scan).
-    assert "wing" in scans[0]
+    assert len(rowid_scans) == 1
+    assert "ORDER BY" not in rowid_scans[0]
+    assert "LIMIT" not in rowid_scans[0]
+    assert "OFFSET" not in rowid_scans[0]
+    # Only the page rows are hydrated, never the full match set.
+    assert len(hydrations) == 1
+    assert "embedding" not in hydrations[0]
 
 
 def _traced_sql(col, action):

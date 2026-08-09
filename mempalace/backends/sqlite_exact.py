@@ -820,23 +820,55 @@ class SQLiteExactCollection(BaseCollection):
         # match set unordered, then sort and slice in Python — identical
         # rowid-order results either way.
         pushed_page = False
-        if not compiled_clauses:
-            # No-filter scan or Python-fallback scan: the (collection_id)
-            # index yields rowid order without a sort step.
-            sql += "\nORDER BY rowid"
-            if not needs_python_filter and (limit is not None or offset):
-                pushed_page = True
-                if limit is not None:
-                    sql += "\nLIMIT ?"
-                    params.append(int(limit))
-                elif offset:
-                    sql += "\nLIMIT -1"
-                if offset:
-                    sql += "\nOFFSET ?"
-                    params.append(int(offset))
-        rows = cur.execute(sql, params).fetchall()
-        if compiled_clauses:
+        if compiled_clauses and (limit is not None or offset):
+            # Paged filtered read: materializing the full match set costs
+            # ~600 ms on a 110k-row wing before slicing to 10 rows. Fetch
+            # only the rowids (narrow, index-only where possible), take the
+            # page in Python (rowid order), then hydrate just the page rows.
+            cand = [
+                row[0]
+                for row in cur.execute(
+                    "SELECT rowid FROM documents WHERE collection_id = ?"
+                    + "".join(f" AND ({clause})" for clause in compiled_clauses),
+                    params,
+                ).fetchall()
+            ]
+            cand.sort()
+            if offset:
+                cand = cand[offset:]
+            if limit is not None:
+                cand = cand[:limit]
+            rows = []
+            for start in range(0, len(cand), 900):
+                chunk = cand[start : start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    cur.execute(
+                        f"SELECT {select_cols} FROM documents "
+                        f"WHERE collection_id = ? AND rowid IN ({placeholders})",
+                        (collection_id, *chunk),
+                    ).fetchall()
+                )
             rows.sort(key=lambda row: row[0])
+            pushed_page = True
+        else:
+            if not compiled_clauses:
+                # No-filter scan or Python-fallback scan: the (collection_id)
+                # index yields rowid order without a sort step.
+                sql += "\nORDER BY rowid"
+                if not needs_python_filter and (limit is not None or offset):
+                    pushed_page = True
+                    if limit is not None:
+                        sql += "\nLIMIT ?"
+                        params.append(int(limit))
+                    elif offset:
+                        sql += "\nLIMIT -1"
+                    if offset:
+                        sql += "\nOFFSET ?"
+                        params.append(int(offset))
+            rows = cur.execute(sql, params).fetchall()
+            if compiled_clauses:
+                rows.sort(key=lambda row: row[0])
         out = []
         for row in rows:
             doc_id, doc, meta_json = row[1], row[2], row[3]
