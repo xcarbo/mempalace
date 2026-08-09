@@ -5968,6 +5968,38 @@ class TestChunkSpans:
     def test_empty_content_yields_single_empty_chunk(self):
         assert self._spans("", chunk_size=800) == [""]
 
+    def test_below_min_boundary_chunks_keeps_fixed_slice_layout(self):
+        """Boundary snapping on small drawers measured recall-negative
+        (2026-08-09 golden run: 5 → 8 failures with it everywhere) —
+        content under the gate keeps the historical fixed-slice layout,
+        byte-identical to what the pre-boundary chunker stored."""
+        from mempalace.mcp_server import _chunk_spans
+
+        section_a = "# Section A\n" + "alpha content line. " * 30
+        section_b = "# Section B\n" + "beta content line. " * 30
+        content = section_a + "\n" + section_b
+        spans = _chunk_spans(content, 800, min_boundary_chunks=12)
+        assert "".join(spans) == content
+        assert spans == [content[i : i + 800] for i in range(0, len(content), 800)]
+
+    def test_at_min_boundary_chunks_snaps_boundaries(self):
+        """Content spanning at least the gate's chunk count gets the
+        boundary-aware layout (the flagship-roadmap win)."""
+        from mempalace.mcp_server import _chunk_spans
+
+        section_a = "# Section A\n" + "alpha content line. " * 30
+        section_b = "# Section B\n" + "beta content line. " * 30
+        content = section_a + "\n" + section_b  # 2 hard-slice chunks
+        spans = _chunk_spans(content, 800, min_boundary_chunks=2)
+        assert "".join(spans) == content
+        assert any(s.startswith("# Section B\n") for s in spans)
+
+    def test_min_boundary_chunks_zero_is_boundary_everywhere(self):
+        from mempalace.mcp_server import _chunk_spans
+
+        content = ("p" * 500) + "\n\n" + ("q" * 500)
+        assert _chunk_spans(content, 800, min_boundary_chunks=0) == _chunk_spans(content, 800)
+
 
 def test_add_drawer_idempotency_covers_legacy_fixed_slice_rows(
     monkeypatch, config, palace_path, kg
@@ -6015,6 +6047,46 @@ def test_add_drawer_idempotency_covers_legacy_fixed_slice_rows(
     assert col2.count() == len(legacy_ids), "legacy rows must not gain siblings"
 
 
+def test_write_path_treatment_gates_preserve_verbatim(monkeypatch, config, palace_path, kg):
+    """The 2026-08-09 recall fix gates boundary chunking and contextual
+    headers behind min-chunk thresholds (default 16): small drawers keep
+    the historical fixed-slice layout and plain stored-document vectors.
+    Whichever side of the gate content lands on, the stored chunk rows
+    must concatenate back to the caller's bytes exactly, and get-drawer
+    must return them — the foundational verbatim promise."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, col = _get_collection(palace_path, create=True)
+    del _client
+
+    from mempalace.mcp_server import tool_add_drawer, tool_get_drawer
+
+    assert config.chunk_boundary_min_chunks == 16  # documented default
+
+    # Under the gate (~3 hard chunks): fixed-slice layout, verbatim.
+    small = "# Small doc\n" + "alpha beta gamma delta epsilon. " * 70  # ~2.2k chars
+    res = tool_add_drawer(wing="w", room="r", content=small)
+    assert res["success"] is True
+    rows = col.get(ids=res["chunk_ids"], include=["documents"])
+    docs = [d for _, d in sorted(zip(rows["ids"], rows["documents"]))]
+    assert docs == [small[i : i + 800] for i in range(0, len(small), 800)]
+    got = tool_get_drawer(drawer_id=res["drawer_id"])
+    assert got.get("content") == small
+
+    # Over the gate (>= 16 hard chunks): boundary-aware layout, verbatim.
+    big = ("# Section head\n" + "body text line for the section. " * 20 + "\n") * 22
+    assert len(big) > 16 * 800
+    res_big = tool_add_drawer(wing="w", room="r", content=big)
+    assert res_big["success"] is True
+    rows_big = col.get(ids=res_big["chunk_ids"], include=["documents"])
+    docs_big = [d for _, d in sorted(zip(rows_big["ids"], rows_big["documents"]))]
+    assert "".join(docs_big) == big
+    assert docs_big != [big[i : i + 800] for i in range(0, len(big), 800)], (
+        "over-gate content should get the boundary-aware layout"
+    )
+    got_big = tool_get_drawer(drawer_id=res_big["drawer_id"])
+    assert got_big.get("content") == big
+
+
 def test_add_drawer_contextual_headers_keep_stored_content_verbatim(
     monkeypatch, config, palace_path, kg
 ):
@@ -6050,6 +6122,10 @@ def test_add_drawer_contextual_headers_change_the_vector(monkeypatch, config, pa
     """The chunk vector must be the embedding of the header-prefixed text,
     not of the bare stored chunk — otherwise the feature is a no-op."""
     pytest.importorskip("onnxruntime")
+    # This doc is 3 chunks — under the min-chunks gate (default 16) headers
+    # would rightly be skipped. Zero the gate: the subject here is the header
+    # mechanism itself, not the gate (which has its own tests).
+    monkeypatch.setenv("MEMPALACE_EMBED_CONTEXT_HEADERS_MIN_CHUNKS", "0")
     _patch_mcp_server(monkeypatch, config, kg)
     _client, _col = _get_collection(palace_path, create=True)
     del _client

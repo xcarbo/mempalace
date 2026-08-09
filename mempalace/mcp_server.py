@@ -2587,7 +2587,7 @@ def _collapse_drawer_rows(ids, documents, metadatas):
 _CHUNK_HEADING_RX = re.compile(r"\n(?=#{1,6} )")
 
 
-def _chunk_spans(content: str, chunk_size: int) -> list:
+def _chunk_spans(content: str, chunk_size: int, min_boundary_chunks: int = 0) -> list:
     """Partition ``content`` into chunks of at most ``chunk_size`` chars.
 
     The chunks CONCATENATE BACK TO ``content`` byte-identically — get-drawer
@@ -2603,10 +2603,22 @@ def _chunk_spans(content: str, chunk_size: int) -> list:
     ``content[i : i + chunk_size]``: the canonical roadmap drawer became 23
     anonymous mid-table windows, which is why its exact-search ranks spanned
     91→108,768.
+
+    ``min_boundary_chunks`` gates the boundary snapping (callers pass
+    ``MempalaceConfig.chunk_boundary_min_chunks``): content whose hard-slice
+    chunk count is below it keeps the historical fixed-slice layout.
+    Boundary snapping on SMALL drawers was measured recall-negative on the
+    2026-08-09 golden run (5 → 8 failures) — their chunks are already
+    self-contained, and re-splitting moves concentrated matches into
+    diluted windows. 0 applies boundary snapping to everything.
     """
     chunk_size = max(1, int(chunk_size or 1))
     if content == "":
         return [""]
+
+    hard_slice_chunks = -(-len(content) // chunk_size)  # ceil division
+    if hard_slice_chunks < max(0, int(min_boundary_chunks or 0)):
+        return [content[i : i + chunk_size] for i in range(0, len(content), chunk_size)]
 
     spans = []
     n = len(content)
@@ -2648,6 +2660,14 @@ def _chunk_spans(content: str, chunk_size: int) -> list:
     return spans
 
 
+def _chunk_boundary_min_chunks() -> int:
+    """The configured boundary-snap gate, fail-open to 0 (always snap)."""
+    try:
+        return int(getattr(_config, "chunk_boundary_min_chunks", 0) or 0)
+    except Exception:
+        return 0
+
+
 def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int):
     base_meta = _safe_meta(meta)
     base_meta.pop("chunk_index", None)
@@ -2657,7 +2677,9 @@ def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int)
     chunk_docs = []
     chunk_metas = []
 
-    for chunk_index, chunk_doc in enumerate(_chunk_spans(content, chunk_size)):
+    for chunk_index, chunk_doc in enumerate(
+        _chunk_spans(content, chunk_size, _chunk_boundary_min_chunks())
+    ):
         chunk_ids.append(f"{drawer_id}_chunk_{chunk_index:06d}")
         chunk_docs.append(chunk_doc)
 
@@ -3873,7 +3895,9 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         chunk_ids: list[str] = []
         chunk_docs: list[str] = []
         chunk_metas: list[dict] = []
-        for chunk_idx, chunk_doc in enumerate(_chunk_spans(entry, chunk_size)):
+        for chunk_idx, chunk_doc in enumerate(
+            _chunk_spans(entry, chunk_size, _chunk_boundary_min_chunks())
+        ):
             chunk_ids.append(f"{entry_id}_chunk_{chunk_idx:06d}")
             chunk_docs.append(chunk_doc)
             chunk_metas.append(
