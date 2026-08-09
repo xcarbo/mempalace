@@ -399,7 +399,7 @@ def test_palace_wrapper_embeds_for_sqlite_exact(tmp_path, monkeypatch):
     monkeypatch.setattr(
         embedding_wrapper,
         "_embed_texts",
-        lambda texts: [[float(len(text)), 1.0] for text in texts],
+        lambda texts, is_query=False: [[float(len(text)), 1.0] for text in texts],
     )
 
     col = get_collection(str(tmp_path), create=True)
@@ -482,7 +482,7 @@ def test_search_union_uses_sqlite_exact_lexical_search(tmp_path, monkeypatch):
     from mempalace.palace import get_collection
     from mempalace.searcher import search_memories
 
-    def fake_embed(texts):
+    def fake_embed(texts, is_query=False):
         vectors = []
         for text in texts:
             if text == "rareterm":

@@ -7,14 +7,24 @@ from typing import Optional
 from .base import BaseCollection
 
 
-def _embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed ``texts`` with the configured local embedding function."""
+def _embed_texts(texts: list[str], is_query: bool = False) -> list[list[float]]:
+    """Embed ``texts`` with the configured local embedding function.
+
+    ``is_query=True`` routes through the EF's ``embed_query`` so models with
+    asymmetric query/document prompts (bge-small) embed queries correctly —
+    the same query/document split chromadb ≥1.5.9 applies natively. For
+    symmetric models (minilm, embeddinggemma) ``embed_query`` aliases
+    ``__call__``, so this is behavior-neutral.
+    """
     if not texts:
         return []
     from ..embedding import get_embedding_function
 
     ef = get_embedding_function()
-    vectors = ef(input=texts)
+    if is_query and hasattr(ef, "embed_query"):
+        vectors = ef.embed_query(input=texts)
+    else:
+        vectors = ef(input=texts)
     return [list(v) for v in vectors]
 
 
@@ -114,7 +124,7 @@ class EmbeddingCollection(BaseCollection):
         include: Optional[list[str]] = None,
     ):
         if query_texts is not None and query_embeddings is None:
-            query_embeddings = _embed_texts(_as_list(query_texts))
+            query_embeddings = _embed_texts(_as_list(query_texts), is_query=True)
             query_texts = None
         return self._inner.query(
             query_texts=query_texts,
