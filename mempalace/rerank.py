@@ -1,11 +1,19 @@
-"""Opt-in local re-ranking of search hits via an embeddings endpoint.
+"""Opt-in local re-scoring of search hits via an embeddings endpoint.
 
 Second-stage retrieval: the palace's first stage (minilm vectors + BM25
 hybrid) over-fetches candidates; when enabled, this module re-scores the
 deduped pool against the query with a stronger *local* embedding model
-(e.g. nomic-embed via LM Studio at :1234) and reorders before the final
-cut. Cross-encoder-style precision without any cloud call — the endpoint
-must be one the user runs themselves.
+(e.g. nomic-embed via LM Studio at :1234). The scores do NOT replace the
+first-stage ranking — the searcher BLENDS them with the fused
+vector+BM25 score and re-applies the archive demotion afterwards
+(:func:`mempalace.searcher._blend_rerank`).
+
+That blend is a measured correction, not a style choice: the original
+implementation sorted the pool by raw bi-encoder cosine alone, discarding
+both the fused score and the archive demotion, and made recall WORSE on
+the 300-case eval (R@5 0.907→0.847, MRR 0.809→0.687, p50 227→902 ms;
+hurt 20 cases, rescued 2 — measured 2026-08-08). A second-stage signal
+may only ever be one voice among the lanes, never the whole ranking.
 
 Off by default; enable by setting both:
 
@@ -13,8 +21,8 @@ Off by default; enable by setting both:
     MEMPALACE_RERANK_MODEL  e.g. text-embedding-nomic-embed-text-v1.5@f32
 
 Fail-soft by contract: any error — endpoint down, timeout, bad payload —
-returns the hits in their original order. Search never degrades because
-the reranker is unavailable; it only ever improves ordering.
+leaves the hits unscored, and the searcher keeps first-stage order.
+Search never breaks because the reranker is unavailable.
 
 Nomic-style task prefixes ("search_query: " / "search_document: ") are
 applied; models that don't use them tolerate them harmlessly.
@@ -73,17 +81,17 @@ def _cosine(a: list, b: list) -> float:
     return dot / (na * nb)
 
 
-def maybe_rerank(query: str, hits: list) -> list:
-    """Reorder ``hits`` by local-embedder relevance to ``query``.
+def annotate_rerank_scores(query: str, pool: list) -> bool:
+    """Score each hit in ``pool`` against ``query`` with the local embedder.
 
-    No-op unless enabled. Only the first MAX_RERANK_POOL hits are
-    re-scored; the tail keeps its first-stage order behind them. Each
-    re-scored hit gains a ``rerank_score`` field for transparency.
+    Adds a ``rerank_score`` field (cosine in the rerank model's space) to
+    every hit; does NOT reorder anything — ordering is the searcher's job,
+    which blends this signal with the first-stage fused score. Returns
+    ``True`` when every hit was scored, ``False`` on any failure (in which
+    case no hit ordering may rely on ``rerank_score`` being present).
     """
-    if not rerank_enabled() or not hits or not query:
-        return hits
-    pool = hits[:MAX_RERANK_POOL]
-    tail = hits[MAX_RERANK_POOL:]
+    if not rerank_enabled() or not pool or not query:
+        return False
     try:
         texts = ["search_query: " + query] + [
             "search_document: " + (h.get("text") or "")[:MAX_TEXT_CHARS] for h in pool
@@ -94,9 +102,7 @@ def maybe_rerank(query: str, hits: list) -> list:
             raise ValueError(f"embedding count mismatch: {len(dvecs)} != {len(pool)}")
         for h, dvec in zip(pool, dvecs):
             h["rerank_score"] = round(_cosine(qvec, dvec), 4)
-        # Stable sort: equal scores keep first-stage order.
-        pool = sorted(pool, key=lambda h: -h["rerank_score"])
-        return pool + tail
+        return True
     except Exception:
-        logger.debug("rerank failed (non-fatal); keeping first-stage order", exc_info=True)
-        return hits
+        logger.debug("rerank scoring failed (non-fatal); keeping first-stage order", exc_info=True)
+        return False

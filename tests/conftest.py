@@ -122,6 +122,13 @@ _AMBIENT_VARS_TO_SCRUB = (
     "MEMPALACE_OUTBOX_URL",
     "MEMPALACE_OUTBOX_SECRET",
     "MEMPALACE_OUTBOX_WINGS",
+    # Ranking behavior — an exported fusion/blend override silently re-scores
+    # every ranking assertion, exactly like the rerank leak did.
+    "MEMPALACE_FUSION",
+    "MEMPALACE_RRF_K",
+    "MEMPALACE_RERANK_BLEND",
+    "MEMPALACE_ARCHIVE_WINGS",
+    "MEMPALACE_ARCHIVE_RANK_PENALTY",
 )
 
 

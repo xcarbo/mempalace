@@ -369,3 +369,156 @@ def test_archive_wings_env_accepts_a_list(monkeypatch):
 
     monkeypatch.setenv("MEMPALACE_ARCHIVE_WINGS", "sessions, diary ,")
     assert archive_wings() == {"sessions", "diary"}
+
+
+# ── fusion mode: RRF vs weighted (MEMPALACE_FUSION) ──────────────────────────
+
+
+def test_fusion_mode_defaults_to_weighted_and_rejects_nonsense(monkeypatch):
+    from mempalace.searcher import fusion_mode
+
+    monkeypatch.delenv("MEMPALACE_FUSION", raising=False)
+    assert fusion_mode() == "weighted"
+    monkeypatch.setenv("MEMPALACE_FUSION", "banana")
+    assert fusion_mode() == "weighted"
+    monkeypatch.setenv("MEMPALACE_FUSION", "rrf")
+    assert fusion_mode() == "rrf"
+
+
+def test_rrf_k_env_parses_and_rejects_nonsense(monkeypatch):
+    from mempalace.searcher import RRF_K_DEFAULT, _rrf_k
+
+    monkeypatch.delenv("MEMPALACE_RRF_K", raising=False)
+    assert _rrf_k() == RRF_K_DEFAULT
+    for bad in ("banana", "0", "-5"):
+        monkeypatch.setenv("MEMPALACE_RRF_K", bad)
+        assert _rrf_k() == RRF_K_DEFAULT
+    monkeypatch.setenv("MEMPALACE_RRF_K", "10")
+    assert _rrf_k() == 10
+
+
+def test_rrf_ranks_dual_lane_candidate_above_single_lane_ones(monkeypatch):
+    """Under RRF a candidate present in BOTH lanes must beat candidates that
+    only one lane found, even when each of those leads its own lane."""
+    from mempalace.searcher import _hybrid_rank
+
+    monkeypatch.setenv("MEMPALACE_FUSION", "rrf")
+    results = [
+        # A: vector rank 2 AND bm25 rank 1.
+        {"text": "alpha beta alpha beta", "distance": 0.5, "wing": "w"},
+        # B: vector rank 1 only (no lexical overlap with the query).
+        {"text": "unrelated words entirely", "distance": 0.2, "wing": "w"},
+        # C: lexical-only (union lane), bm25 rank 2, no vector distance.
+        {"text": "alpha beta", "distance": None, "wing": "w"},
+    ]
+    ranked = _hybrid_rank(results, "alpha beta")
+    assert [r["text"] for r in ranked] == [
+        "alpha beta alpha beta",
+        "unrelated words entirely",
+        "alpha beta",
+    ]
+
+
+def test_rrf_applies_archive_demotion_as_multiplier(monkeypatch):
+    """The archive demotion must survive the fusion swap: a sessions-wing
+    candidate that narrowly leads both lanes loses to a close curated
+    second under the x0.75 multiplier."""
+    from mempalace.searcher import _hybrid_rank
+
+    monkeypatch.setenv("MEMPALACE_FUSION", "rrf")
+    results = [
+        {"text": "alpha beta alpha beta", "distance": 0.2, "wing": "sessions"},
+        {"text": "alpha beta alpha", "distance": 0.3, "wing": "mempalace"},
+    ]
+    ranked = _hybrid_rank(results, "alpha beta")
+    assert ranked[0]["wing"] == "mempalace"
+    assert ranked[1].get("archive_demoted") is True
+
+
+def test_weighted_mode_is_unchanged_by_default(monkeypatch):
+    """With MEMPALACE_FUSION unset the historical convex combination must
+    keep ranking exactly as before (guard against RRF becoming a silent
+    default)."""
+    from mempalace.searcher import _hybrid_rank
+
+    monkeypatch.delenv("MEMPALACE_FUSION", raising=False)
+    results = [
+        {"text": "unrelated words entirely", "distance": 0.1, "wing": "w"},
+        {"text": "alpha beta alpha beta", "distance": 1.4, "wing": "w"},
+    ]
+    ranked = _hybrid_rank(results, "alpha beta")
+    # weighted: doc1 = 0.6*0.9 = 0.54; doc2 = 0.6*(1-1.4=0 -> 0) + 0.4*1.0 = 0.4
+    assert ranked[0]["text"] == "unrelated words entirely"
+
+
+# ── second-stage rerank blend (_blend_rerank) ────────────────────────────────
+
+
+def _annotate_with(scores):
+    """Patchable annotate_rerank_scores stand-in assigning fixed scores."""
+
+    def _annotate(query, pool):
+        for h, s in zip(pool, scores):
+            h["rerank_score"] = s
+        return True
+
+    return _annotate
+
+
+def test_blend_keeps_fused_winner_when_rerank_disagrees_mildly(monkeypatch):
+    """The rerank signal is one voice, not the whole ranking: sorting by raw
+    rerank cosine alone would flip H1/H2 here; the 50/50 blend must not."""
+    from mempalace import searcher as searcher_mod
+
+    hits = [
+        {"text": "H1", "_fused_raw": 1.0, "wing": "w"},
+        {"text": "H2", "_fused_raw": 0.5, "wing": "w"},
+        {"text": "H3", "_fused_raw": 0.0, "wing": "w"},
+    ]
+    monkeypatch.setattr(
+        searcher_mod, "annotate_rerank_scores", _annotate_with([0.80, 0.85, 0.0])
+    )
+    out = searcher_mod._blend_rerank("q", hits)
+    assert [h["text"] for h in out] == ["H1", "H2", "H3"]
+
+
+def test_blend_reapplies_archive_demotion_after_reranking(monkeypatch):
+    """The old reranker discarded the archive demotion inside the reranked
+    head (measured: R@5 0.907->0.847). The blend must re-apply it: an
+    archive drawer leading both signals loses to a near-tied curated one."""
+    from mempalace import searcher as searcher_mod
+
+    hits = [
+        {"text": "ARCH", "_fused_raw": 1.0, "wing": "sessions"},
+        {"text": "CUR", "_fused_raw": 0.98, "wing": "mempalace"},
+        {"text": "PAD", "_fused_raw": 0.0, "wing": "mempalace"},
+    ]
+    monkeypatch.setattr(
+        searcher_mod, "annotate_rerank_scores", _annotate_with([1.0, 0.98, 0.0])
+    )
+    out = searcher_mod._blend_rerank("q", hits)
+    assert [h["text"] for h in out] == ["CUR", "ARCH", "PAD"]
+
+
+def test_blend_fails_soft_to_first_stage_order(monkeypatch):
+    from mempalace import searcher as searcher_mod
+
+    hits = [
+        {"text": "A", "_fused_raw": 1.0, "wing": "w"},
+        {"text": "B", "_fused_raw": 0.5, "wing": "w"},
+    ]
+    monkeypatch.setattr(searcher_mod, "annotate_rerank_scores", lambda q, p: False)
+    out = searcher_mod._blend_rerank("q", hits)
+    assert [h["text"] for h in out] == ["A", "B"]
+
+
+def test_blend_weight_env_parses_and_rejects_nonsense(monkeypatch):
+    from mempalace.searcher import RERANK_BLEND_DEFAULT, _rerank_blend_weight
+
+    monkeypatch.delenv("MEMPALACE_RERANK_BLEND", raising=False)
+    assert _rerank_blend_weight() == RERANK_BLEND_DEFAULT
+    for bad in ("banana", "-0.1", "1.5"):
+        monkeypatch.setenv("MEMPALACE_RERANK_BLEND", bad)
+        assert _rerank_blend_weight() == RERANK_BLEND_DEFAULT
+    monkeypatch.setenv("MEMPALACE_RERANK_BLEND", "0.3")
+    assert _rerank_blend_weight() == 0.3

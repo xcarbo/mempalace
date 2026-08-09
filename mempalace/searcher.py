@@ -24,7 +24,7 @@ from .backends import (
     UnsupportedCapabilityError,
 )
 from .config import sqlite_read_uri
-from .rerank import MAX_RERANK_POOL, maybe_rerank, rerank_enabled
+from .rerank import MAX_RERANK_POOL, annotate_rerank_scores, rerank_enabled
 from .retrieval_log import log_retrieval
 from .palace import (
     _open_collection_or_explain,
@@ -231,6 +231,86 @@ def _metric_for_collection(col) -> str:
     return metric if metric in ("cosine", "l2", "ip") else "cosine"
 
 
+FUSION_MODE_ENV = "MEMPALACE_FUSION"
+FUSION_MODE_DEFAULT = "weighted"
+RRF_K_ENV = "MEMPALACE_RRF_K"
+RRF_K_DEFAULT = 60
+
+
+def fusion_mode() -> str:
+    """How the vector and BM25 lanes are fused into one score.
+
+    * ``"weighted"`` (default) — convex combination
+      ``0.6*vector_sim + 0.4*bm25_minmax``. The historical behavior.
+    * ``"rrf"`` — Reciprocal Rank Fusion: ``Σ_lane 1/(k + rank_lane)`` with
+      ``k`` from ``MEMPALACE_RRF_K`` (default 60). Rank-based, so the two
+      lanes' incomparable score scales never mix.
+
+    A/B'd on the 300-case eval 2026-08-09; see rerank/fusion measurements
+    in the memaudit2 report. Unknown values fall back to the default
+    loudly (warning) rather than silently changing ranking behavior.
+    """
+    raw = os.environ.get(FUSION_MODE_ENV, "").strip().lower()
+    if not raw:
+        return FUSION_MODE_DEFAULT
+    if raw not in ("weighted", "rrf"):
+        logger.warning("Invalid %s=%r; using %s", FUSION_MODE_ENV, raw, FUSION_MODE_DEFAULT)
+        return FUSION_MODE_DEFAULT
+    return raw
+
+
+def _rrf_k() -> int:
+    """RRF's k constant; larger flattens the rank curve. Default 60."""
+    raw = os.environ.get(RRF_K_ENV, "").strip()
+    if not raw:
+        return RRF_K_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", RRF_K_ENV, raw, RRF_K_DEFAULT)
+        return RRF_K_DEFAULT
+    return value if value > 0 else RRF_K_DEFAULT
+
+
+def _rrf_base_scores(results: list, bm25_raw: list) -> list:
+    """Reciprocal-rank-fused base scores for the candidate pool.
+
+    Two lanes. The vector lane ranks candidates carrying a backend distance
+    (ascending); a ``distance=None`` candidate is *not in* the vector lane
+    and simply gets no contribution from it — no imputation needed, which
+    removes the weighted mode's "not measured vs maximally far" problem by
+    construction. The BM25 lane ranks candidates with non-zero local BM25;
+    a zero-BM25 candidate has no lexical evidence and is not in that lane.
+    Ties share the better rank so equal-scored candidates fuse equally.
+    """
+    k = _rrf_k()
+    n = len(results)
+    fused = [0.0] * n
+
+    in_vector = [
+        (i, results[i].get("distance")) for i in range(n) if results[i].get("distance") is not None
+    ]
+    in_vector.sort(key=lambda p: p[1])
+    rank = 0
+    prev = None
+    for pos, (i, dist) in enumerate(in_vector):
+        if prev is None or dist != prev:
+            rank = pos
+            prev = dist
+        fused[i] += 1.0 / (k + rank + 1)
+
+    in_bm25 = [(i, bm25_raw[i]) for i in range(n) if bm25_raw[i] > 0.0]
+    in_bm25.sort(key=lambda p: -p[1])
+    rank = 0
+    prev = None
+    for pos, (i, score) in enumerate(in_bm25):
+        if prev is None or score != prev:
+            rank = pos
+            prev = score
+        fused[i] += 1.0 / (k + rank + 1)
+    return fused
+
+
 def _hybrid_rank(
     results: list,
     query: str,
@@ -238,24 +318,33 @@ def _hybrid_rank(
     bm25_weight: float = 0.4,
     metric: str = "cosine",
 ) -> list:
-    """Re-rank ``results`` by a convex combination of vector similarity and BM25.
+    """Re-rank ``results`` by fusing vector similarity and BM25.
 
-    * Vector similarity is derived from each candidate's backend-reported
-      ``distance`` via :func:`_distance_to_similarity`, interpreted in the
-      collection's declared ``metric`` (per RFC 001) rather than assuming
-      cosine. Absolute (not relative-to-max) means adding/removing a
-      candidate can't reshuffle the others.
-    * BM25 is real Okapi-BM25 with corpus-relative IDF over the candidates
-      themselves. Since the absolute scale is unbounded, BM25 is min-max
-      normalized within the candidate set so weights are commensurable.
+    Fusion is selected by :func:`fusion_mode`:
+
+    * ``"weighted"`` (default) — convex combination:
+
+      - Vector similarity is derived from each candidate's backend-reported
+        ``distance`` via :func:`_distance_to_similarity`, interpreted in the
+        collection's declared ``metric`` (per RFC 001) rather than assuming
+        cosine. Absolute (not relative-to-max) means adding/removing a
+        candidate can't reshuffle the others.
+      - BM25 is real Okapi-BM25 with corpus-relative IDF over the candidates
+        themselves. Since the absolute scale is unbounded, BM25 is min-max
+        normalized within the candidate set so weights are commensurable.
+
+    * ``"rrf"`` — Reciprocal Rank Fusion over the two lanes' *ranks*
+      (:func:`_rrf_base_scores`), sidestepping the incomparable-scales
+      problem entirely.
 
     Candidates with ``distance=None`` are treated as vector-unknown
     (no vector signal available) and scored on BM25 contribution alone.
     Used by candidate-union mode to merge BM25-only candidates that the
     vector index didn't surface.
 
-    Mutates each result dict to add ``bm25_score`` and reorders the list
-    in place. Returns the same list for convenience.
+    Mutates each result dict to add ``bm25_score`` (plus internal
+    ``_fused_raw``/``_fused_score`` used by the second-stage rerank blend)
+    and reorders the list in place. Returns the same list for convenience.
     """
     if not results:
         return results
@@ -288,17 +377,23 @@ def _hybrid_rank(
     ]
     imputed_sim = min(known) * 0.999 if known else 0.0
 
+    rrf_base = _rrf_base_scores(results, bm25_raw) if fusion_mode() == "rrf" else None
+
     archive = archive_wings()
     penalty = archive_rank_penalty()
     scored = []
-    for r, raw, norm in zip(results, bm25_raw, bm25_norm):
+    for idx, (r, raw, norm) in enumerate(zip(results, bm25_raw, bm25_norm)):
         vec_sim = (
             imputed_sim
             if r.get("distance") is None
             else _distance_to_similarity(r.get("distance"), metric)
         )
         r["bm25_score"] = round(raw, 3)
-        score = vector_weight * vec_sim + bm25_weight * norm
+        if rrf_base is not None:
+            score = rrf_base[idx]
+        else:
+            score = vector_weight * vec_sim + bm25_weight * norm
+        r["_fused_raw"] = score
         # Attenuate, never exclude (decision f6639c96). An archive drawer that
         # is clearly the best answer still wins; one that merely ties a curated
         # drawer no longer takes the slot. This is the whole "dim" state: a
@@ -307,6 +402,7 @@ def _hybrid_rank(
         if archive and penalty < 1.0 and r.get("wing") in archive:
             score *= penalty
             r["archive_demoted"] = True
+        r["_fused_score"] = score
         scored.append((score, r))
 
     # Break exact score ties toward the more recently authored drawer so equal-score
@@ -1203,6 +1299,82 @@ def _apply_candidate_strategy(
     )
 
 
+RERANK_BLEND_ENV = "MEMPALACE_RERANK_BLEND"
+RERANK_BLEND_DEFAULT = 0.5
+
+
+def _rerank_blend_weight() -> float:
+    """Weight of the rerank signal in the blended score, in [0, 1].
+
+    0 ignores the reranker entirely, 1 reproduces the old (measured
+    harmful) sort-by-rerank-alone behavior. Out-of-range or unparseable
+    values fall back to the default rather than silently disabling.
+    """
+    raw = os.environ.get(RERANK_BLEND_ENV, "").strip()
+    if not raw:
+        return RERANK_BLEND_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.2f", RERANK_BLEND_ENV, raw, RERANK_BLEND_DEFAULT)
+        return RERANK_BLEND_DEFAULT
+    if not 0.0 <= value <= 1.0:
+        logger.warning(
+            "%s=%r out of range [0, 1]; using %.2f", RERANK_BLEND_ENV, raw, RERANK_BLEND_DEFAULT
+        )
+        return RERANK_BLEND_DEFAULT
+    return value
+
+
+def _minmax_norm(values: list) -> list:
+    """Min-max normalize to [0, 1]; a constant list maps to all zeros."""
+    lo, hi = min(values), max(values)
+    if hi - lo <= 1e-12:
+        return [0.0] * len(values)
+    return [(v - lo) / (hi - lo) for v in values]
+
+
+def _blend_rerank(query: str, hits: list) -> list:
+    """Second-stage rerank as a BLENDED signal, never a replacement.
+
+    The original reranker sorted the pool by raw bi-encoder cosine alone,
+    discarding both the fused vector+BM25 score and the archive demotion.
+    Measured on the 300-case eval (2026-08-08) it made recall worse:
+    R@5 0.907→0.847, MRR 0.809→0.687, hurt 20 cases / rescued 2.
+
+    Here instead: min-max normalize the rerank cosine and the PRE-demotion
+    fused score within the pool (making the two scales commensurable),
+    combine them at ``MEMPALACE_RERANK_BLEND`` (default 0.5), then re-apply
+    the archive demotion multiplier to the blended score — so turning the
+    reranker on can no longer un-demote the archive. Hits beyond
+    MAX_RERANK_POOL keep first-stage order behind the pool. Fail-soft: if
+    scoring fails, first-stage order is returned untouched.
+    """
+    pool = hits[:MAX_RERANK_POOL]
+    tail = hits[MAX_RERANK_POOL:]
+    if not annotate_rerank_scores(query, pool):
+        return hits
+    rerank_norm = _minmax_norm([h["rerank_score"] for h in pool])
+    fused_norm = _minmax_norm([h.get("_fused_raw", 0.0) for h in pool])
+    weight = _rerank_blend_weight()
+    archive = archive_wings()
+    penalty = archive_rank_penalty()
+    scored = []
+    for h, rr, fu in zip(pool, rerank_norm, fused_norm):
+        blended = weight * rr + (1.0 - weight) * fu
+        if archive and penalty < 1.0 and h.get("wing") in archive:
+            blended *= penalty
+        scored.append((blended, h))
+    scored.sort(
+        key=lambda pair: (
+            pair[0],
+            pair[1].get("authored_at") or pair[1].get("metadata", {}).get("authored_at") or "",
+        ),
+        reverse=True,
+    )
+    return [h for _, h in scored] + tail
+
+
 def _finalize_candidate_hits(
     *,
     candidate_strategy: str,
@@ -1255,13 +1427,19 @@ def _finalize_candidate_hits(
 
     ranked = _hybrid_rank(hits, query, metric=_metric_for_collection(drawers_col))
     # Optional second-stage rerank on the deduped pool (opt-in, local,
-    # fail-soft — see mempalace/rerank.py), then the final cut.
-    hits = maybe_rerank(query, _dedupe_by_drawer_id(ranked))[:n_results]
+    # fail-soft — see mempalace/rerank.py). Blended with the fused score,
+    # never a replacement for it; see _blend_rerank. Then the final cut.
+    deduped = _dedupe_by_drawer_id(ranked)
+    if rerank_enabled():
+        deduped = _blend_rerank(query, deduped)
+    hits = deduped[:n_results]
     for h in hits:
         h.pop("_sort_key", None)
         h.pop("_source_file_full", None)
         h.pop("_chunk_index", None)
         h.pop("_parent_drawer_id", None)
+        h.pop("_fused_raw", None)
+        h.pop("_fused_score", None)
     return hits, None, lexical_lane
 
 
