@@ -262,7 +262,7 @@ def test_palace_wrapper_embeds_for_milvus(tmp_path, monkeypatch):
     monkeypatch.setattr(
         embedding_wrapper,
         "_embed_texts",
-        lambda texts: [[1.0, 0.0] for _ in texts],
+        lambda texts, is_query=False: [[1.0, 0.0] for _ in texts],
     )
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "milvus")
     monkeypatch.setenv("MEMPALACE_BACKEND", "milvus")

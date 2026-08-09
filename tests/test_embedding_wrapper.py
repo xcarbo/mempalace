@@ -50,8 +50,9 @@ def _patch_embed(monkeypatch):
     """Stub the embedder: one vector per input text, recording the inputs."""
     seen = {}
 
-    def fake(texts):
+    def fake(texts, is_query=False):
         seen["texts"] = texts
+        seen["is_query"] = is_query
         return [[0.0, 0.0] for _ in texts]
 
     monkeypatch.setattr(ew, "_embed_texts", fake)
@@ -103,6 +104,37 @@ def test_query_wraps_bare_string(monkeypatch):
     # query_texts is consumed into a single query embedding
     assert len(inner.calls["query"]["query_embeddings"]) == 1
     assert inner.calls["query"]["query_texts"] is None
+
+
+def test_query_routes_through_embed_query(monkeypatch):
+    """Queries must take the EF's query path so asymmetric-prompt models
+    (bge-small) prefix them; documents must not."""
+    seen = _patch_embed(monkeypatch)
+    inner = _FakeInner()
+    col = ew.EmbeddingCollection(inner)
+    col.query(query_texts=["find me"])
+    assert seen["is_query"] is True
+    col.add(documents=["store me"], ids=["d1"])
+    assert seen["is_query"] is False
+
+
+def test_embed_texts_uses_ef_embed_query(monkeypatch):
+    """_embed_texts(is_query=True) must call the EF's embed_query, not __call__."""
+    calls = []
+
+    class _AsymmetricEF:
+        def __call__(self, input):  # noqa: A002 — ChromaDB EF protocol
+            calls.append(("doc", input))
+            return [[0.0] for _ in input]
+
+        def embed_query(self, input):  # noqa: A002
+            calls.append(("query", input))
+            return [[0.0] for _ in input]
+
+    monkeypatch.setattr("mempalace.embedding.get_embedding_function", lambda: _AsymmetricEF())
+    ew._embed_texts(["q"], is_query=True)
+    ew._embed_texts(["d"])
+    assert calls == [("query", ["q"]), ("doc", ["d"])]
 
 
 def test_list_inputs_unaffected(monkeypatch):

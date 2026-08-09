@@ -3,7 +3,7 @@
 Returns a ChromaDB-compatible embedding function bound to a user-selected
 ONNX Runtime execution provider.
 
-Two embedding models are available, selected via ``MEMPALACE_EMBEDDING_MODEL``
+Three embedding models are available, selected via ``MEMPALACE_EMBEDDING_MODEL``
 or ``embedding_model`` in ``~/.mempalace/config.json``:
 
 * ``minilm`` (default) — ``all-MiniLM-L6-v2``, 384-dim, English-only training.
@@ -15,6 +15,17 @@ or ``embedding_model`` in ``~/.mempalace/config.json``:
   model is lazy-downloaded from HuggingFace on first use. Switching models
   on an existing palace requires ``mempalace repair rebuild-index``
   (different vector space).
+* ``bge-small`` — ``Xenova/bge-small-en-v1.5`` (fp32), native 384-dim,
+  English retrieval-tuned with asymmetric query/document prompts. The small/
+  fast upgrade candidate from the 2026-08-09 embedder A/B (~130 MB, see
+  docs/embedder-migration.md); same rebuild-index requirement when switching.
+* ``nomic`` — ``nomic-ai/nomic-embed-text-v1.5`` (fp32), 768-dim Matryoshka
+  output truncated to 384 (drop-in width), 2048-token context, asymmetric
+  search prefixes. The strongest retrieval candidate in the 2026-08-09 A/B;
+  ~550 MB download. Same rebuild-index requirement when switching.
+
+All models run in-process via ONNX Runtime — no service, no daemon, no
+network at query time; weights download once from Hugging Face and cache.
 
 Supported devices (env ``MEMPALACE_EMBEDDING_DEVICE`` or ``embedding_device``
 in ``~/.mempalace/config.json``):
@@ -360,6 +371,335 @@ class EmbeddinggemmaONNX:
         return self(input)
 
 
+# bge-small-en-v1.5 ONNX (fp32) — English retrieval-tuned, native 384 dims so
+# it drops into minilm-shaped collections without a schema change. The
+# small/fast tier of the 2026-08-09 embedder A/B
+# (.reports/mempalace-audit/embedder-ab/): R@1 .355→.423, R@10 .696→.816 over
+# minilm on the 300-case eval set (pool-rerank, upper bound) at ~130 MB and
+# roughly twice nomic's embed speed; nomic beats it on recall. Asymmetric
+# retrieval prompts: documents are embedded bare, queries carry the BGE
+# instruction prefix — chromadb ≥1.5.9 routes queries through embed_query()
+# and documents through __call__, which is exactly the split implemented here.
+_BGE_REPO = "Xenova/bge-small-en-v1.5"
+_BGE_ONNX = "onnx/model.onnx"
+_BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+_BGE_DIM = 384
+# BERT position-embedding limit; longer inputs are truncated by the tokenizer.
+_BGE_MAX_LEN = 512
+# Same repair-scale batching rationale as _EMBEDDINGGEMMA_BATCH_SIZE (#1770):
+# attention buffers grow with batch x len^2, so the session only ever sees a
+# bounded sub-batch.
+_BGE_BATCH_SIZE = 32
+
+
+class BgeSmallONNX:
+    """ChromaDB-compatible EF using bge-small-en-v1.5 ONNX (fp32, 384d).
+
+    English-only, retrieval-tuned (CLS pooling + instruction-prefixed
+    queries). Native 384-dim output — the same vector width as MiniLM, so no
+    schema change — but a different vector space: switching an existing
+    palace still requires a full re-embed via ``mempalace repair
+    rebuild-index`` (see docs/embedder-migration.md).
+
+    Queries and documents are embedded differently on purpose:
+    ``embed_query`` prepends the BGE retrieval instruction, ``__call__`` and
+    ``embed_documents`` embed the text bare. Callers comparing documents to
+    documents (e.g. dedup) should use the document path for both sides.
+    """
+
+    @staticmethod
+    def name() -> str:
+        # ChromaDB persists this on the collection and refuses reads with a
+        # mismatched EF — that's the signal that forces users to rebuild_index
+        # when switching models. Keep it stable.
+        return "bge_small_en_v15"
+
+    def __init__(
+        self,
+        preferred_providers=None,
+        batch_size: int = _BGE_BATCH_SIZE,
+        intra_op_num_threads: int = 0,
+    ):
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        self._providers = (
+            list(preferred_providers) if preferred_providers else ["CPUExecutionProvider"]
+        )
+        self._batch_size = batch_size
+        self._intra_op_num_threads = intra_op_num_threads
+        self._session = None
+        self._tokenizer = None
+        self._np = None
+        self._needs_token_type_ids = False
+        # Instances are shared across threads via _EF_CACHE; serialize the
+        # one-time model load so concurrent cold calls cannot build (and
+        # transiently hold) two full model sessions.
+        self._load_lock = threading.Lock()
+
+    def _lazy_load(self) -> None:
+        if self._session is not None:
+            return
+        with self._load_lock:
+            if self._session is not None:
+                return
+            try:
+                import numpy as np
+                import onnxruntime as ort
+                from huggingface_hub import hf_hub_download
+                from tokenizers import Tokenizer
+            except ImportError as e:
+                raise ImportError(
+                    "BgeSmallONNX requires huggingface_hub, tokenizers, and "
+                    "numpy — these ship with mempalace core, so this error usually "
+                    "means one was uninstalled or pinned to an incompatible version. "
+                    "Reinstall with: pip install --upgrade --force-reinstall mempalace"
+                ) from e
+
+            logger.info("Downloading %s/%s (cached after first run)…", _BGE_REPO, _BGE_ONNX)
+            model_path = hf_hub_download(_BGE_REPO, _BGE_ONNX)
+            tok_path = hf_hub_download(_BGE_REPO, "tokenizer.json")
+
+            session = ort.InferenceSession(
+                model_path,
+                sess_options=_intra_op_session_options(self._intra_op_num_threads),
+                providers=self._providers,
+            )
+            tokenizer = Tokenizer.from_file(tok_path)
+            tokenizer.enable_padding()
+            tokenizer.enable_truncation(max_length=_BGE_MAX_LEN)
+            self._needs_token_type_ids = "token_type_ids" in {i.name for i in session.get_inputs()}
+            self._tokenizer = tokenizer
+            self._np = np
+            # Session is assigned last: the unlocked fast path above treats a
+            # non-None session as "fully loaded", so every other attribute
+            # must already be in place when it becomes visible.
+            self._session = session
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        self._lazy_load()
+        np = self._np
+        embeddings: list[list[float]] = []
+        # Tokenize and run per sub-batch: padding is to the longest sequence
+        # in the sub-batch, and the runtime only ever holds batch_size rows
+        # of attention buffers at a time (#1770).
+        for start in range(0, len(texts), self._batch_size):
+            chunk = texts[start : start + self._batch_size]
+            encs = self._tokenizer.encode_batch(chunk)
+            feeds = {
+                "input_ids": np.asarray([e.ids for e in encs], dtype=np.int64),
+                "attention_mask": np.asarray([e.attention_mask for e in encs], dtype=np.int64),
+            }
+            if self._needs_token_type_ids:
+                feeds["token_type_ids"] = np.zeros_like(feeds["input_ids"])
+            outputs = self._session.run(None, feeds)
+            # BGE pools the [CLS] token (position 0), not a mean over tokens.
+            cls = outputs[0][:, 0]
+            norms = np.linalg.norm(cls, axis=1, keepdims=True) + 1e-12
+            embeddings.extend((cls / norms).tolist())
+        return embeddings
+
+    def _normalize_input(self, input) -> list[str]:  # noqa: A002 — ChromaDB EF protocol
+        if isinstance(input, str):
+            # A bare string would be iterated character by character below,
+            # silently producing one garbage vector per character.
+            return [input]
+        if input is None or len(input) == 0:
+            # None or zero docs: nothing to embed; skip the lazy model
+            # download. len() over truthiness so an array-like documents
+            # sequence is not rejected by ambiguous-truth-value semantics.
+            return []
+        return list(input)
+
+    def __call__(self, input: str | list[str] | None) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
+        texts = self._normalize_input(input)
+        if not texts:
+            return []
+        return self._embed(texts)
+
+    def embed_query(self, input: list[str]) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
+        """Embed search queries (instruction-prefixed, per the BGE model card)."""
+        texts = self._normalize_input(input)
+        if not texts:
+            return []
+        return self._embed([_BGE_QUERY_PREFIX + t for t in texts])
+
+    def embed_documents(self, input: list[str]) -> list[list[float]]:  # noqa: A002
+        """Embed a batch of documents (bare, no instruction prefix)."""
+        return self(input)
+
+
+# nomic-embed-text-v1.5 ONNX — the strongest retrieval candidate in the
+# 2026-08-09 embedder A/B (.reports/mempalace-audit/embedder-ab/): on the
+# 300-case eval set R@1 .355→.505 and R@10 .696→.857 over minilm at the
+# default 384-d Matryoshka truncation (768-d full adds ~2pp more but is a
+# schema change — see docs/embedder-migration.md). Long-context (2048 cap
+# here), asymmetric search prefixes, mean pooling + layer-norm per the model
+# card's MRL recipe.
+_NOMIC_REPO = "nomic-ai/nomic-embed-text-v1.5"
+_NOMIC_ONNX = "onnx/model.onnx"
+_NOMIC_DOC_PREFIX = "search_document: "
+_NOMIC_QUERY_PREFIX = "search_query: "
+_NOMIC_DIM = 384  # Matryoshka truncation — first 384 of 768; drop-in width
+# 1024, not the model's native 8192: attention buffers scale with
+# batch x len^2 x heads x fp32, and the 2026-08-09 resource probe measured
+# 7.3 GB peak RSS at (len 2048, batch 8) on a sustained doc sweep — machine-
+# hostile on a 24 GB shared box. (len 1024, batch 4) bounds the worst-case
+# buffer at ~1/8 of that, and only 0.5% of the live corpus's chunks exceed
+# 1024 tokens (they are tokenizer-truncated, exactly as they were at 2048).
+_NOMIC_MAX_LEN = 1024
+_NOMIC_BATCH_SIZE = 4
+
+
+class NomicEmbedONNX:
+    """ChromaDB-compatible EF using nomic-embed-text-v1.5 ONNX (fp32).
+
+    English retrieval-tuned, 2048-token context (vs MiniLM/BGE's 512),
+    trained with Matryoshka Representation Learning so the 768-d output
+    truncates to 384-d with little loss — the default here, keeping the
+    MiniLM-shaped 384-wide collections valid with no schema change.
+    Switching an existing palace still requires a full re-embed via
+    ``mempalace repair rebuild-index`` (see docs/embedder-migration.md).
+
+    Pipeline per the model card's MRL recipe: mean-pool over the attention
+    mask, layer-norm, truncate to ``dim``, L2-normalize. Queries and
+    documents carry different task prefixes (``search_query:`` /
+    ``search_document:``): ``embed_query`` prefixes queries, ``__call__``
+    and ``embed_documents`` prefix documents. Callers comparing documents
+    to documents (e.g. dedup) should use the document path for both sides.
+    """
+
+    def __init__(
+        self,
+        preferred_providers=None,
+        batch_size: int = _NOMIC_BATCH_SIZE,
+        intra_op_num_threads: int = 0,
+        dim: int = _NOMIC_DIM,
+    ):
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        if dim < 1 or dim > 768:
+            raise ValueError(f"dim must be in 1..768, got {dim}")
+        self._providers = (
+            list(preferred_providers) if preferred_providers else ["CPUExecutionProvider"]
+        )
+        self._batch_size = batch_size
+        self._intra_op_num_threads = intra_op_num_threads
+        self._dim = dim
+        self._session = None
+        self._tokenizer = None
+        self._np = None
+        self._needs_token_type_ids = False
+        # Instances are shared across threads via _EF_CACHE; serialize the
+        # one-time model load so concurrent cold calls cannot build (and
+        # transiently hold) two full model sessions.
+        self._load_lock = threading.Lock()
+
+    def name(self) -> str:
+        # ChromaDB persists this on the collection and refuses reads with a
+        # mismatched EF. The truncation width is part of the identity: 384-d
+        # and 768-d truncations are different vector spaces, so the name must
+        # change when dim does — that mismatch is what forces rebuild_index.
+        return f"nomic_embed_text_v15_{self._dim}d"
+
+    def _lazy_load(self) -> None:
+        if self._session is not None:
+            return
+        with self._load_lock:
+            if self._session is not None:
+                return
+            try:
+                import numpy as np
+                import onnxruntime as ort
+                from huggingface_hub import hf_hub_download
+                from tokenizers import Tokenizer
+            except ImportError as e:
+                raise ImportError(
+                    "NomicEmbedONNX requires huggingface_hub, tokenizers, and "
+                    "numpy — these ship with mempalace core, so this error usually "
+                    "means one was uninstalled or pinned to an incompatible version. "
+                    "Reinstall with: pip install --upgrade --force-reinstall mempalace"
+                ) from e
+
+            logger.info("Downloading %s/%s (cached after first run)…", _NOMIC_REPO, _NOMIC_ONNX)
+            model_path = hf_hub_download(_NOMIC_REPO, _NOMIC_ONNX)
+            tok_path = hf_hub_download(_NOMIC_REPO, "tokenizer.json")
+
+            session = ort.InferenceSession(
+                model_path,
+                sess_options=_intra_op_session_options(self._intra_op_num_threads),
+                providers=self._providers,
+            )
+            tokenizer = Tokenizer.from_file(tok_path)
+            tokenizer.enable_padding()
+            tokenizer.enable_truncation(max_length=_NOMIC_MAX_LEN)
+            self._needs_token_type_ids = "token_type_ids" in {i.name for i in session.get_inputs()}
+            self._tokenizer = tokenizer
+            self._np = np
+            # Session is assigned last: the unlocked fast path above treats a
+            # non-None session as "fully loaded", so every other attribute
+            # must already be in place when it becomes visible.
+            self._session = session
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        self._lazy_load()
+        np = self._np
+        embeddings: list[list[float]] = []
+        # Tokenize and run per sub-batch: padding is to the longest sequence
+        # in the sub-batch, and the runtime only ever holds batch_size rows
+        # of attention buffers at a time (#1770).
+        for start in range(0, len(texts), self._batch_size):
+            chunk = texts[start : start + self._batch_size]
+            encs = self._tokenizer.encode_batch(chunk)
+            feeds = {
+                "input_ids": np.asarray([e.ids for e in encs], dtype=np.int64),
+                "attention_mask": np.asarray([e.attention_mask for e in encs], dtype=np.int64),
+            }
+            if self._needs_token_type_ids:
+                feeds["token_type_ids"] = np.zeros_like(feeds["input_ids"])
+            outputs = self._session.run(None, feeds)
+            hidden = outputs[0]  # last_hidden_state: (batch, seq, 768)
+            mask = feeds["attention_mask"][:, :, None].astype(hidden.dtype)
+            pooled = (hidden * mask).sum(axis=1) / np.maximum(mask.sum(axis=1), 1e-9)
+            # MRL recipe: layer-norm BEFORE truncation, else the first 384
+            # dims are not the trained Matryoshka sub-space.
+            mu = pooled.mean(axis=-1, keepdims=True)
+            var = pooled.var(axis=-1, keepdims=True)
+            pooled = (pooled - mu) / np.sqrt(var + 1e-5)
+            pooled = pooled[:, : self._dim]
+            norms = np.linalg.norm(pooled, axis=1, keepdims=True) + 1e-12
+            embeddings.extend((pooled / norms).tolist())
+        return embeddings
+
+    def _normalize_input(self, input) -> list[str]:  # noqa: A002 — ChromaDB EF protocol
+        if isinstance(input, str):
+            # A bare string would be iterated character by character below,
+            # silently producing one garbage vector per character.
+            return [input]
+        if input is None or len(input) == 0:
+            # None or zero docs: nothing to embed; skip the lazy model
+            # download. len() over truthiness so an array-like documents
+            # sequence is not rejected by ambiguous-truth-value semantics.
+            return []
+        return list(input)
+
+    def __call__(self, input: str | list[str] | None) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
+        texts = self._normalize_input(input)
+        if not texts:
+            return []
+        return self._embed([_NOMIC_DOC_PREFIX + t for t in texts])
+
+    def embed_query(self, input: list[str]) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
+        """Embed search queries (``search_query:`` prefix per the model card)."""
+        texts = self._normalize_input(input)
+        if not texts:
+            return []
+        return self._embed([_NOMIC_QUERY_PREFIX + t for t in texts])
+
+    def embed_documents(self, input: list[str]) -> list[list[float]]:  # noqa: A002
+        """Embed a batch of documents (``search_document:`` prefix)."""
+        return self(input)
+
+
 def get_embedding_function(device: Optional[str] = None, model: Optional[str] = None):
     """Return a cached embedding function for the requested device + model.
 
@@ -390,6 +730,10 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         threads = _resolve_intra_op_threads()
         if model == "embeddinggemma":
             ef = EmbeddinggemmaONNX(preferred_providers=providers, intra_op_num_threads=threads)
+        elif model == "bge-small":
+            ef = BgeSmallONNX(preferred_providers=providers, intra_op_num_threads=threads)
+        elif model == "nomic":
+            ef = NomicEmbedONNX(preferred_providers=providers, intra_op_num_threads=threads)
         else:
             # Default: minilm (or anything we don't recognize — back-compat win).
             ef_cls = _build_ef_class()

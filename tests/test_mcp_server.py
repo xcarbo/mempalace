@@ -860,7 +860,7 @@ class TestReadTools:
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
-            lambda texts: [[float(len(text)), 1.0] for text in texts],
+            lambda texts, is_query=False: [[float(len(text)), 1.0] for text in texts],
         )
         col = get_collection(palace_path, create=True)
         col.add(
