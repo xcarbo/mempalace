@@ -17,8 +17,11 @@ deliberately narrow so an LLM-generated header can replace
 :func:`contextual_header` later without touching any call site.
 
 Gated by ``MempalaceConfig.embed_context_headers`` (default ON,
-``MEMPALACE_EMBED_CONTEXT_HEADERS=false`` to disable). Fail-open: any error
-returns ``None`` and the backend embeds the stored documents as before.
+``MEMPALACE_EMBED_CONTEXT_HEADERS=false`` to disable) and by
+``MempalaceConfig.embed_context_headers_min_chunks`` (drawers with fewer
+chunks embed unprefixed — headers on small drawers measured recall-negative,
+2026-08-09). Fail-open: any error returns ``None`` and the backend embeds
+the stored documents as before.
 """
 
 import logging
@@ -91,6 +94,13 @@ def maybe_contextual_embeddings(
         if config is None or not config.embed_context_headers:
             return None
         if not chunk_docs:
+            return None
+        # Small drawers embed better WITHOUT the breadcrumb: their chunks
+        # are already self-contained and the header is a large fraction of
+        # the input (2026-08-09 golden measurement — see
+        # ``MempalaceConfig.embed_context_headers_min_chunks``).
+        min_chunks = int(getattr(config, "embed_context_headers_min_chunks", 0) or 0)
+        if len(chunk_docs) < min_chunks:
             return None
         from .embedding import get_embedding_function
 

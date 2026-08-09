@@ -980,3 +980,43 @@ def test_explicit_palace_path_overrides_env_and_file_config(monkeypatch, tmp_pat
     assert cfg.palace_path == expected
     assert cfg.hallway_file == os.path.join(os.path.dirname(expected), "hallways.json")
     assert cfg.tunnel_file == os.path.join(os.path.dirname(expected), "tunnels.json")
+
+
+# ── Write-path treatment gates (chunk-gate fix, 2026-08-09) ────────────
+# Boundary-aware chunking and contextual embedding headers measured
+# recall-negative on small drawers (golden failures 5 → 8 → 10 when applied
+# everywhere) and strongly positive on large ones (flagship roadmap exact
+# rank 91 → 6). Both are therefore gated behind min-chunk thresholds,
+# env-overridable so recall passes can A/B them without editing config.
+
+
+def test_treatment_gates_default_to_twelve(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embed_context_headers_min_chunks == 12
+    assert cfg.chunk_boundary_min_chunks == 12
+
+
+def test_treatment_gates_file_overrides_honored(tmp_path):
+    cfg = _write_config(tmp_path, embed_context_headers_min_chunks=0, chunk_boundary_min_chunks=30)
+    assert cfg.embed_context_headers_min_chunks == 0
+    assert cfg.chunk_boundary_min_chunks == 30
+
+
+def test_treatment_gates_env_wins_over_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_EMBED_CONTEXT_HEADERS_MIN_CHUNKS", "5")
+    monkeypatch.setenv("MEMPALACE_CHUNK_BOUNDARY_MIN_CHUNKS", "0")
+    cfg = _write_config(tmp_path, embed_context_headers_min_chunks=40, chunk_boundary_min_chunks=40)
+    assert cfg.embed_context_headers_min_chunks == 5
+    assert cfg.chunk_boundary_min_chunks == 0
+
+
+def test_treatment_gates_garbage_env_falls_through_to_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_EMBED_CONTEXT_HEADERS_MIN_CHUNKS", "many")
+    cfg = _write_config(tmp_path, embed_context_headers_min_chunks=7)
+    assert cfg.embed_context_headers_min_chunks == 7
+
+
+def test_treatment_gates_negative_falls_back_to_default(tmp_path):
+    cfg = _write_config(tmp_path, embed_context_headers_min_chunks=-1, chunk_boundary_min_chunks=-3)
+    assert cfg.embed_context_headers_min_chunks == 12
+    assert cfg.chunk_boundary_min_chunks == 12

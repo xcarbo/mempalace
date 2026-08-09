@@ -63,8 +63,9 @@ class TestContextualTexts:
 
 
 class _Cfg:
-    def __init__(self, on=True):
+    def __init__(self, on=True, min_chunks=0):
         self.embed_context_headers = on
+        self.embed_context_headers_min_chunks = min_chunks
 
 
 class TestMaybeContextualEmbeddings:
@@ -85,6 +86,46 @@ class TestMaybeContextualEmbeddings:
 
         monkeypatch.setattr(embedding, "get_embedding_function", boom)
         assert maybe_contextual_embeddings(_Cfg(), "w", "r", "c", ["c"]) is None
+
+    def test_below_min_chunks_returns_none_without_touching_the_model(self, monkeypatch):
+        """Headers on small drawers measured recall-negative (2026-08-09
+        golden run: 5 → 10 failures with headers everywhere; best-chunk
+        cosine −0.02..−0.08 on 2-5-chunk drawers). Below the gate the
+        write embeds stored documents unprefixed — and the gate must
+        short-circuit BEFORE the embedding model is resolved, so a gated
+        write costs nothing extra."""
+        import mempalace.embedding as embedding
+
+        calls = []
+        monkeypatch.setattr(embedding, "get_embedding_function", lambda: calls.append(1))
+        cfg = _Cfg(min_chunks=12)
+        assert maybe_contextual_embeddings(cfg, "w", "r", "c", ["a", "b"]) is None
+        assert calls == []
+
+    def test_at_min_chunks_headers_apply(self):
+        pytest.importorskip("onnxruntime")
+        chunks = ["alpha body text", "beta body text", "gamma body text"]
+        vectors = maybe_contextual_embeddings(
+            _Cfg(min_chunks=3), "w", "r", "# T\nalphabetagamma", chunks
+        )
+        assert vectors is not None and len(vectors) == 3
+
+    def test_zero_min_chunks_applies_to_every_chunked_drawer(self):
+        pytest.importorskip("onnxruntime")
+        vectors = maybe_contextual_embeddings(_Cfg(min_chunks=0), "w", "r", "c", ["c"])
+        assert vectors is not None
+
+    def test_config_without_min_chunks_attribute_applies_headers(self):
+        """A stub/legacy config object lacking the property behaves like
+        gate 0 (headers for every chunked drawer) rather than crashing."""
+        pytest.importorskip("onnxruntime")
+        legacy = type("LegacyCfg", (), {"embed_context_headers": True})()
+        assert maybe_contextual_embeddings(legacy, "w", "r", "c", ["c"]) is not None
+
+    def test_garbage_min_chunks_fails_open_to_no_headers(self):
+        """Un-intable garbage in the gate falls through the outer
+        fail-open: embed stored documents (None), never block the write."""
+        assert maybe_contextual_embeddings(_Cfg(min_chunks="lots"), "w", "r", "c", ["c"]) is None
 
     def test_vectors_match_header_prefixed_text(self):
         """The returned vectors are the embeddings of header+chunk, byte-for-

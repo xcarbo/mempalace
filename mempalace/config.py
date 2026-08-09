@@ -631,6 +631,48 @@ class MempalaceConfig:
         return self._config_bool("embed_context_headers", "MEMPALACE_EMBED_CONTEXT_HEADERS", True)
 
     @property
+    def embed_context_headers_min_chunks(self) -> int:
+        """Minimum chunk count before contextual headers apply (default 12).
+
+        A drawer split into fewer chunks than this embeds its stored
+        documents unprefixed, exactly as before headers existed. Measured
+        2026-08-09 (full 1,886-drawer rewrite, 37-case golden set): headers
+        on every chunked drawer moved golden failures 5 → 10 because a
+        ~40-60-char breadcrumb is a large fraction of a small drawer's
+        already-self-contained chunk (best-chunk cosine −0.02..−0.08 on
+        2-5-chunk drawers), while 14+-chunk drawers — whose chunks are
+        anonymous windows — consistently gained (+0.04..+0.07, flagship
+        roadmap exact rank 91 → 6). 12 sits in the observed sign-flip band
+        (8..14). 0 = headers for every chunked drawer."""
+        return self._config_int(
+            "embed_context_headers_min_chunks",
+            "MEMPALACE_EMBED_CONTEXT_HEADERS_MIN_CHUNKS",
+            12,
+            minimum=0,
+        )
+
+    @property
+    def chunk_boundary_min_chunks(self) -> int:
+        """Minimum hard-slice chunk count before boundary-aware chunking
+        applies (default 12).
+
+        Content that would span fewer chunks than this keeps the historical
+        fixed ``content[i : i + chunk_size]`` layout. Boundary snapping on
+        every drawer was measured net-negative on recall (2026-08-09:
+        golden failures 5 → 8 with headers off — re-splitting moved
+        concentrated matches into diluted windows, e.g. a 355-char tail
+        chunk at cosine 0.295 rebalanced into a 762-char window at 0.149,
+        and re-laying-out 8.6k chunk rows reshuffled every wing's ranking),
+        while large drawers keep their gain at any threshold that includes
+        them. 0 = boundary-aware for all content."""
+        return self._config_int(
+            "chunk_boundary_min_chunks",
+            "MEMPALACE_CHUNK_BOUNDARY_MIN_CHUNKS",
+            12,
+            minimum=0,
+        )
+
+    @property
     def topic_wings(self):
         """List of topic wing names."""
         return self._file_config.get("topic_wings", DEFAULT_TOPIC_WINGS)
@@ -696,6 +738,18 @@ class MempalaceConfig:
         """
         coerced = self._try_coerce_int(self._file_config.get(key, default), minimum)
         return default if coerced is None else coerced
+
+    def _config_int(self, key: str, env_var: str, default: int, minimum=None) -> int:
+        """Read an int setting with env-var override (same contract as
+        ``_config_bool``): env wins when it parses as a valid int, else
+        ``config.json``, else the documented default. Garbage in either
+        source falls through rather than crashing."""
+        env_val = os.environ.get(env_var)
+        if env_val is not None:
+            coerced = self._try_coerce_int(env_val, minimum)
+            if coerced is not None:
+                return coerced
+        return self._coerce_config_int(key, default, minimum)
 
     def _validated_chunk_config(self):
         """Return ``(chunk_size, chunk_overlap, min_chunk_size)`` post-validation.
