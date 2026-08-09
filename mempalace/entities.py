@@ -46,6 +46,8 @@ def extract_structural_entities(text, max_entities=_MAX_ENTITIES):
     by first appearance), deduplicated case-insensitively, preserving the first-seen
     surface form.
     """
+    from .entity_detector import is_junk_entity_token
+
     if not text:
         return []
     counts = {}
@@ -55,6 +57,13 @@ def extract_structural_entities(text, max_entities=_MAX_ENTITIES):
         for match in pattern.finditer(text):
             token = _clean(match.group(1) if pattern is _BACKTICK else match.group(0))
             if not (_MIN_LEN <= len(token) <= _MAX_LEN):
+                continue
+            # 2026-08 audit denylist: drawer-metadata keys, harness tool
+            # names, and infra tokens (node_modules, json.load, README.md)
+            # measured as the bulk of stored entities. allow_structural
+            # keeps this extractor's real outputs (_/./-shaped
+            # identifiers are its purpose) — only the curated list applies.
+            if is_junk_entity_token(token, allow_structural=True):
                 continue
             key = token.lower()
             if key not in counts:

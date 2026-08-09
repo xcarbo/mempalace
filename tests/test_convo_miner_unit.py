@@ -153,12 +153,18 @@ class TestChunkExchanges:
 
     def test_paragraph_loop_no_content_loss(self):
         """Verbatim principle: every char of a single long paragraph lands
-        in some drawer in order. The slicing helper must not drop or
-        reorder content."""
+        in some drawer in order. Forced splits now OVERLAP (standalone
+        convo drawers, never reassembled), so the loss check strips each
+        follow-on slice's shared prefix before joining: slice i always
+        starts exactly ``overlap`` chars before slice i-1 ended."""
+        from mempalace.convo_miner import CHUNK_OVERLAP
+
         content = "a" * 5000
         chunks = chunk_exchanges(content)
-        joined = "".join(c["content"] for c in chunks)
-        assert joined == content
+        reconstructed = chunks[0]["content"] + "".join(
+            c["content"][CHUNK_OVERLAP:] for c in chunks[1:]
+        )
+        assert reconstructed == content
 
     def test_chunk_exactly_at_size_boundary(self):
         """Content length == CHUNK_SIZE produces exactly one drawer of CHUNK_SIZE."""
@@ -168,12 +174,19 @@ class TestChunkExchanges:
         assert len(chunks[0]["content"]) == CHUNK_SIZE
 
     def test_chunk_many_multiples_of_size(self):
-        """Content length == 8 * CHUNK_SIZE produces exactly 8 drawers, each
-        of length CHUNK_SIZE."""
+        """Long boundary-less content: every slice stays bounded, consecutive
+        slices share exactly CHUNK_OVERLAP chars, and the overlap-aware
+        reconstruction is byte-identical (no loss, no reorder)."""
+        from mempalace.convo_miner import CHUNK_OVERLAP
+
         content = "w" * (8 * CHUNK_SIZE)
         chunks = chunk_exchanges(content)
-        assert len(chunks) == 8
-        assert all(len(c["content"]) == CHUNK_SIZE for c in chunks)
+        assert len(chunks) > 8  # overlap means more, smaller-advance slices
+        assert all(len(c["content"]) <= CHUNK_SIZE for c in chunks)
+        reconstructed = chunks[0]["content"] + "".join(
+            c["content"][CHUNK_OVERLAP:] for c in chunks[1:]
+        )
+        assert reconstructed == content
 
     def test_paragraph_loop_preserves_slice_order(self):
         """Slices must appear in source order. Guards against a future
@@ -182,10 +195,41 @@ class TestChunkExchanges:
         as well as content."""
         content = "a" * CHUNK_SIZE + "b" * CHUNK_SIZE + "c" * CHUNK_SIZE
         chunks = chunk_exchanges(content)
-        assert len(chunks) == 3
+        # First slice is pure a's; the letter transitions must appear in
+        # source order across the slice sequence.
         assert chunks[0]["content"] == "a" * CHUNK_SIZE
-        assert chunks[1]["content"] == "b" * CHUNK_SIZE
-        assert chunks[2]["content"] == "c" * CHUNK_SIZE
+        first_b = next(i for i, c in enumerate(chunks) if "b" in c["content"])
+        first_c = next(i for i, c in enumerate(chunks) if "c" in c["content"])
+        assert first_b <= first_c
+        for prev, cur in zip(chunks, chunks[1:]):
+            # Overlap contract: each slice begins with the previous slice's tail.
+            from mempalace.convo_miner import CHUNK_OVERLAP
+
+            assert cur["content"][:CHUNK_OVERLAP] == prev["content"][-CHUNK_OVERLAP:]
+
+    def test_forced_split_overlap_and_word_boundaries(self):
+        """The 2026-08 audit fixes pinned: a forced split (one exchange past
+        chunk_size) must (a) carry CHUNK_OVERLAP shared chars between
+        consecutive slices and (b) cut at a word boundary instead of
+        tearing mid-word."""
+        from mempalace.convo_miner import CHUNK_OVERLAP
+
+        words = " ".join(f"word{i:04d}" for i in range(300))  # ~2,700 chars, spaces
+        content = "> summarize the plan\n" + words
+        chunks = chunk_exchanges(content)
+        assert len(chunks) > 1
+        for prev, cur in zip(chunks, chunks[1:]):
+            assert cur["content"][:CHUNK_OVERLAP] == prev["content"][-CHUNK_OVERLAP:]
+        for c in chunks[:-1]:
+            # Boundary pull keeps the separator with the leading slice, so a
+            # non-final slice ends on the space, not mid-token.
+            assert c["content"].endswith(" ") or c["content"].endswith("\n"), (
+                f"slice tore mid-word: ...{c['content'][-20:]!r}"
+            )
+
+    def test_overlap_above_half_chunk_size_raises(self):
+        with pytest.raises(ValueError, match="chunk_overlap"):
+            chunk_exchanges("> hi there\n" + "x" * 100, chunk_size=100, chunk_overlap=51)
 
     def test_ai_response_preserves_blank_lines(self):
         """Blank lines inside an AI response must survive ingestion (verbatim principle).
@@ -538,13 +582,14 @@ class TestFileChunksLocked:
         monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
         monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
 
-        drawers, room_counts, skipped = _file_chunks_locked(
+        drawers, room_counts, skipped, dedup_lineage = _file_chunks_locked(
             col, "chat.txt", chunks, "wing", "general", "agent", "exchange"
         )
 
         assert drawers == 5
         assert dict(room_counts) == {}
         assert skipped is False
+        assert dedup_lineage == []
         assert col.batch_sizes == [2, 2, 1]
 
     def test_populates_entities_metadata(self, monkeypatch):

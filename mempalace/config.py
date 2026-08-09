@@ -588,6 +588,48 @@ class MempalaceConfig:
         hooks = self._file_config.get("hooks", {})
         return hooks.get("auto_save", True)
 
+    def _config_bool(self, key: str, env_var: str, default: bool) -> bool:
+        """Read a boolean setting with env-var override (same contract as
+        ``hooks_auto_save``): env wins when set, else ``config.json``, else
+        the documented default. Env parsing treats "false"/"0"/"no" (any
+        case) as False and everything else as True."""
+        env_val = os.environ.get(env_var)
+        if env_val is not None:
+            return env_val.lower() not in ("false", "0", "no")
+        return bool(self._file_config.get(key, default))
+
+    @property
+    def convo_content_dedup(self) -> bool:
+        """Content-hash dedup gate for conversation mining (default ON).
+
+        Claude Code fork/resume copies conversation history into new JSONL
+        files, so file-idempotent mining stores the same exchange once per
+        fork (measured 2026-08-08: 16,384 surplus duplicate rows; one
+        247-char snippet stored 406 times). When enabled, a chunk whose
+        (wing, content-hash) already exists from a different source file is
+        skipped and recorded in ``dedup_lineage.jsonl`` instead of upserted.
+        """
+        return self._config_bool("convo_content_dedup", "MEMPALACE_CONVO_DEDUP", True)
+
+    @property
+    def hallways_enabled(self) -> bool:
+        """Whether mining recomputes the hallways associative graph (default OFF).
+
+        Hallways are derived from mined entities on every mine pass and were
+        producing a 126 MB pretty-printed hallways.json read by nothing but
+        the ``memp hallways`` CLI listing. Off by default until something
+        consumes them; ``memp hallways`` on stale data still works.
+        """
+        return self._config_bool("hallways_enabled", "MEMPALACE_HALLWAYS", False)
+
+    @property
+    def embed_context_headers(self) -> bool:
+        """Prepend a wing/room/title breadcrumb to the text fed to the
+        EMBEDDER for chunked drawers (default ON). The stored document is
+        byte-identical to what the caller passed — only the embedding input
+        changes (Anthropic contextual-retrieval, template flavor)."""
+        return self._config_bool("embed_context_headers", "MEMPALACE_EMBED_CONTEXT_HEADERS", True)
+
     @property
     def topic_wings(self):
         """List of topic wing names."""

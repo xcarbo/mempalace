@@ -8,6 +8,7 @@ Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
 Same palace as project mining. Different ingest strategy.
 """
 
+import hashlib
 import os
 import sys
 import json
@@ -83,6 +84,12 @@ CONVO_SKIP_DIRS = SKIP_DIRS | {"tool-results"}
 # normalize.strip_noise, never by a length floor over the user's words.
 MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
+# Overlap between consecutive slices when a single exchange is force-split
+# past CHUNK_SIZE. Convo drawers are standalone rows (never reassembled by
+# parent id), so stored overlap is safe here — unlike the deliberate path,
+# where chunks must concatenate back to the original. 120 sits in the
+# 100–150 band the 2026-08 audit recommended; miner.py uses 100.
+CHUNK_OVERLAP = 120
 _LINE_GROUP_SIZE = 25  # lines per fallback group when no paragraph breaks
 _LINE_FALLBACK_MIN_NEWLINES = 20  # trigger line-group fallback above this newline count
 DRAWER_UPSERT_BATCH_SIZE = 1000
@@ -196,39 +203,56 @@ def chunk_exchanges(
     content: str,
     chunk_size: int = None,
     min_chunk_size: int = None,
+    chunk_overlap: int = None,
 ) -> list:
     """
     Chunk by exchange pair: one > turn + AI response = one unit.
     Falls back to paragraph chunking if no > markers.
 
     Optional params override module-level defaults when provided.
+    ``chunk_overlap`` applies only when a single exchange is force-split
+    past ``chunk_size``: consecutive slices then share that many trailing
+    chars so a sentence torn at the boundary is still searchable whole.
 
-    Raises ``ValueError`` if ``chunk_size`` is not a positive integer or
-    ``min_chunk_size`` is negative. A non-positive ``chunk_size`` would
-    cause ``_chunk_by_exchange`` below to loop forever — ``content[:0]``
-    is empty, ``content[0:]`` is the whole string, and the remainder
-    never shrinks.
+    Raises ``ValueError`` if ``chunk_size`` is not a positive integer,
+    ``min_chunk_size`` is negative, or ``chunk_overlap`` is negative or
+    above ``chunk_size // 2`` (a larger overlap stalls the slice loop —
+    same invariant as miner.chunk_text, #2056). A non-positive
+    ``chunk_size`` would cause ``_chunk_by_exchange`` below to loop
+    forever — ``content[:0]`` is empty, ``content[0:]`` is the whole
+    string, and the remainder never shrinks.
     """
     if chunk_size is None:
         chunk_size = CHUNK_SIZE
     if min_chunk_size is None:
         min_chunk_size = MIN_CHUNK_SIZE
+    if chunk_overlap is None:
+        chunk_overlap = min(CHUNK_OVERLAP, chunk_size // 2)
 
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
     if min_chunk_size < 0:
         raise ValueError(f"min_chunk_size must be >= 0, got {min_chunk_size}")
+    if chunk_overlap < 0:
+        raise ValueError(f"chunk_overlap must be >= 0, got {chunk_overlap}")
+    if chunk_overlap > chunk_size // 2:
+        raise ValueError(
+            f"chunk_overlap ({chunk_overlap}) must be at most chunk_size // 2 "
+            f"({chunk_size // 2}); a larger overlap stalls the slice loop"
+        )
 
     lines = content.split("\n")
     quote_lines = sum(1 for line in lines if line.strip().startswith(">"))
 
     if quote_lines >= 3:
-        return _chunk_by_exchange(lines, chunk_size, min_chunk_size)
+        return _chunk_by_exchange(lines, chunk_size, min_chunk_size, chunk_overlap)
     else:
-        return _chunk_by_paragraph(content, chunk_size, min_chunk_size)
+        return _chunk_by_paragraph(content, chunk_size, min_chunk_size, chunk_overlap)
 
 
-def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> list:
+def _chunk_by_exchange(
+    lines: list, chunk_size: int, min_chunk_size: int, chunk_overlap: int = 0
+) -> list:
     """One user turn (>) + the AI response that follows = one or more chunks.
 
     The full AI response is preserved verbatim.  When the combined
@@ -260,7 +284,7 @@ def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> lis
             ai_response = "\n".join(ai_lines).rstrip("\n")
             content = f"{user_turn}\n{ai_response}" if ai_response else user_turn
 
-            _emit_bounded(chunks, content, chunk_size, min_chunk_size)
+            _emit_bounded(chunks, content, chunk_size, min_chunk_size, chunk_overlap)
         else:
             i += 1
 
@@ -272,23 +296,44 @@ def _emit_bounded(
     content: str,
     chunk_size: int,
     min_chunk_size: int,
+    chunk_overlap: int = 0,
 ) -> None:
     """Append ``content`` as one or more drawers, none exceeding ``chunk_size``.
 
     The ``min_chunk_size`` floor gates the WHOLE call (drops the input if
     its stripped length is at or below the floor, treated as noise). Once
-    the input passes the floor, every slice is emitted verbatim so a
-    small trailing remainder is preserved instead of silently dropped.
-    The index-based loop avoids the O(N^2) repeated-substring allocation
-    of a ``while content: content = content[chunk_size:]`` shape.
+    the input passes the floor, everything is emitted so a small trailing
+    remainder is preserved instead of silently dropped.
+
+    Forced splits (one exchange past ``chunk_size``) pull the boundary back
+    to a line break or space in the trailing half of the window instead of
+    tearing mid-word, and consecutive slices share ``chunk_overlap``
+    trailing chars — convo drawers are standalone search rows (never
+    reassembled by parent id), so stored overlap is safe on THIS path only.
+    Callers must keep ``chunk_overlap <= chunk_size // 2`` (validated in
+    ``chunk_exchanges``) or the window stops advancing.
     """
     if len(content.strip()) <= min_chunk_size:
         return
-    for i in range(0, len(content), chunk_size):
-        chunks.append({"content": content[i : i + chunk_size], "chunk_index": len(chunks)})
+    n = len(content)
+    start = 0
+    while start < n:
+        end = min(start + chunk_size, n)
+        if end < n:
+            # Boundary pull: prefer a newline, then a space, in the trailing
+            # half of the window (same guard as miner.chunk_text).
+            pos = content.rfind("\n", start, end)
+            if pos <= start + chunk_size // 2:
+                pos = content.rfind(" ", start, end)
+            if pos > start + chunk_size // 2:
+                end = pos + 1  # keep the separator with the leading slice
+        chunks.append({"content": content[start:end], "chunk_index": len(chunks)})
+        start = end - chunk_overlap if end < n else end
 
 
-def _chunk_by_paragraph(content: str, chunk_size: int, min_chunk_size: int) -> list:
+def _chunk_by_paragraph(
+    content: str, chunk_size: int, min_chunk_size: int, chunk_overlap: int = 0
+) -> list:
     """Fallback: chunk by paragraph breaks."""
     chunks = []
     paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
@@ -298,11 +343,11 @@ def _chunk_by_paragraph(content: str, chunk_size: int, min_chunk_size: int) -> l
         lines = content.split("\n")
         for i in range(0, len(lines), _LINE_GROUP_SIZE):
             group = "\n".join(lines[i : i + _LINE_GROUP_SIZE]).strip()
-            _emit_bounded(chunks, group, chunk_size, min_chunk_size)
+            _emit_bounded(chunks, group, chunk_size, min_chunk_size, chunk_overlap)
         return chunks
 
     for para in paragraphs:
-        _emit_bounded(chunks, para, chunk_size, min_chunk_size)
+        _emit_bounded(chunks, para, chunk_size, min_chunk_size, chunk_overlap)
 
     return chunks
 
@@ -492,8 +537,53 @@ def _extract_authored_at(filepath):
     return latest
 
 
+def _chunk_content_hash(content: str) -> str:
+    """sha256 hex of a chunk's exact content — the dedup identity."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+_DEDUP_LOOKUP_BATCH = 200  # hashes per $in query — keeps the where clause bounded
+
+
+def _existing_content_hashes(collection, wing: str, hashes: list, source_file: str) -> dict:
+    """Map content_hash → (drawer_id, source_file) for chunks already stored
+    in ``wing`` from a DIFFERENT source file.
+
+    Fail-open: any lookup error returns what was found so far — a failed
+    dedup probe must never block a mine (worst case is a duplicate row,
+    which is the pre-existing behaviour).
+    """
+    found: dict = {}
+    unique = list(dict.fromkeys(hashes))
+    for i in range(0, len(unique), _DEDUP_LOOKUP_BATCH):
+        batch = unique[i : i + _DEDUP_LOOKUP_BATCH]
+        try:
+            result = collection.get(
+                where={"$and": [{"wing": wing}, {"content_hash": {"$in": batch}}]},
+                include=["metadatas"],
+            )
+        except Exception:
+            logger.debug("content-hash dedup lookup failed for %s", source_file, exc_info=True)
+            return found
+        for drawer_id, meta in zip(result.get("ids") or [], result.get("metadatas") or []):
+            meta = meta or {}
+            stored_hash = meta.get("content_hash")
+            stored_src = meta.get("source_file")
+            if stored_hash and stored_src and stored_src != source_file:
+                found.setdefault(stored_hash, (drawer_id, stored_src))
+    return found
+
+
 def _file_chunks_locked(
-    collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None
+    collection,
+    source_file,
+    chunks,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    authored_at=None,
+    content_dedup=True,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -505,16 +595,27 @@ def _file_chunks_locked(
     since a Claude Code session keeps appending to its own file while
     active and /compact or /clear can rewrite one in place.
 
-    Returns (drawers_added, room_counts_delta, skipped).
+    When ``content_dedup`` is on, a chunk whose exact content already exists
+    in this wing from a DIFFERENT source file is skipped instead of stored —
+    Claude Code fork/resume copies history into new JSONL files, and each
+    copy is legitimately "never mined before" so file idempotency cannot see
+    it. Skips are returned as lineage records so provenance survives. Known
+    accepted edge: if the canonical copy's source file is later rewritten in
+    place (/compact) and re-mined smaller, a skipped twin is not re-checked
+    until the next global re-mine (schema bump), which self-heals the gap;
+    the on-disk transcript remains the verbatim record throughout.
+
+    Returns (drawers_added, room_counts_delta, skipped, dedup_lineage).
     """
     room_counts_delta: dict = defaultdict(int)
     drawers_added = 0
+    dedup_lineage: list = []
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
         # still fall through to the purge+rebuild path below.
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
-            return 0, room_counts_delta, True
+            return 0, room_counts_delta, True, dedup_lineage
 
         # Purge stale drawers first. Fires both on a normalize-schema bump
         # (file_already_mined() returned False for pre-v2 drawers) and on a
@@ -536,11 +637,39 @@ def _file_chunks_locked(
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
+
+        # Content-hash dedup gate: one bulk lookup for this file's hashes,
+        # then O(1) skip decisions per chunk. Same-file rows never match
+        # (they were just purged above, and the helper excludes them anyway).
+        chunk_hashes = [_chunk_content_hash(chunk["content"]) for chunk in chunks]
+        duplicate_map = (
+            _existing_content_hashes(collection, wing, chunk_hashes, source_file)
+            if content_dedup
+            else {}
+        )
+
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
             batch_ids: list = []
             batch_metas: list = []
-            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+            for offset, chunk in enumerate(
+                chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+            ):
+                content_hash = chunk_hashes[batch_start + offset]
+                duplicate = duplicate_map.get(content_hash)
+                if duplicate is not None:
+                    dedup_lineage.append(
+                        {
+                            "source_file": source_file,
+                            "chunk_index": chunk["chunk_index"],
+                            "content_hash": content_hash,
+                            "duplicate_of_drawer": duplicate[0],
+                            "duplicate_of_source": duplicate[1],
+                            "wing": wing,
+                            "skipped_at": filed_at,
+                        }
+                    )
+                    continue
                 chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
                 if extract_mode == "general":
                     room_counts_delta[chunk_room] += 1
@@ -563,10 +692,13 @@ def _file_chunks_locked(
                     "extract_mode": extract_mode,
                     "normalize_version": NORMALIZE_VERSION,
                     "id_recipe": ID_RECIPE,
+                    "content_hash": content_hash,
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
                 batch_metas.append(meta)
+            if not batch_ids:
+                continue
             assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
             try:
                 collection.upsert(
@@ -578,7 +710,7 @@ def _file_chunks_locked(
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise
-    return drawers_added, room_counts_delta, False
+    return drawers_added, room_counts_delta, False, dedup_lineage
 
 
 def _is_ai_tool_path(path: Path) -> bool:
@@ -711,13 +843,61 @@ def mine_convos(
         )
 
 
+def _handle_dedup_skips(
+    collection,
+    palace_path,
+    source_file,
+    wing,
+    agent,
+    extract_mode,
+    dedup_lineage,
+    drawers_added,
+) -> str:
+    """Post-file bookkeeping for cross-file dedup skips.
+
+    Persists the lineage records, and registers the sentinel when EVERY
+    chunk was a duplicate — nothing was stored, so nothing carries the
+    file's mtime and it would otherwise be re-processed on every future
+    mine. Returns the per-file console note ("" when nothing was skipped).
+    """
+    if not dedup_lineage:
+        return ""
+    _append_dedup_lineage(palace_path, dedup_lineage)
+    if drawers_added == 0:
+        _register_file(collection, source_file, wing, agent, extract_mode)
+    return f" (dedup: {len(dedup_lineage)} skipped)"
+
+
+def _append_dedup_lineage(palace_path: str, records: list) -> None:
+    """Append dedup-skip lineage records to ``<palace>/dedup_lineage.jsonl``.
+
+    The skipped copy's provenance (which file held it, which drawer is the
+    canonical copy) would otherwise be lost — the transcript stays on disk
+    but nothing in the palace would say "this exchange also appeared here".
+    Best-effort: lineage is forensics, never worth failing a mine over.
+    """
+    try:
+        path = Path(palace_path).expanduser() / "dedup_lineage.jsonl"
+        with open(path, "a", encoding="utf-8") as fh:
+            for record in records:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        logger.debug("dedup lineage append failed for %s", palace_path, exc_info=True)
+
+
 def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None):
     """Auto-populate the associative graph from the entities just mined.
 
     Best-effort: hallway computation must never fail an otherwise-good mine, and is
     skipped when nothing new was filed.
+
+    Gated OFF by default (2026-08 audit): every mine was rewriting a 126 MB
+    pretty-printed hallways.json read by nothing except the ``memp hallways``
+    CLI listing. Re-enable with hallways_enabled / MEMPALACE_HALLWAYS=1.
     """
     if drawers_filed <= 0:
+        return
+    if config is not None and not config.hallways_enabled:
         return
     try:
         from .hallways import compute_hallways_for_wing
@@ -781,6 +961,7 @@ def _mine_convos_impl(
     )
 
     total_drawers = 0
+    total_dedup_skipped = 0
     files_mined = 0
     files_skipped = 0
     files_processed = 0
@@ -830,6 +1011,7 @@ def _mine_convos_impl(
                 content,
                 chunk_size=cfg_chunk_size,
                 min_chunk_size=cfg_min_chunk_size,
+                chunk_overlap=palace_config.chunk_overlap,
             )
 
         if not chunks:
@@ -869,7 +1051,7 @@ def _mine_convos_impl(
 
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
-        drawers_added, room_delta, skipped = _file_chunks_locked(
+        drawers_added, room_delta, skipped, dedup_lineage = _file_chunks_locked(
             collection,
             source_file,
             chunks,
@@ -878,16 +1060,28 @@ def _mine_convos_impl(
             agent,
             extract_mode,
             authored_at=_extract_authored_at(filepath),
+            content_dedup=palace_config.convo_content_dedup,
         )
         if skipped:
             files_skipped += 1
             continue
+        dedup_note = _handle_dedup_skips(
+            collection,
+            palace_path,
+            source_file,
+            wing,
+            agent,
+            extract_mode,
+            dedup_lineage,
+            drawers_added,
+        )
+        total_dedup_skipped += len(dedup_lineage)
         for r, n in room_delta.items():
             room_counts[r] += n
 
         total_drawers += drawers_added
         files_mined += 1
-        print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+        print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}{dedup_note}")
         if limit > 0 and files_mined >= limit:
             break
 
@@ -898,11 +1092,22 @@ def _mine_convos_impl(
         _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
         _validate_palace_fts5_after_mine(palace_path)
 
+    _print_convo_mine_summary(
+        files_processed, files_skipped, total_drawers, total_dedup_skipped, room_counts
+    )
+
+
+def _print_convo_mine_summary(
+    files_processed, files_skipped, total_drawers, total_dedup_skipped, room_counts
+) -> None:
+    """End-of-mine console summary for ``_mine_convos_impl``."""
     print(f"\n{'=' * 55}")
     print("  Done.")
     print(f"  Files processed: {files_processed - files_skipped}")
     print(f"  Files skipped (already filed): {files_skipped}")
     print(f"  Drawers filed: {total_drawers}")
+    if total_dedup_skipped:
+        print(f"  Duplicate chunks skipped (cross-file dedup): {total_dedup_skipped}")
     if room_counts:
         print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
