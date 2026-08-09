@@ -6013,3 +6013,94 @@ def test_add_drawer_idempotency_covers_legacy_fixed_slice_rows(
     _client2, col2 = _get_collection(palace_path)
     del _client2
     assert col2.count() == len(legacy_ids), "legacy rows must not gain siblings"
+
+
+def test_add_drawer_contextual_headers_keep_stored_content_verbatim(
+    monkeypatch, config, palace_path, kg
+):
+    """THE verbatim guarantee for contextual headers (2026-08 audit, lane 2):
+    with embed_context_headers ON (the default), the stored documents must be
+    byte-identical to what the caller passed — the breadcrumb exists only in
+    the embedding input. This test is the contract that headers never touch
+    fidelity or durability."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
+    from mempalace.mcp_server import tool_add_drawer, tool_get_drawer
+
+    assert config.embed_context_headers is True  # default ON
+
+    content = "# Golden Doc\n\n" + ("A line of curated roadmap content.\n" * 60)
+    result = tool_add_drawer(wing="w", room="r", content=content)
+    assert result["success"] is True
+    assert result["chunks"] > 1
+
+    fetched = tool_get_drawer(result["drawer_id"])
+    assert fetched["content"] == content, "stored content must be byte-identical"
+
+    # And the chunk rows themselves are verbatim slices of the original.
+    _client2, col = _get_collection(palace_path)
+    del _client2
+    stored = col.get(include=["documents", "metadatas"])
+    for doc in stored["documents"]:
+        assert doc in content
+
+
+def test_add_drawer_contextual_headers_change_the_vector(
+    monkeypatch, config, palace_path, kg
+):
+    """The chunk vector must be the embedding of the header-prefixed text,
+    not of the bare stored chunk — otherwise the feature is a no-op."""
+    pytest.importorskip("onnxruntime")
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
+    from mempalace.embedding import get_embedding_function
+    from mempalace.embedding_input import contextual_embedding_texts
+    from mempalace.mcp_server import tool_add_drawer
+
+    content = "# Vector Doc\n\n" + ("Curated content that will be chunked.\n" * 60)
+    result = tool_add_drawer(wing="w", room="r", content=content)
+    assert result["success"] is True and result["chunks"] > 1
+
+    _client2, col = _get_collection(palace_path)
+    del _client2
+    first_chunk_id = result["chunk_ids"][0]
+    row = col.get(ids=[first_chunk_id], include=["embeddings", "documents"])
+    stored_vec = list(row["embeddings"][0])
+    chunk_doc = row["documents"][0]
+
+    ef = get_embedding_function()
+    header_text = contextual_embedding_texts(
+        "w", "r", content, [chunk_doc] * result["chunks"]
+    )[0]
+    expected = list(ef(input=[header_text])[0])
+    bare = list(ef(input=[chunk_doc])[0])
+    assert stored_vec == pytest.approx(expected, abs=1e-5)
+    assert stored_vec != pytest.approx(bare, abs=1e-3)
+
+
+def test_add_drawer_contextual_headers_flag_off_embeds_stored_doc(
+    monkeypatch, config, palace_path, kg
+):
+    """MEMPALACE_EMBED_CONTEXT_HEADERS=false restores stored-doc embedding."""
+    pytest.importorskip("onnxruntime")
+    monkeypatch.setenv("MEMPALACE_EMBED_CONTEXT_HEADERS", "false")
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
+    from mempalace.embedding import get_embedding_function
+    from mempalace.mcp_server import tool_add_drawer
+
+    content = "# Plain Doc\n\n" + ("Content chunked without headers.\n" * 60)
+    result = tool_add_drawer(wing="w", room="r", content=content)
+    assert result["success"] is True and result["chunks"] > 1
+
+    _client2, col = _get_collection(palace_path)
+    del _client2
+    first_chunk_id = result["chunk_ids"][0]
+    row = col.get(ids=[first_chunk_id], include=["embeddings", "documents"])
+    stored_vec = list(row["embeddings"][0])
+    ef = get_embedding_function()
+    bare = list(ef(input=[row["documents"][0]])[0])
+    assert stored_vec == pytest.approx(bare, abs=1e-5)

@@ -2797,7 +2797,17 @@ def tool_add_drawer(
             drawer_id, content, base_meta, chunk_size
         )
         assert_no_collisions(list(zip(chunk_ids, chunk_metas)), col)
-        col.upsert(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+        # Contextual headers (template flavor): the EMBEDDING input is
+        # "<wing>/<room> — <title>, part i/N: " + chunk. The stored
+        # documents stay byte-identical to the caller's content; None
+        # falls back to embedding the stored docs (flag off / EF error).
+        from mempalace.embedding_input import maybe_contextual_embeddings
+
+        chunk_embeddings = maybe_contextual_embeddings(_config, wing, room, content, chunk_docs)
+        upsert_kwargs = {"ids": chunk_ids, "documents": chunk_docs, "metadatas": chunk_metas}
+        if chunk_embeddings is not None:
+            upsert_kwargs["embeddings"] = chunk_embeddings
+        col.upsert(**upsert_kwargs)
         # Probe the LAST chunk id, not the first — its presence confirms
         # the whole batch landed, not just the leading row.
         inserted = col.get(ids=[chunk_ids[-1]], include=[])
@@ -3492,7 +3502,25 @@ def tool_update_drawer(
                 chunk_size,
             )
 
-            col.upsert(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+            # Same contextual-header seam as tool_add_drawer: embedding
+            # input gets the breadcrumb, stored documents stay verbatim.
+            from mempalace.embedding_input import maybe_contextual_embeddings
+
+            chunk_embeddings = maybe_contextual_embeddings(
+                _config,
+                str(new_meta.get("wing") or ""),
+                str(new_meta.get("room") or ""),
+                new_doc,
+                chunk_docs,
+            )
+            upsert_kwargs = {
+                "ids": chunk_ids,
+                "documents": chunk_docs,
+                "metadatas": chunk_metas,
+            }
+            if chunk_embeddings is not None:
+                upsert_kwargs["embeddings"] = chunk_embeddings
+            col.upsert(**upsert_kwargs)
 
             keep_ids = set(chunk_ids)
             stale_ids = [old_id for old_id in record["ids"] if old_id not in keep_ids]
