@@ -24,7 +24,7 @@ from .backends import (
     UnsupportedCapabilityError,
 )
 from .config import sqlite_read_uri
-from .rerank import MAX_RERANK_POOL, maybe_rerank, rerank_enabled
+from .rerank import MAX_RERANK_POOL, annotate_rerank_scores, rerank_enabled
 from .retrieval_log import log_retrieval
 from .palace import (
     _open_collection_or_explain,
@@ -231,6 +231,86 @@ def _metric_for_collection(col) -> str:
     return metric if metric in ("cosine", "l2", "ip") else "cosine"
 
 
+FUSION_MODE_ENV = "MEMPALACE_FUSION"
+FUSION_MODE_DEFAULT = "weighted"
+RRF_K_ENV = "MEMPALACE_RRF_K"
+RRF_K_DEFAULT = 60
+
+
+def fusion_mode() -> str:
+    """How the vector and BM25 lanes are fused into one score.
+
+    * ``"weighted"`` (default) — convex combination
+      ``0.6*vector_sim + 0.4*bm25_minmax``. The historical behavior.
+    * ``"rrf"`` — Reciprocal Rank Fusion: ``Σ_lane 1/(k + rank_lane)`` with
+      ``k`` from ``MEMPALACE_RRF_K`` (default 60). Rank-based, so the two
+      lanes' incomparable score scales never mix.
+
+    A/B'd on the 300-case eval 2026-08-09; see rerank/fusion measurements
+    in the memaudit2 report. Unknown values fall back to the default
+    loudly (warning) rather than silently changing ranking behavior.
+    """
+    raw = os.environ.get(FUSION_MODE_ENV, "").strip().lower()
+    if not raw:
+        return FUSION_MODE_DEFAULT
+    if raw not in ("weighted", "rrf"):
+        logger.warning("Invalid %s=%r; using %s", FUSION_MODE_ENV, raw, FUSION_MODE_DEFAULT)
+        return FUSION_MODE_DEFAULT
+    return raw
+
+
+def _rrf_k() -> int:
+    """RRF's k constant; larger flattens the rank curve. Default 60."""
+    raw = os.environ.get(RRF_K_ENV, "").strip()
+    if not raw:
+        return RRF_K_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", RRF_K_ENV, raw, RRF_K_DEFAULT)
+        return RRF_K_DEFAULT
+    return value if value > 0 else RRF_K_DEFAULT
+
+
+def _rrf_base_scores(results: list, bm25_raw: list) -> list:
+    """Reciprocal-rank-fused base scores for the candidate pool.
+
+    Two lanes. The vector lane ranks candidates carrying a backend distance
+    (ascending); a ``distance=None`` candidate is *not in* the vector lane
+    and simply gets no contribution from it — no imputation needed, which
+    removes the weighted mode's "not measured vs maximally far" problem by
+    construction. The BM25 lane ranks candidates with non-zero local BM25;
+    a zero-BM25 candidate has no lexical evidence and is not in that lane.
+    Ties share the better rank so equal-scored candidates fuse equally.
+    """
+    k = _rrf_k()
+    n = len(results)
+    fused = [0.0] * n
+
+    in_vector = [
+        (i, results[i].get("distance")) for i in range(n) if results[i].get("distance") is not None
+    ]
+    in_vector.sort(key=lambda p: p[1])
+    rank = 0
+    prev = None
+    for pos, (i, dist) in enumerate(in_vector):
+        if prev is None or dist != prev:
+            rank = pos
+            prev = dist
+        fused[i] += 1.0 / (k + rank + 1)
+
+    in_bm25 = [(i, bm25_raw[i]) for i in range(n) if bm25_raw[i] > 0.0]
+    in_bm25.sort(key=lambda p: -p[1])
+    rank = 0
+    prev = None
+    for pos, (i, score) in enumerate(in_bm25):
+        if prev is None or score != prev:
+            rank = pos
+            prev = score
+        fused[i] += 1.0 / (k + rank + 1)
+    return fused
+
+
 def _hybrid_rank(
     results: list,
     query: str,
@@ -238,24 +318,33 @@ def _hybrid_rank(
     bm25_weight: float = 0.4,
     metric: str = "cosine",
 ) -> list:
-    """Re-rank ``results`` by a convex combination of vector similarity and BM25.
+    """Re-rank ``results`` by fusing vector similarity and BM25.
 
-    * Vector similarity is derived from each candidate's backend-reported
-      ``distance`` via :func:`_distance_to_similarity`, interpreted in the
-      collection's declared ``metric`` (per RFC 001) rather than assuming
-      cosine. Absolute (not relative-to-max) means adding/removing a
-      candidate can't reshuffle the others.
-    * BM25 is real Okapi-BM25 with corpus-relative IDF over the candidates
-      themselves. Since the absolute scale is unbounded, BM25 is min-max
-      normalized within the candidate set so weights are commensurable.
+    Fusion is selected by :func:`fusion_mode`:
+
+    * ``"weighted"`` (default) — convex combination:
+
+      - Vector similarity is derived from each candidate's backend-reported
+        ``distance`` via :func:`_distance_to_similarity`, interpreted in the
+        collection's declared ``metric`` (per RFC 001) rather than assuming
+        cosine. Absolute (not relative-to-max) means adding/removing a
+        candidate can't reshuffle the others.
+      - BM25 is real Okapi-BM25 with corpus-relative IDF over the candidates
+        themselves. Since the absolute scale is unbounded, BM25 is min-max
+        normalized within the candidate set so weights are commensurable.
+
+    * ``"rrf"`` — Reciprocal Rank Fusion over the two lanes' *ranks*
+      (:func:`_rrf_base_scores`), sidestepping the incomparable-scales
+      problem entirely.
 
     Candidates with ``distance=None`` are treated as vector-unknown
     (no vector signal available) and scored on BM25 contribution alone.
     Used by candidate-union mode to merge BM25-only candidates that the
     vector index didn't surface.
 
-    Mutates each result dict to add ``bm25_score`` and reorders the list
-    in place. Returns the same list for convenience.
+    Mutates each result dict to add ``bm25_score`` (plus internal
+    ``_fused_raw``/``_fused_score`` used by the second-stage rerank blend)
+    and reorders the list in place. Returns the same list for convenience.
     """
     if not results:
         return results
@@ -288,17 +377,23 @@ def _hybrid_rank(
     ]
     imputed_sim = min(known) * 0.999 if known else 0.0
 
+    rrf_base = _rrf_base_scores(results, bm25_raw) if fusion_mode() == "rrf" else None
+
     archive = archive_wings()
     penalty = archive_rank_penalty()
     scored = []
-    for r, raw, norm in zip(results, bm25_raw, bm25_norm):
+    for idx, (r, raw, norm) in enumerate(zip(results, bm25_raw, bm25_norm)):
         vec_sim = (
             imputed_sim
             if r.get("distance") is None
             else _distance_to_similarity(r.get("distance"), metric)
         )
         r["bm25_score"] = round(raw, 3)
-        score = vector_weight * vec_sim + bm25_weight * norm
+        if rrf_base is not None:
+            score = rrf_base[idx]
+        else:
+            score = vector_weight * vec_sim + bm25_weight * norm
+        r["_fused_raw"] = score
         # Attenuate, never exclude (decision f6639c96). An archive drawer that
         # is clearly the best answer still wins; one that merely ties a curated
         # drawer no longer takes the slot. This is the whole "dim" state: a
@@ -307,6 +402,7 @@ def _hybrid_rank(
         if archive and penalty < 1.0 and r.get("wing") in archive:
             score *= penalty
             r["archive_demoted"] = True
+        r["_fused_score"] = score
         scored.append((score, r))
 
     # Break exact score ties toward the more recently authored drawer so equal-score
@@ -589,10 +685,35 @@ def _print_search_results_bm25_only(
     )
 
 
-def search(query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5):
+# Default vector-distance ceiling for the human CLI path. Mirrors the
+# ``max_distance=1.5`` default on the MCP tool surface (tool_search) so bare
+# `memp search` and `memp search --json` rank identically. Keep in sync.
+SEARCH_MAX_DISTANCE_DEFAULT = 1.5
+
+
+def search(
+    query: str,
+    palace_path: str,
+    wing: str = None,
+    room: str = None,
+    n_results: int = 5,
+    source_file: str = None,
+    max_distance: float = None,
+):
     """
     Search the palace. Returns verbatim drawer content.
-    Optionally filter by wing (project) or room (aspect).
+    Optionally filter by wing (project), room (aspect), or source_file.
+
+    This is a *printer* over :func:`search_memories` — the human CLI output
+    over the exact pipeline the tool surface uses (lexical union lane, closet
+    boost, hybrid rank, archive demotion, final dedup). It was previously a
+    second, older pipeline: vector-only candidates from a pool of n*2, no
+    lexical lane — which made bare `memp search` (the majority production
+    path, ~70% of real searches) miss drawers the ``--json`` path ranked
+    first. One pipeline, two output formats.
+
+    ``max_distance=None`` selects :data:`SEARCH_MAX_DISTANCE_DEFAULT`;
+    pass ``0.0`` explicitly to disable distance filtering.
     """
     # Probe a Chroma palace before get_collection(). Opening the client can
     # load native index state, and embedder-identity enforcement may call
@@ -621,53 +742,32 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     # creation — their similarity scores will be junk until they run repair.
     _warn_if_legacy_metric(col)
 
-    where = build_where_filter(wing, room)
+    if max_distance is None:
+        max_distance = SEARCH_MAX_DISTANCE_DEFAULT
 
-    try:
-        kwargs = {
-            "query_texts": [query],
-            # Over-fetch so chunk-level duplicates of one drawer can be
-            # collapsed and still fill n_results with distinct drawers.
-            "n_results": n_results * 2,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            kwargs["where"] = where
+    result = search_memories(
+        query,
+        palace_path=palace_path,
+        wing=wing,
+        room=room,
+        source_file=source_file,
+        n_results=n_results,
+        max_distance=max_distance,
+    )
+    if result.get("error"):
+        msg = result["error"]
+        display = msg if msg.lower().startswith("search error") else f"Search error: {msg}"
+        print(f"\n  {display}")
+        if result.get("hint"):
+            print(f"  Hint: {result['hint']}")
+        raise SearchError(msg)
 
-        results = col.query(**kwargs)
-
-    except Exception as e:
-        print(f"\n  Search error: {e}")
-        raise SearchError(f"Search error: {e}") from e
-
-    docs = _first_or_empty(results, "documents")
-    metas = _first_or_empty(results, "metadatas")
-    dists = _first_or_empty(results, "distances")
-
-    if not docs:
+    hits = result.get("results") or []
+    if not hits:
         print(f'\n  No results found for: "{query}"')
         return
 
-    # Pure-cosine retrieval on the CLI path was missing lexical matches:
-    # a drawer whose text contains every query term can still score distance
-    # >= 1.0 against the natural-language query when the drawer is a
-    # mechanical artifact (directory listing, diff, log fragment) that
-    # embeds as file-tree noise rather than as prose about its subject.
-    # The MCP tool path already hybridizes BM25 with vector sim via
-    # `_hybrid_rank`; do the same here so CLI results match what agents
-    # see via `mempalace_search`.
     metric = _metric_for_collection(col)
-    rids = _first_or_empty(results, "ids") or [None] * len(docs)
-    hits = [
-        {
-            "text": doc or "",
-            "distance": float(dist),
-            "metadata": meta or {},
-            "drawer_id": _drawer_id_from(meta, rid),
-        }
-        for doc, meta, dist, rid in zip(docs, metas, dists, rids)
-    ]
-    hits = _dedupe_by_drawer_id(_hybrid_rank(hits, query, metric=metric))[:n_results]
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
@@ -679,12 +779,11 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
 
     seen_drawer_ids = []
     for i, hit in enumerate(hits, 1):
-        vec_sim = round(_distance_to_similarity(hit["distance"], metric), 3)
+        sim = hit.get("similarity")
         bm25 = hit.get("bm25_score", 0.0)
-        meta = hit["metadata"]
-        source = Path(meta.get("source_file", "?")).name
-        wing_name = meta.get("wing", "?")
-        room_name = meta.get("room", "?")
+        wing_name = hit.get("wing", "?")
+        room_name = hit.get("room", "?")
+        source = hit.get("source_file", "?")
         drawer_id = hit.get("drawer_id")
         seen_drawer_ids.append(drawer_id)
 
@@ -692,10 +791,15 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         if drawer_id:
             print(f"      ID:     {drawer_id}")
         print(f"      Source: {source}")
-        print(f"      Match:  {metric}_sim={vec_sim}  bm25={bm25}")
+        # Lexical-lane hits (matched_via="bm25_backend") have no vector
+        # distance; show sim=n/a rather than a fake 0.0.
+        sim_str = f"{metric}_sim={sim}" if sim is not None else f"{metric}_sim=n/a"
+        via = hit.get("matched_via", "drawer")
+        via_str = f"  via={via}" if via != "drawer" else ""
+        print(f"      Match:  {sim_str}  bm25={bm25}{via_str}")
         print()
         # Print the verbatim text, indented
-        for line in hit["text"].strip().split("\n"):
+        for line in (hit.get("text") or "").strip().split("\n"):
             print(f"      {line}")
         print()
         print(f"  {'─' * 56}")
@@ -707,9 +811,11 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         query=query,
         wing=wing,
         room=room,
+        source_file=source_file,
         limit=n_results,
         returned=len(hits),
         drawer_ids=seen_drawer_ids,
+        fallback=result.get("fallback"),
     )
 
 
@@ -994,6 +1100,34 @@ def _bm25_only_via_sqlite(
 # subquery per row and there is no index for it.
 _LEXICAL_CANDIDATE_FLOOR = 300
 
+# Floor on how many vector candidates to fetch when the archive is in play —
+# the vector-lane sibling of _LEXICAL_CANDIDATE_FLOOR, and the fix for the
+# demotion ordering gap agent-03 flagged (2026-08-08): the archive demotion
+# runs on the candidate pool, but with a fetch of only n*3 (=15) chunks the
+# pool was ~90% sessions rows, so a curated drawer at vector rank 16+ was cut
+# before the demotion could promote it and could only re-enter through the
+# lexical floor. 60 chunks ≈ the reranker's widened fetch, keeps HNSW cost
+# trivial, and gives the demotion actual curated candidates to work with.
+_VECTOR_CANDIDATE_FLOOR = 60
+
+
+def _vector_candidate_count(n_results: int, wing: str) -> int:
+    """How many vector-lane chunks to fetch for the rank pool.
+
+    Same shape as :func:`_lexical_candidate_count`: proportional (n*3) when
+    the search is wing-scoped or the archive mechanism is disabled, floored
+    at ``_VECTOR_CANDIDATE_FLOOR`` otherwise so the demotion has curated
+    candidates to promote. When the second-stage reranker is enabled the
+    fetch is additionally widened so its pool holds ~MAX_RERANK_POOL
+    distinct drawers even after chunk dedup.
+    """
+    proportional = n_results * 3
+    if not wing and archive_wings():
+        proportional = max(proportional, _VECTOR_CANDIDATE_FLOOR)
+    if rerank_enabled():
+        proportional = max(proportional, MAX_RERANK_POOL * 2)
+    return proportional
+
 
 def _lexical_candidate_count(n_results: int, wing: str) -> int:
     """How many lexical candidates to fetch.
@@ -1046,6 +1180,11 @@ def _merge_bm25_union_candidates(
     meaningfully violate one either; it is admitted on lexical relevance, which
     is a different and equally valid signal. The threshold still does its real
     job, which is keeping distant *vector* matches out.
+
+    Returns ``"ok"`` or ``"failed"`` so the caller can surface a degraded
+    (vector-only) search instead of hiding it. The lexical lane was
+    silently off for months, three different ways at once; a lane that
+    dies must at least say so.
     """
     where = build_where_filter(wing, room, source_file)
     try:
@@ -1057,8 +1196,10 @@ def _merge_bm25_union_candidates(
     except UnsupportedCapabilityError:
         raise
     except Exception:
-        logger.debug("candidate_strategy=union: lexical fetch failed", exc_info=True)
-        return
+        # WARNING, not debug: this degrades search quality for the caller
+        # (vector-only results) and must be visible in logs.
+        logger.warning("candidate_strategy=union: lexical fetch failed", exc_info=True)
+        return "failed"
 
     bm25_extra = []
     for hit in lexical.hits:
@@ -1105,6 +1246,7 @@ def _merge_bm25_union_candidates(
         bh["closet_boost"] = 0.0
         hits.append(bh)
         seen.add(key)
+    return "ok"
 
 
 # Strategy dispatch — keeps search_memories' branch count under the
@@ -1163,24 +1305,102 @@ def _apply_candidate_strategy(
     n_results: int,
     max_distance: float = 0.0,
     source_file: str = None,
-) -> None:
+) -> "str | None":
     """Dispatch to the registered merger for ``strategy``.
 
     Strategy validity is assumed (``_validate_candidate_strategy`` runs
-    earlier); ``"vector"`` is a no-op.
+    earlier); ``"vector"`` is a no-op returning ``None``. Union returns the
+    merger's lane status (``"ok"`` / ``"failed"``).
     """
     merger = _CANDIDATE_MERGERS[strategy]
-    if merger is not None:
-        merger(
-            hits,
-            drawers_col,
-            query,
-            wing,
-            room,
-            n_results,
-            max_distance=max_distance,
-            source_file=source_file,
+    if merger is None:
+        return None
+    return merger(
+        hits,
+        drawers_col,
+        query,
+        wing,
+        room,
+        n_results,
+        max_distance=max_distance,
+        source_file=source_file,
+    )
+
+
+RERANK_BLEND_ENV = "MEMPALACE_RERANK_BLEND"
+RERANK_BLEND_DEFAULT = 0.5
+
+
+def _rerank_blend_weight() -> float:
+    """Weight of the rerank signal in the blended score, in [0, 1].
+
+    0 ignores the reranker entirely, 1 reproduces the old (measured
+    harmful) sort-by-rerank-alone behavior. Out-of-range or unparseable
+    values fall back to the default rather than silently disabling.
+    """
+    raw = os.environ.get(RERANK_BLEND_ENV, "").strip()
+    if not raw:
+        return RERANK_BLEND_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.2f", RERANK_BLEND_ENV, raw, RERANK_BLEND_DEFAULT)
+        return RERANK_BLEND_DEFAULT
+    if not 0.0 <= value <= 1.0:
+        logger.warning(
+            "%s=%r out of range [0, 1]; using %.2f", RERANK_BLEND_ENV, raw, RERANK_BLEND_DEFAULT
         )
+        return RERANK_BLEND_DEFAULT
+    return value
+
+
+def _minmax_norm(values: list) -> list:
+    """Min-max normalize to [0, 1]; a constant list maps to all zeros."""
+    lo, hi = min(values), max(values)
+    if hi - lo <= 1e-12:
+        return [0.0] * len(values)
+    return [(v - lo) / (hi - lo) for v in values]
+
+
+def _blend_rerank(query: str, hits: list) -> list:
+    """Second-stage rerank as a BLENDED signal, never a replacement.
+
+    The original reranker sorted the pool by raw bi-encoder cosine alone,
+    discarding both the fused vector+BM25 score and the archive demotion.
+    Measured on the 300-case eval (2026-08-08) it made recall worse:
+    R@5 0.907→0.847, MRR 0.809→0.687, hurt 20 cases / rescued 2.
+
+    Here instead: min-max normalize the rerank cosine and the PRE-demotion
+    fused score within the pool (making the two scales commensurable),
+    combine them at ``MEMPALACE_RERANK_BLEND`` (default 0.5), then re-apply
+    the archive demotion multiplier to the blended score — so turning the
+    reranker on can no longer un-demote the archive. Hits beyond
+    MAX_RERANK_POOL keep first-stage order behind the pool. Fail-soft: if
+    scoring fails, first-stage order is returned untouched.
+    """
+    pool = hits[:MAX_RERANK_POOL]
+    tail = hits[MAX_RERANK_POOL:]
+    if not annotate_rerank_scores(query, pool):
+        return hits
+    rerank_norm = _minmax_norm([h["rerank_score"] for h in pool])
+    fused_norm = _minmax_norm([h.get("_fused_raw", 0.0) for h in pool])
+    weight = _rerank_blend_weight()
+    archive = archive_wings()
+    penalty = archive_rank_penalty()
+    scored = []
+    for h, rr, fu in zip(pool, rerank_norm, fused_norm):
+        blended = weight * rr + (1.0 - weight) * fu
+        if archive and penalty < 1.0 and h.get("wing") in archive:
+            blended *= penalty
+        scored.append((blended, h))
+    scored.sort(
+        key=lambda pair: (
+            pair[0],
+            pair[1].get("authored_at") or pair[1].get("metadata", {}).get("authored_at") or "",
+        ),
+        reverse=True,
+    )
+    return [h for _, h in scored] + tail
 
 
 def _finalize_candidate_hits(
@@ -1196,8 +1416,11 @@ def _finalize_candidate_hits(
     source_file: str = None,
     strategy_was_explicit: bool = True,
 ) -> tuple:
+    """Returns ``(hits, error, lexical_lane)`` — ``lexical_lane`` is
+    ``"ok"`` / ``"failed"`` / ``"unsupported"`` when the union lane was in
+    play, ``None`` for pure-vector strategies."""
     try:
-        _apply_candidate_strategy(
+        lexical_lane = _apply_candidate_strategy(
             candidate_strategy,
             hits,
             drawers_col,
@@ -1213,23 +1436,39 @@ def _finalize_candidate_hits(
             # Took the default on a backend without lexical search: use the
             # vector candidates we already have rather than failing the search.
             logger.debug("lexical lane unavailable on this backend; vector candidates only")
+            lexical_lane = "unsupported"
         else:
-            return [], {
-                "error": "candidate_strategy='union' requires a backend with lexical_search support",
-                "unsupported_capability": "supports_lexical_search",
-                "hint": "Use candidate_strategy='vector' or select a backend that supports lexical search.",
-            }
+            return (
+                [],
+                {
+                    "error": (
+                        "candidate_strategy='union' requires a backend with lexical_search support"
+                    ),
+                    "unsupported_capability": "supports_lexical_search",
+                    "hint": (
+                        "Use candidate_strategy='vector' or select a backend "
+                        "that supports lexical search."
+                    ),
+                },
+                "unsupported",
+            )
 
     ranked = _hybrid_rank(hits, query, metric=_metric_for_collection(drawers_col))
     # Optional second-stage rerank on the deduped pool (opt-in, local,
-    # fail-soft — see mempalace/rerank.py), then the final cut.
-    hits = maybe_rerank(query, _dedupe_by_drawer_id(ranked))[:n_results]
+    # fail-soft — see mempalace/rerank.py). Blended with the fused score,
+    # never a replacement for it; see _blend_rerank. Then the final cut.
+    deduped = _dedupe_by_drawer_id(ranked)
+    if rerank_enabled():
+        deduped = _blend_rerank(query, deduped)
+    hits = deduped[:n_results]
     for h in hits:
         h.pop("_sort_key", None)
         h.pop("_source_file_full", None)
         h.pop("_chunk_index", None)
         h.pop("_parent_drawer_id", None)
-    return hits, None
+        h.pop("_fused_raw", None)
+        h.pop("_fused_score", None)
+    return hits, None, lexical_lane
 
 
 def _backend_mismatch_result(error: BackendMismatchError) -> dict:
@@ -1422,6 +1661,34 @@ def _query_drawers_with_filter_fallback(
         return {"documents": [fdocs], "metadatas": [fmetas], "distances": [fdists]}
 
 
+def _assemble_search_result(
+    *,
+    query: str,
+    wing,
+    room,
+    source_file,
+    total_before_filter: int,
+    hits: list,
+    lexical_lane,
+) -> dict:
+    """Build the public search_memories response dict.
+
+    ``lexical_lane`` is included only when the union lane was in play
+    ("ok" / "failed" / "unsupported"), so a search degraded to vector-only
+    is observable rather than silent — the lexical lane was off for months,
+    three different ways at once, and nothing said so.
+    """
+    result = {
+        "query": query,
+        "filters": {"wing": wing, "room": room, "source_file": source_file},
+        "total_before_filter": total_before_filter,
+        "results": hits,
+    }
+    if lexical_lane is not None:
+        result["lexical_lane"] = lexical_lane
+    return result
+
+
 def search_memories(
     query: str,
     palace_path: str,
@@ -1455,21 +1722,25 @@ def search_memories(
             detects a divergence that would segfault chromadb on segment
             load.
         candidate_strategy: How candidates for the hybrid re-rank are gathered.
+            ``None`` (the common case) selects ``DEFAULT_CANDIDATE_STRATEGY``,
+            which is ``"union"``.
 
-            * ``"vector"`` (default) — preserves historical behavior: top
-              ``n_results * 3`` rows from the vector index are the rerank pool.
-              Cheap; works well when query and target docs agree in the
-              embedding space.
-            * ``"union"`` — also pull top ``n_results * 3`` lexical candidates
-              through the backend's ``lexical_search`` capability and merge
-              them into the rerank pool (deduped by source_file). Catches docs
-              with strong BM25 signal that are vector-distant from the query.
-              Perf depends on the selected backend; opt in until the cost is
-              characterized.
+            * ``"union"`` (default) — vector candidates plus top lexical
+              candidates pulled through the backend's ``lexical_search``
+              capability, merged into the rerank pool (chunk-precise dedup).
+              Catches docs with strong BM25 signal that are vector-distant
+              from the query — measured +18.7 points R@5 over vector-only on
+              the 300-case eval (2026-08-08). ``max_distance`` bounds the
+              vector lane only; lexical candidates have no vector distance
+              and are admitted on lexical relevance.
+            * ``"vector"`` — historical behavior: top ``n_results * 3`` rows
+              from the vector index are the whole rerank pool. Cheaper
+              (~50ms vs ~227ms p50), but cannot find a drawer whose embedding
+              is poor even when its text matches the query word for word.
 
-              When ``max_distance > 0.0`` is also set, BM25-only candidates
-              are skipped — they have no vector distance and would silently
-              violate the requested distance threshold.
+            The result carries ``lexical_lane`` ("ok" / "failed" /
+            "unsupported") whenever the union lane was requested, so a
+            degraded search is observable instead of silent.
     """
     # Validate the strategy eagerly so invalid values fail the same way
     # regardless of whether the call routes through the vector path or
@@ -1502,14 +1773,13 @@ def search_memories(
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
     try:
+        vector_fetch_n = _vector_candidate_count(n_results, wing)
         dkwargs = {
             "query_texts": [query],
-            # Over-fetch for hybrid re-ranking; wider still when the local
-            # reranker is on so its pool holds ~MAX_RERANK_POOL distinct
-            # drawers even after chunk dedup.
-            "n_results": max(n_results * 3, MAX_RERANK_POOL * 2)
-            if rerank_enabled()
-            else n_results * 3,
+            # Over-fetch for hybrid re-ranking; floored when the archive can
+            # crowd the lane, wider still when the local reranker is on. See
+            # _vector_candidate_count.
+            "n_results": vector_fetch_n,
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
@@ -1638,7 +1908,12 @@ def search_memories(
     #
     # The final cut to n_results still happens in `_finalize_candidate_hits`,
     # so callers see no change in result count.
-    pool_size = max(n_results, MAX_RERANK_POOL)
+    # The cut must never truncate the vector lane below what was fetched for
+    # it — cutting to MAX_RERANK_POOL here re-created the demotion gap at 30
+    # that _VECTOR_CANDIDATE_FLOOR exists to fix at 15 (the demotion can only
+    # promote what survives to _hybrid_rank). Dedup alone shrinks the pool;
+    # hydration cost is bounded by closet-boosted hits, not pool width.
+    pool_size = max(n_results, MAX_RERANK_POOL, vector_fetch_n)
     hits = _dedupe_by_drawer_id(scored)[:pool_size]
 
     # Drawer-grep enrichment: for closet-boosted hits whose source has
@@ -1707,7 +1982,7 @@ def search_memories(
     # caller's strict distance threshold.
     # The helper also runs the final BM25 hybrid re-rank and strips internal
     # dedup fields before returning.
-    hits, strategy_error = _finalize_candidate_hits(
+    hits, strategy_error, lexical_lane = _finalize_candidate_hits(
         candidate_strategy=candidate_strategy,
         hits=hits,
         drawers_col=drawers_col,
@@ -1722,12 +1997,15 @@ def search_memories(
     if strategy_error:
         return strategy_error
 
-    return {
-        "query": query,
-        "filters": {"wing": wing, "room": room, "source_file": source_file},
-        "total_before_filter": len(_first_or_empty(drawer_results, "documents")),
-        "results": hits,
-    }
+    return _assemble_search_result(
+        query=query,
+        wing=wing,
+        room=room,
+        source_file=source_file,
+        total_before_filter=len(_first_or_empty(drawer_results, "documents")),
+        hits=hits,
+        lexical_lane=lexical_lane,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

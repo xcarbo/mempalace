@@ -109,6 +109,47 @@ class TestCandidateUnion:
         )
         assert explicit.get("unsupported_capability") == "supports_lexical_search"
 
+    def test_result_reports_lexical_lane_health(self, tmp_path, monkeypatch):
+        """The lexical lane was silently off for months, three different ways
+        at once. A degraded search must now say so: ``lexical_lane`` is
+        "ok" when the union lane ran, "failed" when the lexical fetch died,
+        "unsupported" when the backend can't do it — and absent entirely on
+        an explicit vector-only search (no lane in play, nothing to report)."""
+        import mempalace.searcher as searcher_mod
+        from mempalace.backends import UnsupportedCapabilityError
+
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+
+        ok = search_memories(_NARRATIVE_QUERY, palace, n_results=5)
+        assert ok.get("lexical_lane") == "ok"
+
+        vector_only = search_memories(
+            _NARRATIVE_QUERY, palace, n_results=5, candidate_strategy="vector"
+        )
+        assert "lexical_lane" not in vector_only
+
+        real_merger = searcher_mod._merge_bm25_union_candidates
+
+        def _failing_lexical(hits, drawers_col, query, *a, **k):
+            class _DeadCol:
+                def lexical_search(self, **kw):
+                    raise RuntimeError("fts blew up")
+
+            return real_merger(hits, _DeadCol(), query, *a, **k)
+
+        monkeypatch.setitem(searcher_mod._CANDIDATE_MERGERS, "union", _failing_lexical)
+        failed = search_memories(_NARRATIVE_QUERY, palace, n_results=5)
+        assert failed.get("lexical_lane") == "failed"
+        assert failed.get("results"), "a failed lexical lane must still return vector hits"
+
+        def _no_lexical(*a, **k):
+            raise UnsupportedCapabilityError("supports_lexical_search")
+
+        monkeypatch.setitem(searcher_mod._CANDIDATE_MERGERS, "union", _no_lexical)
+        unsupported = search_memories(_NARRATIVE_QUERY, palace, n_results=5)
+        assert unsupported.get("lexical_lane") == "unsupported"
+
     def test_union_surfaces_bm25_strong_vector_distant_doc(self, tmp_path):
         """The brand-voice doc has strong BM25 signal for the query but is
         stylistically far from the narrative tickets. Union mode must

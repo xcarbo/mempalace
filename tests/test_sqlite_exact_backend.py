@@ -495,6 +495,10 @@ def test_search_union_uses_sqlite_exact_lexical_search(tmp_path, monkeypatch):
 
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
     monkeypatch.setattr(embedding_wrapper, "_embed_texts", fake_embed)
+    # Disable the archive-mode vector floor (_VECTOR_CANDIDATE_FLOOR=60): on
+    # this 4-doc corpus it would let the vector lane return every doc, so the
+    # rare doc could never demonstrate arriving through the lexical lane.
+    monkeypatch.setenv("MEMPALACE_ARCHIVE_WINGS", "")
 
     col = get_collection(str(tmp_path), create=True)
     col.add(

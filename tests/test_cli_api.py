@@ -648,10 +648,12 @@ def test_subprocess_search_help_shows_schema_flag_aliases():
     assert "--context" in r.stdout
 
 
-def test_cmd_search_rejects_json_only_filters_without_json():
-    # Fail fast: the human search path cannot honor these filters — returning
-    # unfiltered results silently would be worse than an error.
+def test_cmd_search_accepts_filters_without_json():
+    # The human path routes through search_memories now, so the v3.5.0
+    # filters work without --json (they used to exit 2 with a "JSON path
+    # only" error).
     import argparse
+    from unittest.mock import patch
 
     from mempalace import cli
 
@@ -662,9 +664,11 @@ def test_cmd_search_rejects_json_only_filters_without_json():
         room=None,
         results=5,
         source_file="/x/notes.md",
-        max_distance=None,
+        max_distance=0.8,
         json=False,
     )
-    with pytest.raises(SystemExit) as ei:
+    with patch("mempalace.searcher.search") as mock_search:
         cli.cmd_search(ns)
-    assert ei.value.code == 2
+    kwargs = mock_search.call_args.kwargs
+    assert kwargs["source_file"] == "/x/notes.md"
+    assert kwargs["max_distance"] == 0.8
