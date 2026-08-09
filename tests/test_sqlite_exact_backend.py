@@ -183,21 +183,236 @@ def test_sqlite_exact_get_unfiltered_page_pushes_limit_offset(tmp_path):
     assert "OFFSET" in selects[0]
 
 
-def test_sqlite_exact_get_filtered_page_stays_on_full_scan(tmp_path):
+def test_sqlite_exact_get_filtered_page_compiles_without_sql_page(tmp_path):
     _backend, col = _collection(tmp_path)
     _seed(col, 6)
 
-    # With a filter the rows are dropped after the scan, so LIMIT/OFFSET must
-    # not reach SQL; the page is taken in Python over the filtered rows.
-    result, selects = _doc_select_sql(
+    # A translatable filter compiles to SQL, but the compiled scan is fetched
+    # unordered (no ORDER BY — see the planner note in _rows) and sorted in
+    # Python, so LIMIT/OFFSET must not reach SQL; the page is taken in Python
+    # over the rowid-sorted filtered rows.
+    result, statements = _traced_sql(
         col,
         lambda: col.get(where={"wing": "w"}, limit=2, offset=1, include=["metadatas"]),
     )
+    scans = [s for s in statements if "metadata_json" in s and "FROM documents" in s]
 
     assert result.ids == ["d1", "d2"]
-    assert len(selects) == 1
-    assert "LIMIT" not in selects[0]
-    assert "OFFSET" not in selects[0]
+    assert len(scans) == 1
+    assert "ORDER BY" not in scans[0]
+    assert "LIMIT" not in scans[0]
+    assert "OFFSET" not in scans[0]
+    # The compiled predicate reached SQL (no Python fallback scan).
+    assert "wing" in scans[0]
+
+
+def _traced_sql(col, action):
+    """Run ``action`` while tracing every SQL statement on the connection."""
+    statements = []
+    conn = col._handle.conn
+    conn.set_trace_callback(statements.append)
+    try:
+        result = action()
+    finally:
+        conn.set_trace_callback(None)
+    return result, statements
+
+
+def test_sqlite_exact_filtered_get_skips_embedding_column(tmp_path):
+    """The filtered get() must not drag 1.5KB embedding blobs through the scan
+    unless the caller asked for embeddings — that fetch was the dominant cost
+    of the 2026-08-09 cutover latency tail (775ms per hydration call)."""
+    _backend, col = _collection(tmp_path)
+    _seed(col, 4)
+
+    _result, statements = _traced_sql(
+        col, lambda: col.get(where={"wing": "w"}, include=["documents", "metadatas"])
+    )
+    scans = [s for s in statements if "FROM documents" in s and "metadata_json" in s]
+    assert scans and all("embedding" not in s for s in scans)
+
+    with_embed, statements = _traced_sql(
+        col, lambda: col.get(where={"wing": "w"}, include=["embeddings"])
+    )
+    scans = [s for s in statements if "FROM documents" in s and "metadata_json" in s]
+    assert scans and any("embedding" in s for s in scans)
+    assert with_embed.embeddings and with_embed.embeddings[0] == [0.0, 1.0]
+
+
+def test_sqlite_exact_filtered_get_uses_index_without_analyze(tmp_path):
+    """The scoped hydration filter must hit the generated-column index on a
+    freshly built store with no sqlite_stat1 rows. Keeping ORDER BY rowid in
+    the compiled SQL makes the stat-less planner walk the whole
+    (collection_id) index to avoid the sort — 183ms per call on 177k rows —
+    which silently re-creates the cutover latency tail on every fresh build."""
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["da", "db"],
+        metadatas=[
+            {"source_file": "f.md", "parent_drawer_id": "p1", "chunk_index": 0},
+            {"source_file": "g.md", "parent_drawer_id": "p2", "chunk_index": 1},
+        ],
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    conn = col._handle.conn
+    assert not conn.execute(
+        "SELECT name FROM sqlite_master WHERE name LIKE 'sqlite_stat%'"
+    ).fetchall(), "test premise: no ANALYZE stats present"
+    where = {"$and": [{"source_file": "f.md"}, {"parent_drawer_id": "p1"}]}
+    result, statements = _traced_sql(col, lambda: col.get(where=where, include=["metadatas"]))
+    assert result.ids == ["a"]
+    scan = next(s for s in statements if "FROM documents" in s and "metadata_json" in s)
+    # The trace callback yields the statement with parameters expanded.
+    plan = " | ".join(row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + scan).fetchall())
+    # Either scoped generated-column index is fine; a bare (collection_id)
+    # walk is the regression.
+    assert "idx_documents_source_file" in plan or "idx_documents_parent_drawer_id" in plan, plan
+    assert "USING INDEX idx_documents_collection " not in plan, plan
+
+
+def test_sqlite_exact_untranslatable_get_falls_back_to_python_scan(tmp_path):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["da", "db"],
+        metadatas=[{'we"ird': "x", "wing": "w"}, {'we"ird': "y", "wing": "w"}],
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    # Unquotable JSON-path key → _WhereNotTranslatable → Python scan, same rows.
+    result = col.get(where={'we"ird': "x"}, include=["metadatas"])
+    assert result.ids == ["a"]
+    assert result.metadatas[0]['we"ird'] == "x"
+
+
+def _seed_equivalence_fixture(col):
+    """Rows exercising every metadata shape the filter grammar can meet:
+    missing keys, None values, bools (stored as JSON true/false), ints,
+    floats, unicode text, empty strings, and mixed types under one key."""
+    col.add(
+        ids=["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"],
+        documents=[
+            "alpha beta",
+            "beta gamma",
+            "Ünïcode dräwer 日本語",
+            "",
+            "delta",
+            "epsilon zeta",
+            "eta theta",
+            "iota kappa",
+        ],
+        metadatas=[
+            {"wing": "w1", "n": 0, "flag": True, "score": 1.5},
+            {"wing": "w1", "n": 1, "flag": False, "score": 0.0},
+            {"wing": "wü", "n": 2, "label": "Ünïcode 值"},
+            {"wing": "w2", "n": None, "label": ""},
+            {"wing": "w2", "n": 4},
+            {"n": "5"},  # n as str on this row, int elsewhere
+            {"wing": "w3", "score": -2},
+            {},
+        ],
+        embeddings=[[float(i), 1.0] for i in range(8)],
+    )
+
+
+_EQUIVALENCE_FILTERS = [
+    None,
+    {},
+    {"wing": "w1"},
+    {"wing": "wü"},
+    {"label": "Ünïcode 值"},
+    {"label": ""},
+    {"n": None},
+    {"missing": None},
+    {"flag": True},
+    {"flag": False},
+    {"n": 1},
+    {"n": "5"},
+    {"score": 1.5},
+    {"wing": {"$ne": "w1"}},
+    {"missing": {"$ne": "x"}},
+    {"n": {"$ne": None}},
+    {"n": {"$in": [0, "5", None]}},
+    {"n": {"$nin": [0, 1]}},
+    {"n": {"$in": []}},
+    {"n": {"$gt": 0}},
+    {"n": {"$gte": 0}},
+    {"n": {"$lt": 2}},
+    {"score": {"$lte": 1.5}},
+    {"n": {"$gt": "4"}},  # str operand: only str values compare
+    {"wing": {"$contains": "w"}},
+    {"n": {"$contains": "5"}},
+    {"label": {"$contains": ""}},
+    {"$and": [{"wing": "w1"}, {"flag": True}]},
+    {"$or": [{"wing": "w3"}, {"n": 4}]},
+    {"$and": [{"$or": [{"wing": "w1"}, {"wing": "w2"}]}, {"n": {"$ne": 1}}]},
+    {"$and": []},
+    {"$or": []},
+]
+
+_EQUIVALENCE_WHERE_DOCS = [
+    None,
+    {"$contains": "beta"},
+    {"$contains": "日本語"},
+    {"$contains": ""},
+    {"$or": [{"$contains": "alpha"}, {"$contains": "kappa"}]},
+]
+
+
+def test_sqlite_exact_get_compiled_sql_matches_python_scan(tmp_path, monkeypatch):
+    """The compiled-SQL filter path and the Python fallback must return the
+    same rows for every expressible filter shape — a silent difference in
+    WHICH rows come back would never show up in a recall metric."""
+    import mempalace.backends.sqlite_exact as se
+
+    _backend, col = _collection(tmp_path)
+    _seed_equivalence_fixture(col)
+
+    def forced(*_a, **_k):
+        raise se._WhereNotTranslatable("forced fallback")
+
+    for where in _EQUIVALENCE_FILTERS:
+        for where_doc in _EQUIVALENCE_WHERE_DOCS:
+            kwargs = dict(
+                where=where,
+                where_document=where_doc,
+                include=["documents", "metadatas", "embeddings"],
+            )
+            compiled = col.get(**kwargs)
+            with monkeypatch.context() as m:
+                m.setattr(se, "_compile_where", forced)
+                m.setattr(se, "_compile_where_document", forced)
+                fallback = col.get(**kwargs)
+            label = f"where={where!r} where_document={where_doc!r}"
+            assert compiled.ids == fallback.ids, label
+            assert compiled.documents == fallback.documents, label
+            assert compiled.metadatas == fallback.metadatas, label
+            assert compiled.embeddings == fallback.embeddings, label
+
+
+def test_sqlite_exact_index_version_migrates_v2_to_v3(tmp_path):
+    backend, col = _collection(tmp_path)
+    _seed(col, 3)
+    conn = col._handle.conn
+    # Simulate a v2 palace: drop the v3-only indexes and stamp version 2.
+    conn.execute("DROP INDEX IF EXISTS idx_documents_source_file")
+    conn.execute("DROP INDEX IF EXISTS idx_documents_parent_drawer_id")
+    conn.execute("UPDATE meta SET value = '2' WHERE key = 'index_version'")
+    conn.commit()
+    backend.close()
+
+    backend2, col2 = _collection(tmp_path)
+    conn2 = col2._handle.conn
+    names = {
+        row[0]
+        for row in conn2.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_documents_%'"
+        ).fetchall()
+    }
+    assert {"idx_documents_source_file", "idx_documents_parent_drawer_id"} <= names
+    version = conn2.execute("SELECT value FROM meta WHERE key = 'index_version'").fetchone()[0]
+    assert version == "3"
+    backend2.close()
 
 
 def test_sqlite_exact_get_offset_only_and_limit_only_push(tmp_path):

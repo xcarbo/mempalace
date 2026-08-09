@@ -600,6 +600,6 @@ def test_index_v2_covers_dim_and_migrates_v1(tmp_path):
             "dim",
         ]
         marker = conn.execute("SELECT value FROM meta WHERE key = 'index_version'").fetchone()
-        assert marker[0] == "2"
+        assert marker[0] == "3"
     finally:
         backend2.close()

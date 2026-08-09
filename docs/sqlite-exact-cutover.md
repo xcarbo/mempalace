@@ -100,9 +100,52 @@ cutover happens this week.
    * **Both lexical code paths exercised:** the run must include filtered
      searches (the goldens do). If the golden set ever loses its filtered
      cases, add explicit wing-filtered probes before trusting this gate.
-   * **Latency:** end-to-end within ~4× of chroma (measured 2026-08-09:
-     exact was *faster* end-to-end — p50 44 ms vs 92 ms — so any big
-     slowdown is a bug).
+   * **Latency, absolute and tail-aware.** The first latency criterion here
+     ("within ~4× of chroma") failed on 2026-08-09: the A/B's p50 was 109 ms
+     while p95 was 10.9 s and the worst query 25 s — a per-hit hydration
+     `get(where=...)` full-scan that no median can see. Percentile
+     thresholds, all required, measured over the combined 300-case + full
+     golden run (which exercises unfiltered, wing/room-filtered, and
+     hydration-heavy queries), warm process, closets collection present:
+     - p50 ≤ 150 ms, p95 ≤ 500 ms (the CLAUDE.md hook budget), p99 ≤ 1 s,
+     - **max ≤ 2 s** — with 337 cases, p99 still hides three queries; the
+       2026-08-09 tail lived exactly there,
+     - p95 ≤ the chroma leg's p95 measured in the same session on the same
+       machine state.
+     Also one **cold-process probe** (the `memp` CLI reality): fresh
+     interpreter, one query, median of ≥ 5 runs ≤ 1.5× the chroma leg's
+     equivalent (interpreter + model load dominate both legs; the backend
+     must not add a multi-second rebuild on top).
+   * **Hydration-heavy queries included.** The tail scaled with the number
+     of closet-boosted hits (worst case: 39 hydration calls in one query).
+     The run must include the ≥ 3 queries with the highest closet-boost
+     counts from the previous A/B (2026-08-09: `kaimeta-tailscale-ecs`,
+     `dup-tie-cjc1295-hair`, `ct-thewill-adgm`); each is individually
+     subject to the 2 s max.
+   * **Query-plan preflight (catches the ANALYZE / missing-index class).**
+     On the freshly built store, before the A/B: run
+     `EXPLAIN QUERY PLAN` for the two hydration filter shapes
+     (`{"source_file": X}` and `{"$and": [{"source_file": X},
+     {"parent_drawer_id": Y}]}` compiled via `get()`), and assert the plan
+     uses a generated-column index — not a bare `(collection_id)` index
+     walk. A freshly bulk-built store has **no `sqlite_stat1`**; code whose
+     plan is correct only after `ANALYZE` will pass every warm benchmark on
+     a hand-tuned store and silently regress ~30× on the next fresh build
+     (measured 2026-08-09: p95 110 ms with stats vs 3,004 ms without, same
+     code, same store). If the shipped code needs stats, `ANALYZE` must be
+     a build step (0.16 s on 177k rows) *and* this preflight still gates.
+   * **Closet-boost liveness.** Collection-list parity is a Phase-1 gate,
+     but assert it end-to-end here too: at least one A/B query must return
+     `matched_via = "drawer+closet"`. The 2026-08-09 build shipped without
+     `mempalace_closets`; search silently degraded to drawer-only, recall
+     numbers looked *better*, and the hydration cost this collection
+     triggers was invisible — the latency bug was measured only after the
+     rebuild restored closets.
+   * **Machine discipline.** Latency gates are void if another benchmark or
+     heavy agent ran concurrently (three agents timed each other into
+     noise on 2026-08-09). Record `os.getloadavg()` at start and every 50
+     cases; rerun any leg whose load exceeded ~2× the idle baseline, and
+     never run two legs simultaneously.
 10. **If the A/B regresses: stop.** Do not cut over. Diagnose against the
     2026-08-09 baselines (`eval_ab_results.json` in the cutover dir; per-lane
     traces in the 2026-08-09 exact-diag session). A golden-only regression
