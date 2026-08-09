@@ -362,6 +362,63 @@ def test_sqlite_exact_lexical_search_filters_after_full_fts_window(tmp_path):
     assert [hit.id for hit in hits] == ["target"]
 
 
+def test_sqlite_exact_lexical_filtered_rescores_window_not_fts_rank(tmp_path):
+    """The filtered lane must rank by the window-relative Okapi rescore, not
+    by FTS5's whole-corpus bm25 — and must fetch a window wider than
+    ``n_results`` to do it.
+
+    Out-of-scope "banana" filler drives FTS5's corpus IDF for "banana"
+    negative, so FTS5 ranks the apple-stuffed docB above docA ("apple
+    banana"). Within the wing-scoped window, "banana" is the discriminative
+    term and the Okapi rescore ranks docA first. The pre-fix code (LIMIT
+    n_results by raw FTS rank) returned docB here — the exact failure mode
+    behind the 2026-08-09 golden regressions (ct-fp-three-buckets,
+    ct-thewill-adgm, arc-liq4life-sdlt-legal).
+    """
+    _backend, col = _collection(tmp_path)
+    filler_ids = [f"noise-{i}" for i in range(30)]
+    col.add(
+        ids=["docA", "docB", *filler_ids],
+        documents=[
+            "apple banana",
+            "apple apple apple apple",
+            *["banana banana" for _ in filler_ids],
+        ],
+        metadatas=[
+            {"wing": "w"},
+            {"wing": "w"},
+            *[{"wing": "elsewhere"} for _ in filler_ids],
+        ],
+        embeddings=[[1.0, 0.0] for _ in range(len(filler_ids) + 2)],
+    )
+
+    hits = col.lexical_search(query="apple banana", n_results=1, where={"wing": "w"}).hits
+
+    assert [hit.id for hit in hits] == ["docA"]
+    assert hits[0].score > 0
+
+
+def test_sqlite_exact_lexical_short_tokens_skip_fts_but_keep_python_fallback(tmp_path):
+    """2-char tokens are dropped from FTS candidate generation (unicode61 has
+    no substring matching, so they only flood the OR match set), matching the
+    chroma lane's ≥3 floor. A query of ONLY short tokens must not go dark:
+    it skips FTS entirely and the Python BM25 scan still finds the doc.
+    """
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["short", "long"],
+        documents=["ab ab ab", "needle note"],
+        metadatas=[{"wing": "w"}, {"wing": "w"}],
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+
+    fts_hits = col.lexical_search(query="ab needle", n_results=5).hits
+    assert [hit.id for hit in fts_hits] == ["long"]
+
+    fallback_hits = col.lexical_search(query="ab", n_results=5).hits
+    assert [hit.id for hit in fallback_hits] == ["short"]
+
+
 def test_sqlite_exact_logical_filters_evaluate_sibling_predicates(tmp_path):
     _backend, col = _collection(tmp_path)
     col.add(

@@ -48,6 +48,13 @@ cutover happens this week.
    (`embedding_metadata`, key `chroma:document`), inserts in 2 000-row
    batches with explicit embeddings, and records the embedder identity
    (`minilm`, 384).
+   **Build EVERY collection, not just `mempalace_drawers`.** The live palace
+   also carries `mempalace_closets` (~2.6k rows); the 2026-08-09 build
+   omitted it, and `search_memories` silently degrades to drawer-only search
+   when `get_closets_collection` fails — closet rank-boosts (up to 0.40
+   effective-distance) vanish without any error. Gate: the built store's
+   collection list == the chroma palace's collection list, with per-collection
+   row-count parity.
 4. Copy `mempalace_embedder.json` and `palace_format.json` from the live
    palace into the new directory.
 
@@ -65,18 +72,42 @@ cutover happens this week.
 
 ## Phase 3 — A/B (gate: recall must not regress)
 
+> **Why this gate got stricter (2026-08-09):** the first cutover attempt
+> passed the then-current gate — 300-case R@1/5/10/MRR all ≥ chroma — while
+> the full 37-golden set regressed 2 → 5 failures and two real click-through
+> cases fell out entirely. The 300-case queries are unfiltered TF-IDF
+> extractions, so they never exercised the **wing/room-filtered lexical
+> path**, which was a different code path with a different ranking function
+> (raw FTS5 corpus-IDF bm25, `LIMIT n`) than chroma's (windowed candidates +
+> Okapi rescore). Aggregate metrics on one query shape are not a recall gate.
+
 8. Run the A/B harness (`scratchpad/ab/eval_ab.py` shape): both palace
-   copies, production `search_memories`, 9 goldens + the 300-case set at
+   copies, production `search_memories`, the **full golden set**
+   (`golden_recall.py`, all cases) + the 300-case set at
    `~/.local/state/herdr-spawn/ma-code-260808-224241/harness/`.
-9. Pass criteria: sqlite_exact R@1/R@5/R@10/MRR ≥ chroma on the 300-case set
-   (exact retrieval is a superset by construction — a regression means a
-   build bug, not a property of exact search); goldens not worse per-case;
-   end-to-end latency within ~4× of chroma (measured 2026-08-09: exact was
-   *faster* end-to-end — p50 63 ms vs 82 ms — so any big slowdown is a bug).
+9. Pass criteria — ALL of:
+   * **300-case set:** sqlite_exact R@1/R@5/R@10/MRR ≥ chroma (exact
+     retrieval is a superset by construction — a regression means a build
+     bug, not a property of exact search).
+   * **Full golden set, per-case:** the exact leg's failure set must be a
+     subset of the chroma leg's failure set measured on the same snapshot
+     pair, same code, same config. No new failing case, no case pushed past
+     its `rank_within` bound — aggregate counts are not enough; compare
+     case-by-case. The goldens are the only leg that carries real
+     click-throughs and the only leg that exercises wing/room-filtered
+     searches; a candidate backend that "wins on average" while dropping a
+     click-through case is not at parity.
+   * **Both lexical code paths exercised:** the run must include filtered
+     searches (the goldens do). If the golden set ever loses its filtered
+     cases, add explicit wing-filtered probes before trusting this gate.
+   * **Latency:** end-to-end within ~4× of chroma (measured 2026-08-09:
+     exact was *faster* end-to-end — p50 44 ms vs 92 ms — so any big
+     slowdown is a bug).
 10. **If the A/B regresses: stop.** Do not cut over. Diagnose against the
-    2026-08-09 baseline in `eval_ab_results.json` (scratchpad `ab/`); the
-    regression is in the build (id misalignment, metadata loss, wrong
-    embedder identity), not in exactness.
+    2026-08-09 baselines (`eval_ab_results.json` in the cutover dir; per-lane
+    traces in the 2026-08-09 exact-diag session). A golden-only regression
+    with a green 300-case set points at ranking-path divergence (lexical
+    lane, closet boosts, fusion pool composition), not at the build.
 
 ## Phase 4 — Flip the default
 
