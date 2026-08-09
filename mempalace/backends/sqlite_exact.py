@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 
 _DB_FILENAME = "sqlite_exact.sqlite3"
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+# FTS candidate-generation window for lexical_search, mirroring the chroma
+# lane's ``max_candidates=500``: FTS5 rank selects the window, the shared
+# Okapi rescore ranks it. See ``_rescore_lexical_candidates``.
+_FTS_CANDIDATE_WINDOW = 500
 _SUPPORTED_OPERATORS = frozenset(
     {"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains", "$gt", "$gte", "$lt", "$lte"}
 )
@@ -1313,16 +1317,21 @@ class SQLiteExactCollection(BaseCollection):
     def _lexical_search_fts(self, cur, *, query: str, n_results: int, where: Optional[dict]):
         if not self._fts_available(cur):
             return None
-        tokens = [t for t in _tokenize(query) if len(t) >= 2]
+        # ≥3 like the chroma lane: unicode61 matches whole tokens only, so
+        # 2-char tokens ("to", "of") just explode the OR match set with noise.
+        tokens = [t for t in _tokenize(query) if len(t) >= 3]
         if not tokens:
             return None
         fts_query = " OR ".join(tokens)
         collection_id = self._collection_id(cur)
+        window = max(_FTS_CANDIDATE_WINDOW, n_results)
         if where:
             hits = self._lexical_search_fts_filtered(
                 cur,
                 fts_query=fts_query,
+                query=query,
                 n_results=n_results,
+                window=window,
                 where=where,
                 collection_id=collection_id,
             )
@@ -1334,7 +1343,7 @@ class SQLiteExactCollection(BaseCollection):
             limit_sql = "" if where else "LIMIT ?"
             params = (fts_query, collection_id)
             if not where:
-                params = (*params, max(n_results * 5, n_results))
+                params = (*params, window)
             rows = cur.execute(
                 f"""
                 SELECT doc_id, bm25(docs_fts) AS rank
@@ -1366,36 +1375,60 @@ class SQLiteExactCollection(BaseCollection):
                 ).fetchall()
             )
         by_id = {doc_id: (doc or "", _json_loads(meta_json)) for doc_id, doc, meta_json in docs}
-        hits = []
-        for doc_id, rank in rows:
+        candidates = []
+        for doc_id, _rank in rows:
             doc_meta = by_id.get(doc_id)
             if doc_meta is None:
                 continue
             doc, meta = doc_meta
             if not _matches_where(meta, where):
                 continue
-            hits.append(
-                LexicalHit(
-                    id=doc_id,
-                    document=doc,
-                    metadata=meta,
-                    score=-float(rank),
-                )
-            )
-            if len(hits) >= n_results:
-                break
-        return hits
+            candidates.append((doc_id, doc, meta))
+        return self._rescore_lexical_candidates(query, candidates, n_results)
+
+    @staticmethod
+    def _rescore_lexical_candidates(
+        query: str, candidates: list[tuple], n_results: int
+    ) -> list[LexicalHit]:
+        """Rank FTS *candidates* with the shared Okapi BM25, window-relative IDF.
+
+        FTS5's own ``bm25()`` ranks with whole-corpus IDF and k1=1.2, which is
+        a different function from the chroma lane's candidate-window Okapi
+        rescore — measured 2026-08-09, corpus-IDF top-N selection systematically
+        favors term-stuffed chunks and regressed 3 real click-through goldens
+        while the TF-IDF-derived 300-case set (whose targets *are* the
+        term-dense doc) still improved. The FTS stage is a candidate generator;
+        this rescore is the lane's actual ranking, same as chroma's.
+        """
+        scores = _bm25_scores(query, [doc for _, doc, _ in candidates])
+        hits = [
+            LexicalHit(id=doc_id, document=doc, metadata=meta, score=float(score))
+            for (doc_id, doc, meta), score in zip(candidates, scores)
+            if score > 0
+        ]
+        hits.sort(key=lambda hit: hit.score, reverse=True)
+        return hits[:n_results]
 
     def _lexical_search_fts_filtered(
-        self, cur, *, fts_query: str, n_results: int, where: dict, collection_id: int
+        self,
+        cur,
+        *,
+        fts_query: str,
+        query: str,
+        n_results: int,
+        window: int,
+        where: dict,
+        collection_id: int,
     ):
-        """Filtered BM25 via one FTS5 JOIN with the where compiled to SQL.
+        """Filtered lexical lane via one FTS5 JOIN with the where compiled to SQL.
 
-        The unfiltered path caps its FTS window with a LIMIT; the old filtered
-        path could not (a post-filter after a LIMIT would starve results), so
-        it read the *entire* match set. Pushing the filter into the join keeps
-        the LIMIT sound and bounded. Returns ``None`` when the filter cannot
-        be compiled; the caller falls back to the full-window path.
+        The join keeps the window bounded *within the filter scope* (the old
+        filtered path read the entire match set), and the window is then
+        rescored by :meth:`_rescore_lexical_candidates` — LIMIT ``window``, not
+        ``n_results``: a LIMIT at ``n_results`` made FTS5's corpus-IDF bm25 the
+        lane's final ranking, which is the regression described there. Returns
+        ``None`` when the filter cannot be compiled; the caller falls back to
+        the full-window path.
         """
         try:
             where_sql, where_params = _compile_where(where, prefix="d.")
@@ -1411,22 +1444,15 @@ class SQLiteExactCollection(BaseCollection):
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (fts_query, collection_id, *where_params, n_results),
+                (fts_query, collection_id, *where_params, window),
             ).fetchall()
         except sqlite3.Error:
             logger.debug(
                 "sqlite_exact filtered FTS join failed; using full-window scan", exc_info=True
             )
             return None
-        return [
-            LexicalHit(
-                id=row[0],
-                document=row[2] or "",
-                metadata=_json_loads(row[3]),
-                score=-float(row[1]),
-            )
-            for row in rows
-        ]
+        candidates = [(row[0], row[2] or "", _json_loads(row[3])) for row in rows]
+        return self._rescore_lexical_candidates(query, candidates, n_results)
 
     def close(self) -> None:
         self._closed = True
