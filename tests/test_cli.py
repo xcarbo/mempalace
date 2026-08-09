@@ -132,6 +132,36 @@ def test_cmd_search_calls_search(mock_config_cls):
             wing="mywing",
             room="myroom",
             n_results=3,
+            source_file=None,
+            max_distance=None,
+        )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_search_forwards_filters(mock_config_cls):
+    """--source-file / --max-distance work on the human path now that it
+    routes through search_memories (they used to exit 2 with a
+    'JSON path only' error)."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        palace=None,
+        query="q",
+        wing=None,
+        room=None,
+        results=5,
+        source_file="/x/notes.md",
+        max_distance=0.8,
+    )
+    with patch("mempalace.searcher.search") as mock_search:
+        cmd_search(args)
+        mock_search.assert_called_once_with(
+            query="q",
+            palace_path="/fake/palace",
+            wing=None,
+            room=None,
+            n_results=5,
+            source_file="/x/notes.md",
+            max_distance=0.8,
         )
 
 
@@ -145,6 +175,104 @@ def test_cmd_search_error_exits(mock_config_cls):
         with pytest.raises(SystemExit) as exc_info:
             cmd_search(args)
         assert exc_info.value.code == 1
+
+
+class _FakeLexicalOnlyReachableCollection:
+    """Vector lane returns only session transcripts; the wings-registry
+    drawer is reachable only through ``lexical_search``. Mirrors the live
+    failure measured 2026-08-08: `memp search "wings registry canonical
+    wing list"` missed the registry drawer entirely while the same query
+    with --json ranked it #1, because the human path was a separate,
+    vector-only pipeline with no lexical lane."""
+
+    metadata = {"hnsw:space": "cosine"}
+    distance_metric = "cosine"
+
+    REGISTRY_ID = "drawer_xdev-patterns_wings-registry_59f46b742949a2b8c3345924"
+
+    def query(self, **kwargs):
+        n = 12
+        return {
+            "ids": [[f"session_{i}" for i in range(n)]],
+            "documents": [
+                [f"transcript {i} discussing wings and other palace work" for i in range(n)]
+            ],
+            "metadatas": [
+                [
+                    {"wing": "sessions", "room": "2026-08-01", "source_file": f"s{i}.jsonl"}
+                    for i in range(n)
+                ]
+            ],
+            "distances": [[0.3 + i * 0.02 for i in range(n)]],
+        }
+
+    def lexical_search(self, query, n_results, where=None):
+        from mempalace.backends.base import LexicalHit, LexicalResult
+
+        return LexicalResult(
+            hits=[
+                LexicalHit(
+                    id=self.REGISTRY_ID,
+                    document="wings registry — the canonical wing list for the palace",
+                    metadata={
+                        "wing": "xdev-patterns",
+                        "room": "conventions",
+                        "source_file": "wings-registry.md",
+                        "chunk_index": 0,
+                    },
+                    score=9.7,
+                )
+            ]
+        )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cli_search_finds_lexical_only_drawer_at_rank_1(
+    mock_config_cls, tmp_path, monkeypatch, capsys
+):
+    """THE golden for the pipeline unification: bare `memp search` (no
+    --json) must surface a drawer that only the lexical lane can find, at
+    rank 1. Before cmd_search routed through search_memories this printed
+    five transcripts and missed the registry drawer entirely (~70% of real
+    searches took that weak path)."""
+    from tests._chroma_palace_helper import make_minimal_chroma_sqlite
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    make_minimal_chroma_sqlite(palace)
+    mock_config_cls.return_value.palace_path = str(palace)
+    monkeypatch.setenv("MEMPALACE_RETRIEVAL_LOG", "0")
+    monkeypatch.delenv("MEMPALACE_RERANK_URL", raising=False)
+    monkeypatch.delenv("MEMPALACE_RERANK_MODEL", raising=False)
+
+    fake_col = _FakeLexicalOnlyReachableCollection()
+    args = argparse.Namespace(
+        palace=None,
+        query="wings registry canonical wing list",
+        wing=None,
+        room=None,
+        results=5,
+        source_file=None,
+        max_distance=None,
+    )
+    with (
+        patch("mempalace.searcher.resolve_backend_name", return_value="chroma"),
+        patch("mempalace.searcher._hnsw_capacity_diverged", return_value=False),
+        patch("mempalace.searcher.get_collection", return_value=fake_col),
+        patch(
+            "mempalace.searcher.get_closets_collection",
+            side_effect=RuntimeError("no closets in this palace"),
+        ),
+    ):
+        cmd_search(args)
+
+    out = capsys.readouterr().out
+    first_block, _, _ = out.partition("[2]")
+    assert fake_col.REGISTRY_ID in first_block, (
+        f"expected the lexical-only registry drawer at rank 1, got:\n{out}"
+    )
+    # The hit came through the lexical lane and says so.
+    assert "via=bm25_backend" in first_block
 
 
 # ── _reconcile_search_query (tool-schema --query alias) ────────────────

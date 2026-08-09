@@ -589,10 +589,35 @@ def _print_search_results_bm25_only(
     )
 
 
-def search(query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5):
+# Default vector-distance ceiling for the human CLI path. Mirrors the
+# ``max_distance=1.5`` default on the MCP tool surface (tool_search) so bare
+# `memp search` and `memp search --json` rank identically. Keep in sync.
+SEARCH_MAX_DISTANCE_DEFAULT = 1.5
+
+
+def search(
+    query: str,
+    palace_path: str,
+    wing: str = None,
+    room: str = None,
+    n_results: int = 5,
+    source_file: str = None,
+    max_distance: float = None,
+):
     """
     Search the palace. Returns verbatim drawer content.
-    Optionally filter by wing (project) or room (aspect).
+    Optionally filter by wing (project), room (aspect), or source_file.
+
+    This is a *printer* over :func:`search_memories` — the human CLI output
+    over the exact pipeline the tool surface uses (lexical union lane, closet
+    boost, hybrid rank, archive demotion, final dedup). It was previously a
+    second, older pipeline: vector-only candidates from a pool of n*2, no
+    lexical lane — which made bare `memp search` (the majority production
+    path, ~70% of real searches) miss drawers the ``--json`` path ranked
+    first. One pipeline, two output formats.
+
+    ``max_distance=None`` selects :data:`SEARCH_MAX_DISTANCE_DEFAULT`;
+    pass ``0.0`` explicitly to disable distance filtering.
     """
     # Probe a Chroma palace before get_collection(). Opening the client can
     # load native index state, and embedder-identity enforcement may call
@@ -621,53 +646,32 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     # creation — their similarity scores will be junk until they run repair.
     _warn_if_legacy_metric(col)
 
-    where = build_where_filter(wing, room)
+    if max_distance is None:
+        max_distance = SEARCH_MAX_DISTANCE_DEFAULT
 
-    try:
-        kwargs = {
-            "query_texts": [query],
-            # Over-fetch so chunk-level duplicates of one drawer can be
-            # collapsed and still fill n_results with distinct drawers.
-            "n_results": n_results * 2,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            kwargs["where"] = where
+    result = search_memories(
+        query,
+        palace_path=palace_path,
+        wing=wing,
+        room=room,
+        source_file=source_file,
+        n_results=n_results,
+        max_distance=max_distance,
+    )
+    if result.get("error"):
+        msg = result["error"]
+        display = msg if msg.lower().startswith("search error") else f"Search error: {msg}"
+        print(f"\n  {display}")
+        if result.get("hint"):
+            print(f"  Hint: {result['hint']}")
+        raise SearchError(msg)
 
-        results = col.query(**kwargs)
-
-    except Exception as e:
-        print(f"\n  Search error: {e}")
-        raise SearchError(f"Search error: {e}") from e
-
-    docs = _first_or_empty(results, "documents")
-    metas = _first_or_empty(results, "metadatas")
-    dists = _first_or_empty(results, "distances")
-
-    if not docs:
+    hits = result.get("results") or []
+    if not hits:
         print(f'\n  No results found for: "{query}"')
         return
 
-    # Pure-cosine retrieval on the CLI path was missing lexical matches:
-    # a drawer whose text contains every query term can still score distance
-    # >= 1.0 against the natural-language query when the drawer is a
-    # mechanical artifact (directory listing, diff, log fragment) that
-    # embeds as file-tree noise rather than as prose about its subject.
-    # The MCP tool path already hybridizes BM25 with vector sim via
-    # `_hybrid_rank`; do the same here so CLI results match what agents
-    # see via `mempalace_search`.
     metric = _metric_for_collection(col)
-    rids = _first_or_empty(results, "ids") or [None] * len(docs)
-    hits = [
-        {
-            "text": doc or "",
-            "distance": float(dist),
-            "metadata": meta or {},
-            "drawer_id": _drawer_id_from(meta, rid),
-        }
-        for doc, meta, dist, rid in zip(docs, metas, dists, rids)
-    ]
-    hits = _dedupe_by_drawer_id(_hybrid_rank(hits, query, metric=metric))[:n_results]
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
@@ -679,12 +683,11 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
 
     seen_drawer_ids = []
     for i, hit in enumerate(hits, 1):
-        vec_sim = round(_distance_to_similarity(hit["distance"], metric), 3)
+        sim = hit.get("similarity")
         bm25 = hit.get("bm25_score", 0.0)
-        meta = hit["metadata"]
-        source = Path(meta.get("source_file", "?")).name
-        wing_name = meta.get("wing", "?")
-        room_name = meta.get("room", "?")
+        wing_name = hit.get("wing", "?")
+        room_name = hit.get("room", "?")
+        source = hit.get("source_file", "?")
         drawer_id = hit.get("drawer_id")
         seen_drawer_ids.append(drawer_id)
 
@@ -692,10 +695,15 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         if drawer_id:
             print(f"      ID:     {drawer_id}")
         print(f"      Source: {source}")
-        print(f"      Match:  {metric}_sim={vec_sim}  bm25={bm25}")
+        # Lexical-lane hits (matched_via="bm25_backend") have no vector
+        # distance; show sim=n/a rather than a fake 0.0.
+        sim_str = f"{metric}_sim={sim}" if sim is not None else f"{metric}_sim=n/a"
+        via = hit.get("matched_via", "drawer")
+        via_str = f"  via={via}" if via != "drawer" else ""
+        print(f"      Match:  {sim_str}  bm25={bm25}{via_str}")
         print()
         # Print the verbatim text, indented
-        for line in hit["text"].strip().split("\n"):
+        for line in (hit.get("text") or "").strip().split("\n"):
             print(f"      {line}")
         print()
         print(f"  {'─' * 56}")
@@ -707,9 +715,11 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         query=query,
         wing=wing,
         room=room,
+        source_file=source_file,
         limit=n_results,
         returned=len(hits),
         drawer_ids=seen_drawer_ids,
+        fallback=result.get("fallback"),
     )
 
 

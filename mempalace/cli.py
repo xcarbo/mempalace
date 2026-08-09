@@ -956,18 +956,6 @@ def _reconcile_search_query(args):
 
 
 def cmd_search(args):
-    # The human search path (searcher.search) does not support these filters;
-    # fail fast rather than silently return unfiltered results.
-    if (
-        getattr(args, "source_file", None) is not None
-        or getattr(args, "max_distance", None) is not None
-    ):
-        print(
-            "mempalace: --source-file/--max-distance apply to the JSON path only — add --json",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
     from .searcher import search, SearchError
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
@@ -978,6 +966,8 @@ def cmd_search(args):
             wing=args.wing,
             room=args.room,
             n_results=args.results,
+            source_file=getattr(args, "source_file", None),
+            max_distance=getattr(args, "max_distance", None),
         )
     except SearchError:
         sys.exit(1)
@@ -2118,14 +2108,14 @@ def main():
         "--source-file",
         dest="source_file",
         default=None,
-        help="Filter to one exact stored source_file path (JSON path only — requires --json)",
+        help="Filter to one exact stored source_file path",
     )
     p_search.add_argument(
         "--max-distance",
         dest="max_distance",
         type=float,
         default=None,
-        help="Max cosine distance 0-2; drop farther results (JSON path only — requires --json)",
+        help="Max cosine distance 0-2; drop farther results (default 1.5; 0 disables)",
     )
 
     # compress
