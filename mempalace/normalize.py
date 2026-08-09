@@ -974,8 +974,18 @@ def _format_tool_result(content, tool_name: str) -> str:
     return "→ " + text
 
 
-def _messages_to_transcript(messages: list, spellcheck: bool = True) -> str:
-    """Convert [(role, text), ...] to transcript format with > markers."""
+def _messages_to_transcript(messages: list, spellcheck: bool = False) -> str:
+    """Convert [(role, text), ...] to transcript format with > markers.
+
+    ``spellcheck`` defaults OFF (2026-08 audit, finding 12): the system
+    whose founding promise is "we return your exact words" was silently
+    storing spell-corrected ones — and the now-default lexical lane
+    (FTS5/BM25) then matched the corrected token instead of the one the
+    user will actually type when searching for their own words. Spellcheck
+    also corrupts code fragments, names, and deliberate spellings inside
+    user turns. The module stays available as opt-in query-side expansion;
+    it just never rewrites what gets stored.
+    """
     if spellcheck:
         try:
             from mempalace.spellcheck import spellcheck_user_text

@@ -399,6 +399,38 @@ def test_claude_code_jsonl_chrome_only_session_returns_empty():
     assert result == ""
 
 
+def test_misspelled_user_turn_is_stored_verbatim():
+    """Verbatim restored (2026-08 audit, finding 12): mine-time spellcheck
+    must NOT rewrite the user's words before storage. A misspelling is what
+    the user typed and what they will type again when searching (the
+    lexical lane matches exact tokens). Pin: the transcript carries the
+    misspelled text byte-for-byte, even when the speller would correct it."""
+    from unittest.mock import patch
+
+    from mempalace.normalize import _messages_to_transcript
+
+    misspelled = "knoe the qeustion befor answering"
+    lines = [
+        json.dumps({"type": "user", "message": {"content": misspelled}}),
+        json.dumps({"type": "assistant", "message": {"content": "Understood."}}),
+    ]
+    # Belt and braces: even if a speller is installed and eager, the mine
+    # path must never call it. Patch it to something destructive so an
+    # accidental call is loud.
+    with patch(
+        "mempalace.spellcheck.spellcheck_user_text",
+        side_effect=AssertionError("mine-time spellcheck must not run"),
+    ):
+        result = _try_claude_code_jsonl("\n".join(lines))
+    assert result is not None
+    assert f"> {misspelled}" in result
+
+    # And the explicit opt-in still works — the module is kept, not killed.
+    with patch("mempalace.spellcheck.spellcheck_user_text", return_value="corrected!"):
+        opted_in = _messages_to_transcript([("user", misspelled)], spellcheck=True)
+    assert "corrected!" in opted_in
+
+
 def test_claude_code_jsonl_not_claude_code_still_returns_none():
     """Content with no conversation-shaped entries keeps the None verdict so
     other formats (and plain-text passthrough) still get their turn."""
