@@ -1056,6 +1056,11 @@ def _merge_bm25_union_candidates(
     meaningfully violate one either; it is admitted on lexical relevance, which
     is a different and equally valid signal. The threshold still does its real
     job, which is keeping distant *vector* matches out.
+
+    Returns ``"ok"`` or ``"failed"`` so the caller can surface a degraded
+    (vector-only) search instead of hiding it. The lexical lane was
+    silently off for months, three different ways at once; a lane that
+    dies must at least say so.
     """
     where = build_where_filter(wing, room, source_file)
     try:
@@ -1067,8 +1072,10 @@ def _merge_bm25_union_candidates(
     except UnsupportedCapabilityError:
         raise
     except Exception:
-        logger.debug("candidate_strategy=union: lexical fetch failed", exc_info=True)
-        return
+        # WARNING, not debug: this degrades search quality for the caller
+        # (vector-only results) and must be visible in logs.
+        logger.warning("candidate_strategy=union: lexical fetch failed", exc_info=True)
+        return "failed"
 
     bm25_extra = []
     for hit in lexical.hits:
@@ -1115,6 +1122,7 @@ def _merge_bm25_union_candidates(
         bh["closet_boost"] = 0.0
         hits.append(bh)
         seen.add(key)
+    return "ok"
 
 
 # Strategy dispatch — keeps search_memories' branch count under the
@@ -1173,24 +1181,26 @@ def _apply_candidate_strategy(
     n_results: int,
     max_distance: float = 0.0,
     source_file: str = None,
-) -> None:
+) -> "str | None":
     """Dispatch to the registered merger for ``strategy``.
 
     Strategy validity is assumed (``_validate_candidate_strategy`` runs
-    earlier); ``"vector"`` is a no-op.
+    earlier); ``"vector"`` is a no-op returning ``None``. Union returns the
+    merger's lane status (``"ok"`` / ``"failed"``).
     """
     merger = _CANDIDATE_MERGERS[strategy]
-    if merger is not None:
-        merger(
-            hits,
-            drawers_col,
-            query,
-            wing,
-            room,
-            n_results,
-            max_distance=max_distance,
-            source_file=source_file,
-        )
+    if merger is None:
+        return None
+    return merger(
+        hits,
+        drawers_col,
+        query,
+        wing,
+        room,
+        n_results,
+        max_distance=max_distance,
+        source_file=source_file,
+    )
 
 
 def _finalize_candidate_hits(
@@ -1206,8 +1216,11 @@ def _finalize_candidate_hits(
     source_file: str = None,
     strategy_was_explicit: bool = True,
 ) -> tuple:
+    """Returns ``(hits, error, lexical_lane)`` — ``lexical_lane`` is
+    ``"ok"`` / ``"failed"`` / ``"unsupported"`` when the union lane was in
+    play, ``None`` for pure-vector strategies."""
     try:
-        _apply_candidate_strategy(
+        lexical_lane = _apply_candidate_strategy(
             candidate_strategy,
             hits,
             drawers_col,
@@ -1223,12 +1236,22 @@ def _finalize_candidate_hits(
             # Took the default on a backend without lexical search: use the
             # vector candidates we already have rather than failing the search.
             logger.debug("lexical lane unavailable on this backend; vector candidates only")
+            lexical_lane = "unsupported"
         else:
-            return [], {
-                "error": "candidate_strategy='union' requires a backend with lexical_search support",
-                "unsupported_capability": "supports_lexical_search",
-                "hint": "Use candidate_strategy='vector' or select a backend that supports lexical search.",
-            }
+            return (
+                [],
+                {
+                    "error": (
+                        "candidate_strategy='union' requires a backend with lexical_search support"
+                    ),
+                    "unsupported_capability": "supports_lexical_search",
+                    "hint": (
+                        "Use candidate_strategy='vector' or select a backend "
+                        "that supports lexical search."
+                    ),
+                },
+                "unsupported",
+            )
 
     ranked = _hybrid_rank(hits, query, metric=_metric_for_collection(drawers_col))
     # Optional second-stage rerank on the deduped pool (opt-in, local,
@@ -1239,7 +1262,7 @@ def _finalize_candidate_hits(
         h.pop("_source_file_full", None)
         h.pop("_chunk_index", None)
         h.pop("_parent_drawer_id", None)
-    return hits, None
+    return hits, None, lexical_lane
 
 
 def _backend_mismatch_result(error: BackendMismatchError) -> dict:
@@ -1432,6 +1455,34 @@ def _query_drawers_with_filter_fallback(
         return {"documents": [fdocs], "metadatas": [fmetas], "distances": [fdists]}
 
 
+def _assemble_search_result(
+    *,
+    query: str,
+    wing,
+    room,
+    source_file,
+    total_before_filter: int,
+    hits: list,
+    lexical_lane,
+) -> dict:
+    """Build the public search_memories response dict.
+
+    ``lexical_lane`` is included only when the union lane was in play
+    ("ok" / "failed" / "unsupported"), so a search degraded to vector-only
+    is observable rather than silent — the lexical lane was off for months,
+    three different ways at once, and nothing said so.
+    """
+    result = {
+        "query": query,
+        "filters": {"wing": wing, "room": room, "source_file": source_file},
+        "total_before_filter": total_before_filter,
+        "results": hits,
+    }
+    if lexical_lane is not None:
+        result["lexical_lane"] = lexical_lane
+    return result
+
+
 def search_memories(
     query: str,
     palace_path: str,
@@ -1465,21 +1516,25 @@ def search_memories(
             detects a divergence that would segfault chromadb on segment
             load.
         candidate_strategy: How candidates for the hybrid re-rank are gathered.
+            ``None`` (the common case) selects ``DEFAULT_CANDIDATE_STRATEGY``,
+            which is ``"union"``.
 
-            * ``"vector"`` (default) — preserves historical behavior: top
-              ``n_results * 3`` rows from the vector index are the rerank pool.
-              Cheap; works well when query and target docs agree in the
-              embedding space.
-            * ``"union"`` — also pull top ``n_results * 3`` lexical candidates
-              through the backend's ``lexical_search`` capability and merge
-              them into the rerank pool (deduped by source_file). Catches docs
-              with strong BM25 signal that are vector-distant from the query.
-              Perf depends on the selected backend; opt in until the cost is
-              characterized.
+            * ``"union"`` (default) — vector candidates plus top lexical
+              candidates pulled through the backend's ``lexical_search``
+              capability, merged into the rerank pool (chunk-precise dedup).
+              Catches docs with strong BM25 signal that are vector-distant
+              from the query — measured +18.7 points R@5 over vector-only on
+              the 300-case eval (2026-08-08). ``max_distance`` bounds the
+              vector lane only; lexical candidates have no vector distance
+              and are admitted on lexical relevance.
+            * ``"vector"`` — historical behavior: top ``n_results * 3`` rows
+              from the vector index are the whole rerank pool. Cheaper
+              (~50ms vs ~227ms p50), but cannot find a drawer whose embedding
+              is poor even when its text matches the query word for word.
 
-              When ``max_distance > 0.0`` is also set, BM25-only candidates
-              are skipped — they have no vector distance and would silently
-              violate the requested distance threshold.
+            The result carries ``lexical_lane`` ("ok" / "failed" /
+            "unsupported") whenever the union lane was requested, so a
+            degraded search is observable instead of silent.
     """
     # Validate the strategy eagerly so invalid values fail the same way
     # regardless of whether the call routes through the vector path or
@@ -1717,7 +1772,7 @@ def search_memories(
     # caller's strict distance threshold.
     # The helper also runs the final BM25 hybrid re-rank and strips internal
     # dedup fields before returning.
-    hits, strategy_error = _finalize_candidate_hits(
+    hits, strategy_error, lexical_lane = _finalize_candidate_hits(
         candidate_strategy=candidate_strategy,
         hits=hits,
         drawers_col=drawers_col,
@@ -1732,12 +1787,15 @@ def search_memories(
     if strategy_error:
         return strategy_error
 
-    return {
-        "query": query,
-        "filters": {"wing": wing, "room": room, "source_file": source_file},
-        "total_before_filter": len(_first_or_empty(drawer_results, "documents")),
-        "results": hits,
-    }
+    return _assemble_search_result(
+        query=query,
+        wing=wing,
+        room=room,
+        source_file=source_file,
+        total_before_filter=len(_first_or_empty(drawer_results, "documents")),
+        hits=hits,
+        lexical_lane=lexical_lane,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
