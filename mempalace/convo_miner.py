@@ -865,8 +865,14 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
 
     Best-effort: hallway computation must never fail an otherwise-good mine, and is
     skipped when nothing new was filed.
+
+    Gated OFF by default (2026-08 audit): every mine was rewriting a 126 MB
+    pretty-printed hallways.json read by nothing except the ``memp hallways``
+    CLI listing. Re-enable with hallways_enabled / MEMPALACE_HALLWAYS=1.
     """
     if drawers_filed <= 0:
+        return
+    if config is not None and not config.hallways_enabled:
         return
     try:
         from .hallways import compute_hallways_for_wing

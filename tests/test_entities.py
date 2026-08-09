@@ -67,3 +67,21 @@ def test_metadata_is_semicolon_joined():
     assert md == "one_thing;TwoThing"
     assert entities_metadata("") == ""
     assert entities_metadata("just plain prose with nothing structural") == ""
+
+
+def test_extract_skips_audit_denylist_but_keeps_structural_identifiers():
+    """The 2026-08 junk denylist (metadata keys, tool names, infra tokens)
+    must not survive into entities metadata — but the extractor's real
+    outputs (project identifiers, paths) must be untouched."""
+    text = (
+        "The `drawer_id` and `source_file` metadata plus WebFetch results "
+        "landed in node_modules via json.load; see README.md. "
+        "We changed `MemoryStack` in rag/foo.py via do_thing_now()."
+    )
+    entities = extract_structural_entities(text)
+    lowered = {e.lower() for e in entities}
+    for junk in ("drawer_id", "source_file", "webfetch", "node_modules", "json.load", "readme.md"):
+        assert junk not in lowered, f"denylisted token survived: {junk}"
+    assert "MemoryStack" in entities
+    assert "rag/foo.py" in entities
+    assert "do_thing_now" in entities

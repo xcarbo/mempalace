@@ -20,7 +20,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
-from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
+from .entity_detector import _apply_known_systems_prepass, _get_coca_filter, is_junk_entity_token
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -1054,6 +1054,10 @@ def _extract_entities_for_metadata(content: str) -> str:
         # metadata so they don't poison hallways/tunnels/search.
         if w.lower() in coca_filter:
             continue
+        # 2026-08 audit — metadata keys, tool names, and path/code-shaped
+        # tokens measured as ~85% of stored entities; never proper nouns.
+        if is_junk_entity_token(w):
+            continue
         freq[w] = freq.get(w, 0) + 1
     for w, c in freq.items():
         if c >= 2 and len(w) > 2:
@@ -1936,33 +1940,45 @@ def _mine_impl(
             # tunnel-compute fault-tolerance pattern — hallway computation
             # must never fail a mine; it's a derived analytic, not load-bearing
             # for the drawer write that already committed above.
-            try:
-                hallways_created = compute_hallways_for_wing(
-                    wing, col=collection, config=graph_config
-                )
-                if hallways_created:
-                    print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
-            except Exception as e:
-                print(
-                    f"\n  WARNING: hallway computation skipped — {e}",
-                    file=sys.stderr,
-                )
+            #
+            # Gated OFF by default (2026-08 audit): recomputing hallways on
+            # every mine was rewriting a 126 MB hallways.json consumed by
+            # nothing but the `memp hallways` CLI listing. Entity tunnels are
+            # derived FROM those hallway records, so they share the gate —
+            # computing them from a stale file would be worse than skipping.
+            # Re-enable with hallways_enabled / MEMPALACE_HALLWAYS=1.
+            if graph_config.hallways_enabled:
+                try:
+                    hallways_created = compute_hallways_for_wing(
+                        wing, col=collection, config=graph_config
+                    )
+                    if hallways_created:
+                        print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
+                except Exception as e:
+                    print(
+                        f"\n  WARNING: hallway computation skipped — {e}",
+                        file=sys.stderr,
+                    )
 
-            # Cross-wing entity tunnels: derived from the hallway records
-            # materialized just above. When an entity appears in hallways of
-            # this wing AND another wing, a tunnel bridges them. Runs in
-            # parallel with topic tunnels — both kinds coexist via
-            # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
-            # pattern: never fail a mine over a derived analytic.
-            try:
-                entity_tunnels_added = _compute_entity_tunnels_for_wing(wing, config=graph_config)
-                if entity_tunnels_added:
-                    print(f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)")
-            except Exception as e:
-                print(
-                    f"\n  WARNING: entity tunnel computation skipped — {e}",
-                    file=sys.stderr,
-                )
+                # Cross-wing entity tunnels: derived from the hallway records
+                # materialized just above. When an entity appears in hallways
+                # of this wing AND another wing, a tunnel bridges them. Runs
+                # in parallel with topic tunnels — both kinds coexist via
+                # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
+                # pattern: never fail a mine over a derived analytic.
+                try:
+                    entity_tunnels_added = _compute_entity_tunnels_for_wing(
+                        wing, config=graph_config
+                    )
+                    if entity_tunnels_added:
+                        print(
+                            f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)"
+                        )
+                except Exception as e:
+                    print(
+                        f"\n  WARNING: entity tunnel computation skipped — {e}",
+                        file=sys.stderr,
+                    )
 
             _validate_palace_fts5_after_mine(palace_path)
 

@@ -1059,3 +1059,40 @@ def test_zh_tw_known_limitation_inline_name_no_boundary():
     result = extract_candidates(text, languages=("zh-TW",))
     # Extraction is expected to miss this adversarial case.
     assert "朱宜振" not in result
+
+
+class TestJunkEntityToken:
+    """2026-08 audit stoplist: metadata keys, tool names, infra tokens, and
+    (for proper-noun extraction) anything path/code-shaped. Measured: ~85%
+    of the live palace's stored entities were this junk."""
+
+    def test_metadata_keys_are_junk(self):
+        from mempalace.entity_detector import is_junk_entity_token
+
+        for token in ("drawer_id", "source_file", "filed_at", "chunk_index", "added_by"):
+            assert is_junk_entity_token(token)
+            assert is_junk_entity_token(token, allow_structural=True)
+
+    def test_tool_and_infra_tokens_are_junk_even_for_structural(self):
+        from mempalace.entity_detector import is_junk_entity_token
+
+        for token in ("WebFetch", "node_modules", "json.load", "README.md", "sys.stdin"):
+            assert is_junk_entity_token(token, allow_structural=True), token
+
+    def test_shape_heuristic_applies_only_to_proper_noun_extraction(self):
+        from mempalace.entity_detector import is_junk_entity_token
+
+        # Proper-noun path: names never contain _ . /
+        assert is_junk_entity_token("some_snake_case")
+        assert is_junk_entity_token("pkg.module")
+        assert is_junk_entity_token("a/b.py")
+        # Structural path: those shapes are the extractor's purpose.
+        assert not is_junk_entity_token("do_thing_now", allow_structural=True)
+        assert not is_junk_entity_token("rag/foo.py", allow_structural=True)
+
+    def test_real_names_are_not_junk(self):
+        from mempalace.entity_detector import is_junk_entity_token
+
+        for token in ("Bachmeyer", "ForgePoint", "MemoryStack", "Trevor"):
+            assert not is_junk_entity_token(token)
+            assert not is_junk_entity_token(token, allow_structural=True)

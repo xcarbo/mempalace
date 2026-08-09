@@ -137,7 +137,10 @@ def _save_hallways(hallways: list[dict], config=None) -> None:
     fd, tmp_path = tempfile.mkstemp(prefix=".hallways-", suffix=".tmp", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
+            # Compact separators, no indent: pretty-printing this file
+            # measured 126 MB on the live palace (2026-08 audit), rewritten
+            # on every mine for a machine-read artifact nobody pages through.
+            json.dump(payload, f, separators=(",", ":"), ensure_ascii=False)
         try:
             os.chmod(tmp_path, 0o600)
         except OSError:

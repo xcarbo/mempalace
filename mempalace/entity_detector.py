@@ -78,6 +78,105 @@ def _get_coca_filter() -> frozenset[str]:
         return frozenset()
 
 
+# ==================== JUNK-TOKEN STOPLIST (2026-08 audit, finding 7) ====================
+#
+# The live palace's `entities` metadata measured ~85% junk: of the top 40
+# tokens by frequency, ~6 were real entities — the rest were drawer-metadata
+# key names (`drawer_id` 2,614 rows, `source_file` 1,888, `filed_at` 1,388),
+# harness tool names (`WebFetch` 1,313), and build/runtime infrastructure
+# (`node_modules`, `json.load`, `README.md`, `sys.stdin`). Hallways are
+# derived from these entities, so the junk poisoned the whole associative
+# graph downstream.
+#
+# Two tiers of filtering, because the two extractors have different
+# contracts:
+#   * Capitalized/proper-noun extraction (people, projects — miner metadata
+#     tagging, closet pointers): a real person or project name never
+#     contains `_`, `.` or `/`, so the full rule applies (denylist + the
+#     path/code-shape heuristic).
+#   * Structural extraction (``entities.py`` — code spans, paths,
+#     identifiers for the associative graph): `_`/`.`/`/` tokens are its
+#     entire purpose, so only the curated denylist applies there
+#     (``allow_structural=True``).
+
+_JUNK_ENTITY_TOKENS = frozenset(
+    {
+        # Drawer-metadata key names — echoed constantly in tool output and
+        # session transcripts, never a thing anyone searches for.
+        "drawer_id",
+        "drawer_ids",
+        "parent_drawer_id",
+        "parent_entry_id",
+        "source_file",
+        "filed_at",
+        "authored_at",
+        "added_by",
+        "chunk_index",
+        "chunk_ids",
+        "chunk_size",
+        "content_hash",
+        "source_mtime",
+        "ingest_mode",
+        "extract_mode",
+        "memory_type",
+        "normalize_version",
+        "id_recipe",
+        "wing",
+        "room",
+        "hall",
+        "metadatas",
+        "embeddings",
+        # Agent-harness tool names — machine scaffolding, not entities.
+        "webfetch",
+        "websearch",
+        "todowrite",
+        "toolsearch",
+        "tool_use",
+        "tool_result",
+        "tool_use_id",
+        "notebookedit",
+        "askuserquestion",
+        "sendmessage",
+        # Build/runtime infrastructure tokens.
+        "node_modules",
+        "__pycache__",
+        "readme.md",
+        "package.json",
+        "pyproject.toml",
+        "requirements.txt",
+        "json.load",
+        "json.loads",
+        "json.dumps",
+        "sys.stdin",
+        "sys.stdout",
+        "sys.stderr",
+        "os.path",
+        "http",
+        "https",
+    }
+)
+
+_JUNK_SHAPE_CHARS = ("_", ".", "/")
+
+
+def is_junk_entity_token(token: str, allow_structural: bool = False) -> bool:
+    """True when ``token`` is metadata/tooling/infra junk, not an entity.
+
+    ``allow_structural=True`` applies only the curated denylist — for the
+    structural extractor in ``entities.py``, whose whole design is
+    ``_``/``.``/``/``-shaped identifiers. Everything else (capitalized
+    proper-noun candidates) also fails on the shape heuristic: real people
+    and projects don't contain underscores, dots, or slashes.
+    """
+    if not token:
+        return True
+    if token.strip().lower() in _JUNK_ENTITY_TOKENS:
+        return True
+    if not allow_structural and any(ch in token for ch in _JUNK_SHAPE_CHARS):
+        return True
+    return False
+
+
 # ==================== KNOWN-SYSTEMS COMPOUND LEXICON (Tier 3 linguistics cleanup) ====================
 #
 # Multi-word product / system names that must be detected atomically — NOT

@@ -89,9 +89,15 @@ def test_mine_computes_hallways_for_wing_post_mine(monkeypatch):
     This is the integration test for the hallway primitive — without this
     call, the hallway module is dead code (no miner triggers it). Mirrors
     the existing tunnel-computation integration pattern at miner.py:1241.
+
+    Hallway computation is gated OFF by default since the 2026-08 audit
+    (126 MB hallways.json rewritten per mine, zero consumers), so this
+    test opts in via MEMPALACE_HALLWAYS.
     """
 
     from mempalace import miner as miner_mod
+
+    monkeypatch.setenv("MEMPALACE_HALLWAYS", "1")
 
     hallway_calls = []
 
@@ -139,6 +145,55 @@ def test_mine_computes_hallways_for_wing_post_mine(monkeypatch):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_mine_skips_hallways_and_entity_tunnels_by_default(monkeypatch):
+    """Default-off pin for the 2026-08 gate: without MEMPALACE_HALLWAYS /
+    hallways_enabled, a mine must call NEITHER compute_hallways_for_wing
+    nor _compute_entity_tunnels_for_wing — every mine was rewriting a
+    126 MB hallways.json consumed by nothing."""
+    from mempalace import miner as miner_mod
+
+    calls = []
+    monkeypatch.setattr(
+        miner_mod,
+        "compute_hallways_for_wing",
+        lambda *a, **kw: calls.append("hallways") or [],
+    )
+    monkeypatch.setattr(
+        miner_mod,
+        "_compute_entity_tunnels_for_wing",
+        lambda *a, **kw: calls.append("entity_tunnels") or 0,
+    )
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        os.makedirs(project_root / "backend")
+        write_file(
+            project_root / "backend" / "app.py",
+            "def main():\n    print('hello world')\n" * 20,
+        )
+        with open(project_root / "mempalace.yaml", "w") as f:
+            yaml.dump(
+                {
+                    "wing": "test_project",
+                    "rooms": [{"name": "backend", "description": "Backend code"}],
+                },
+                f,
+            )
+
+        palace_path = project_root / "palace"
+        mine(str(project_root), str(palace_path))
+        assert calls == [], f"hallway-derived computation ran despite default-off gate: {calls}"
+
+        # The drawer write itself still committed.
+        client = chromadb.PersistentClient(path=str(palace_path))
+        col = client.get_collection("mempalace_drawers")
+        assert col.count() > 0
+        del col, client
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_mine_hallway_failure_does_not_crash_mine(monkeypatch):
     """If compute_hallways_for_wing raises, the mine must still complete.
 
@@ -147,6 +202,8 @@ def test_mine_hallway_failure_does_not_crash_mine(monkeypatch):
     load-bearing for the drawer write itself.
     """
     from mempalace import miner as miner_mod
+
+    monkeypatch.setenv("MEMPALACE_HALLWAYS", "1")  # gate on so the failure path runs
 
     def angry_compute(wing, col=None, min_count=2, config=None):
         raise RuntimeError("simulated hallway-compute explosion")
@@ -189,9 +246,12 @@ def test_mine_computes_entity_tunnels_for_wing_post_mine(monkeypatch):
     Without this call the entity-tunnel feature is dead code — no miner
     triggers it, no entity tunnels ever land in ~/.mempalace/tunnels.json.
     Mirrors the existing hallway- and topic-tunnel integration tests in
-    this file.
+    this file. Entity tunnels are derived from hallway records, so they
+    share the hallways_enabled gate (default off) — opt in via env.
     """
     from mempalace import miner as miner_mod
+
+    monkeypatch.setenv("MEMPALACE_HALLWAYS", "1")
 
     entity_tunnel_calls = []
 
@@ -242,6 +302,8 @@ def test_mine_entity_tunnel_failure_does_not_crash_mine(monkeypatch):
     not load-bearing for the drawer write itself.
     """
     from mempalace import miner as miner_mod
+
+    monkeypatch.setenv("MEMPALACE_HALLWAYS", "1")  # gate on so the failure path runs
 
     def angry_compute(wing, config=None):
         raise RuntimeError("simulated entity-tunnel-compute explosion")

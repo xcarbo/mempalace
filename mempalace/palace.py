@@ -26,7 +26,7 @@ from .backends import (
     resolve_backend_for_palace,
 )
 from .backends.embedding_wrapper import EmbeddingCollection
-from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
+from .entity_detector import _apply_known_systems_prepass, _get_coca_filter, is_junk_entity_token
 from .locks import (
     ORPHAN_GUIDANCE,
     describe_holder,
@@ -674,6 +674,10 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room, drawer_meta
         # ("Code", "Line", "Note", "Phase", …) so they don't appear in
         # closet pointers as fake entities.
         if w.lower() in coca_filter:
+            continue
+        # 2026-08 audit — metadata keys, tool names, path/code-shaped
+        # tokens are never proper nouns; keep them out of closet pointers.
+        if is_junk_entity_token(w):
             continue
         word_freq[w] = word_freq.get(w, 0) + 1
     entities = sorted(
