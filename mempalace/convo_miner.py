@@ -843,6 +843,31 @@ def mine_convos(
         )
 
 
+def _handle_dedup_skips(
+    collection,
+    palace_path,
+    source_file,
+    wing,
+    agent,
+    extract_mode,
+    dedup_lineage,
+    drawers_added,
+) -> str:
+    """Post-file bookkeeping for cross-file dedup skips.
+
+    Persists the lineage records, and registers the sentinel when EVERY
+    chunk was a duplicate — nothing was stored, so nothing carries the
+    file's mtime and it would otherwise be re-processed on every future
+    mine. Returns the per-file console note ("" when nothing was skipped).
+    """
+    if not dedup_lineage:
+        return ""
+    _append_dedup_lineage(palace_path, dedup_lineage)
+    if drawers_added == 0:
+        _register_file(collection, source_file, wing, agent, extract_mode)
+    return f" (dedup: {len(dedup_lineage)} skipped)"
+
+
 def _append_dedup_lineage(palace_path: str, records: list) -> None:
     """Append dedup-skip lineage records to ``<palace>/dedup_lineage.jsonl``.
 
@@ -1040,20 +1065,22 @@ def _mine_convos_impl(
         if skipped:
             files_skipped += 1
             continue
-        if dedup_lineage:
-            _append_dedup_lineage(palace_path, dedup_lineage)
-            total_dedup_skipped += len(dedup_lineage)
-            if drawers_added == 0:
-                # Every chunk was a cross-file duplicate — nothing was stored,
-                # so nothing carries this file's mtime. Register the sentinel
-                # or the file gets fully re-processed on every future mine.
-                _register_file(collection, source_file, wing, agent, extract_mode)
+        dedup_note = _handle_dedup_skips(
+            collection,
+            palace_path,
+            source_file,
+            wing,
+            agent,
+            extract_mode,
+            dedup_lineage,
+            drawers_added,
+        )
+        total_dedup_skipped += len(dedup_lineage)
         for r, n in room_delta.items():
             room_counts[r] += n
 
         total_drawers += drawers_added
         files_mined += 1
-        dedup_note = f" (dedup: {len(dedup_lineage)} skipped)" if dedup_lineage else ""
         print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}{dedup_note}")
         if limit > 0 and files_mined >= limit:
             break
@@ -1065,6 +1092,15 @@ def _mine_convos_impl(
         _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
         _validate_palace_fts5_after_mine(palace_path)
 
+    _print_convo_mine_summary(
+        files_processed, files_skipped, total_drawers, total_dedup_skipped, room_counts
+    )
+
+
+def _print_convo_mine_summary(
+    files_processed, files_skipped, total_drawers, total_dedup_skipped, room_counts
+) -> None:
+    """End-of-mine console summary for ``_mine_convos_impl``."""
     print(f"\n{'=' * 55}")
     print("  Done.")
     print(f"  Files processed: {files_processed - files_skipped}")

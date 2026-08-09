@@ -6046,9 +6046,7 @@ def test_add_drawer_contextual_headers_keep_stored_content_verbatim(
         assert doc in content
 
 
-def test_add_drawer_contextual_headers_change_the_vector(
-    monkeypatch, config, palace_path, kg
-):
+def test_add_drawer_contextual_headers_change_the_vector(monkeypatch, config, palace_path, kg):
     """The chunk vector must be the embedding of the header-prefixed text,
     not of the bare stored chunk — otherwise the feature is a no-op."""
     pytest.importorskip("onnxruntime")
@@ -6071,9 +6069,7 @@ def test_add_drawer_contextual_headers_change_the_vector(
     chunk_doc = row["documents"][0]
 
     ef = get_embedding_function()
-    header_text = contextual_embedding_texts(
-        "w", "r", content, [chunk_doc] * result["chunks"]
-    )[0]
+    header_text = contextual_embedding_texts("w", "r", content, [chunk_doc] * result["chunks"])[0]
     expected = list(ef(input=[header_text])[0])
     bare = list(ef(input=[chunk_doc])[0])
     assert stored_vec == pytest.approx(expected, abs=1e-5)
