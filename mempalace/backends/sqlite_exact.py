@@ -221,7 +221,14 @@ class _WhereNotTranslatable(Exception):
 
 
 # Metadata keys promoted to indexed generated columns (see ``_init_schema``).
-_GENERATED_META_COLUMNS = ("wing", "room", "authored_at")
+# All string-valued in every write path: TEXT affinity on the generated column
+# is lossless. Do NOT add integer-valued keys (e.g. ``chunk_index``) — TEXT
+# affinity would coerce them and break ``IS ?`` comparisons against ints.
+# ``source_file`` / ``parent_drawer_id`` serve the searcher's per-hit
+# neighbor/hydration ``get(where=...)`` calls, which otherwise scan the
+# whole collection per call (measured 775 ms warm, seconds cold, ×2 per
+# closet-boosted hit — the entire 2026-08-09 cutover latency tail).
+_GENERATED_META_COLUMNS = ("wing", "room", "authored_at", "source_file", "parent_drawer_id")
 
 # JSON path keys we can quote safely inside ``$."<key>"``. A double quote or
 # backslash would need JSON-path escaping SQLite does not define; those keys
@@ -767,47 +774,125 @@ class SQLiteExactCollection(BaseCollection):
                 )
                 self._replace_fts(cur, collection_id, doc_id, doc, rowid)
 
-    def _rows(self, cur, *, where=None, where_document=None, limit=None, offset=None) -> list[dict]:
+    def _rows(
+        self, cur, *, where=None, where_document=None, limit=None, offset=None, with_embedding=True
+    ) -> list[dict]:
         _validate_where(where)
         _validate_where(where_document)
         collection_id = self._collection_id(cur)
-        sql = (
-            "SELECT id, document, metadata_json, embedding\n"
-            "FROM documents\n"
-            "WHERE collection_id = ?\n"
-            "ORDER BY rowid"
+        # Compile the filters to SQL when possible so a filtered read is a
+        # (potentially indexed) SQL scan instead of a full-collection fetch
+        # plus Python JSON matching. Untranslatable filters keep the Python
+        # scan, which is a slow path, never a behavior change — both paths
+        # evaluate the same predicate semantics over rowid order.
+        compiled_clauses: list[str] = []
+        compiled_params: list = []
+        compiled = True
+        try:
+            if where is not None:
+                sql_part, w_params = _compile_where(where)
+                compiled_clauses.append(sql_part)
+                compiled_params.extend(w_params)
+            if where_document is not None:
+                sql_part, d_params = _compile_where_document(where_document)
+                compiled_clauses.append(sql_part)
+                compiled_params.extend(d_params)
+        except _WhereNotTranslatable:
+            compiled = False
+            compiled_clauses = []
+            compiled_params = []
+        needs_python_filter = not compiled and (where is not None or where_document is not None)
+        # The embedding blob dominates row width (1.5 KB at 384-d); skip it
+        # unless the caller actually wants vectors back.
+        select_cols = "rowid, id, document, metadata_json" + (
+            ", embedding" if with_embedding else ""
         )
-        params = [collection_id]
-        # Emit SQL LIMIT/OFFSET only on an unfiltered page. With a
-        # where/where_document the post-filter loop below drops rows *after*
-        # this scan, so a SQL LIMIT/OFFSET would cut the wrong rows; those
-        # callers scan in full and paginate in Python. SQLite requires a LIMIT
-        # before OFFSET, so an offset-only page uses "LIMIT -1" (unbounded).
-        if where is None and where_document is None and (limit is not None or offset):
-            if limit is not None:
-                sql += "\nLIMIT ?"
-                params.append(int(limit))
-            elif offset:
-                sql += "\nLIMIT -1"
+        sql = f"SELECT {select_cols}\nFROM documents\nWHERE collection_id = ?" + "".join(
+            f" AND ({clause})" for clause in compiled_clauses
+        )
+        params = [collection_id, *compiled_params]
+        # SQL ORDER BY + LIMIT/OFFSET pushdown only on the no-filter scan:
+        # there the (collection_id) index yields rowid order for free. With
+        # compiled filter clauses, ``ORDER BY rowid`` makes the planner (no
+        # ANALYZE stats) prefer that same index *to avoid the sort* — a full
+        # 177k-entry walk instead of the selective generated-column index
+        # (measured: 183 ms vs <1 ms). So filtered reads fetch the (small)
+        # match set unordered, then sort and slice in Python — identical
+        # rowid-order results either way.
+        pushed_page = False
+        if compiled_clauses and (limit is not None or offset):
+            # Paged filtered read: materializing the full match set costs
+            # ~600 ms on a 110k-row wing before slicing to 10 rows. Fetch
+            # only the rowids (narrow, index-only where possible), take the
+            # page in Python (rowid order), then hydrate just the page rows.
+            cand = [
+                row[0]
+                for row in cur.execute(
+                    "SELECT rowid FROM documents WHERE collection_id = ?"
+                    + "".join(f" AND ({clause})" for clause in compiled_clauses),
+                    params,
+                ).fetchall()
+            ]
+            cand.sort()
             if offset:
-                sql += "\nOFFSET ?"
-                params.append(int(offset))
-        rows = cur.execute(sql, params).fetchall()
+                cand = cand[offset:]
+            if limit is not None:
+                cand = cand[:limit]
+            rows = []
+            for start in range(0, len(cand), 900):
+                chunk = cand[start : start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    cur.execute(
+                        f"SELECT {select_cols} FROM documents "
+                        f"WHERE collection_id = ? AND rowid IN ({placeholders})",
+                        (collection_id, *chunk),
+                    ).fetchall()
+                )
+            rows.sort(key=lambda row: row[0])
+            pushed_page = True
+        else:
+            if not compiled_clauses:
+                # No-filter scan or Python-fallback scan: the (collection_id)
+                # index yields rowid order without a sort step.
+                sql += "\nORDER BY rowid"
+                if not needs_python_filter and (limit is not None or offset):
+                    pushed_page = True
+                    if limit is not None:
+                        sql += "\nLIMIT ?"
+                        params.append(int(limit))
+                    elif offset:
+                        sql += "\nLIMIT -1"
+                    if offset:
+                        sql += "\nOFFSET ?"
+                        params.append(int(offset))
+            rows = cur.execute(sql, params).fetchall()
+            if compiled_clauses:
+                rows.sort(key=lambda row: row[0])
         out = []
-        for doc_id, doc, meta_json, emb_blob in rows:
+        for row in rows:
+            doc_id, doc, meta_json = row[1], row[2], row[3]
             meta = _json_loads(meta_json)
-            if not _matches_where(meta, where):
-                continue
-            if not _matches_where_document(doc or "", where_document):
-                continue
+            if needs_python_filter:
+                if not _matches_where(meta, where):
+                    continue
+                if not _matches_where_document(doc or "", where_document):
+                    continue
             out.append(
                 {
                     "id": doc_id,
                     "document": doc or "",
                     "metadata": meta,
-                    "embedding": emb_blob,
+                    "embedding": row[4] if with_embedding else None,
                 }
             )
+        if not pushed_page and (limit is not None or offset):
+            # Callers only pass limit/offset here under the push_page contract
+            # (non-negative bounds), so plain slicing mirrors SQL LIMIT/OFFSET.
+            if offset:
+                out = out[offset:]
+            if limit is not None:
+                out = out[:limit]
         return out
 
     # ------------------------------------------------------------------
@@ -1211,25 +1296,29 @@ class SQLiteExactCollection(BaseCollection):
         include=None,
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
-        # Fast path for the common unfiltered page (e.g. the prefetch_mined_set
-        # and status sweeps): push LIMIT/OFFSET into the scan instead of
-        # materializing the whole collection and slicing in Python. Safe only
-        # with no post-filter (ids/where/where_document drop rows after the
-        # scan) and non-negative bounds: SQLite does not honor a negative LIMIT
-        # or OFFSET the way a Python slice does, so those keep the slice path.
+        # Fast path for pages without an ids= post-filter (e.g. the
+        # prefetch_mined_set and status sweeps, and the searcher's filtered
+        # neighbor/hydration reads): push LIMIT/OFFSET down to _rows, which
+        # emits SQL LIMIT/OFFSET when the filter compiled (or slices
+        # identically after the Python fallback filter). Safe only with no
+        # ids= post-filter and non-negative bounds: SQLite does not honor a
+        # negative LIMIT or OFFSET the way a Python slice does, so those keep
+        # the slice path.
         push_page = (
             ids is None
-            and where is None
-            and where_document is None
             and (limit is None or limit >= 0)
             and (offset is None or offset >= 0)
             and (limit is not None or offset)
         )
         with self._cursor() as cur:
-            if push_page:
-                rows = self._rows(cur, limit=limit, offset=offset)
-            else:
-                rows = self._rows(cur, where=where, where_document=where_document)
+            rows = self._rows(
+                cur,
+                where=where,
+                where_document=where_document,
+                limit=limit if push_page else None,
+                offset=offset if push_page else None,
+                with_embedding=spec.embeddings,
+            )
         if not push_page:
             if ids is not None:
                 by_id = {row["id"]: row for row in rows}
@@ -1251,7 +1340,7 @@ class SQLiteExactCollection(BaseCollection):
         with self._cursor() as cur:
             collection_id = self._collection_id(cur)
             if ids is None:
-                rows = self._rows(cur, where=where)
+                rows = self._rows(cur, where=where, with_embedding=False)
                 ids = [row["id"] for row in rows]
             deleted = 0
             fts = self._fts_available(cur)
@@ -1299,7 +1388,7 @@ class SQLiteExactCollection(BaseCollection):
             hits = self._lexical_search_fts(cur, query=query, n_results=n_results, where=where)
             if hits is not None:
                 return LexicalResult(hits=hits)
-            rows = self._rows(cur, where=where)
+            rows = self._rows(cur, where=where, with_embedding=False)
         scores = _bm25_scores(query, [row["document"] for row in rows])
         scored = [
             LexicalHit(
@@ -1643,8 +1732,13 @@ class SQLiteExactBackend(BaseBackend):
         # and the filtered candidate scans are index-only. Without `dim` in the
         # index, each of the ~n entries costs a table probe — measured at
         # 134 ms p50 per query on a 174k palace, ~30× the matmul it guards.
+        # Index version 3 = version 2 (every hot-path index carries `dim`)
+        # plus generated-column indexes for source_file / parent_drawer_id.
+        # v2 → v3 only builds the two new indexes (CREATE IF NOT EXISTS skips
+        # the unchanged three); pre-v2 palaces drop the dim-less shapes first.
         version_row = conn.execute("SELECT value FROM meta WHERE key = 'index_version'").fetchone()
-        if not version_row or version_row[0] != "2":
+        version = version_row[0] if version_row else None
+        if version not in ("2", "3"):
             for col in _GENERATED_META_COLUMNS:
                 conn.execute(f"DROP INDEX IF EXISTS idx_documents_{col}")
         for col in _GENERATED_META_COLUMNS:
@@ -1656,9 +1750,9 @@ class SQLiteExactBackend(BaseBackend):
             "CREATE INDEX IF NOT EXISTS idx_documents_collection_dim "
             "ON documents(collection_id, dim)"
         )
-        if not version_row or version_row[0] != "2":
+        if version != "3":
             conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('index_version', '2') "
+                "INSERT INTO meta(key, value) VALUES ('index_version', '3') "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
             )
         try:
