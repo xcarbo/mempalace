@@ -1104,6 +1104,58 @@ class SQLiteExactCollection(BaseCollection):
         valid[valid] &= cache.rowids[pos[valid]] == cand[valid]
         return pos[valid]
 
+    def _rows_by_ids(self, cur, ids, where, where_document, with_embedding: bool):
+        """Point-lookup path for ``get(ids=...)``: chunked ``id IN (...)``
+        probes on the (collection_id, id) primary key instead of a
+        full-collection scan plus Python post-filter (~835 ms per call on a
+        185k-row store; the probe is ~1 ms).
+
+        Any ``where``/``where_document`` is compiled and appended to the probe
+        SQL, so combined calls keep the same predicate semantics as the scan
+        path. No ORDER BY is emitted — output order is the caller's ids order,
+        applied in Python — so the plan is stat-independent: with equality on
+        both PK columns the planner takes the primary-key index with or
+        without ANALYZE stats. Returns ``None`` when the filter cannot be
+        compiled; the caller falls back to the scan path.
+        """
+        _validate_where(where)
+        _validate_where(where_document)
+        try:
+            filter_clauses: list[str] = []
+            filter_params: list = []
+            if where is not None:
+                sql_part, w_params = _compile_where(where)
+                filter_clauses.append(sql_part)
+                filter_params.extend(w_params)
+            if where_document is not None:
+                sql_part, d_params = _compile_where_document(where_document)
+                filter_clauses.append(sql_part)
+                filter_params.extend(d_params)
+        except _WhereNotTranslatable:
+            return None
+        collection_id = self._collection_id(cur)
+        select_cols = "id, document, metadata_json" + (", embedding" if with_embedding else "")
+        filter_sql = "".join(f" AND ({clause})" for clause in filter_clauses)
+        unique_ids = list(dict.fromkeys(ids))
+        by_id: dict[str, dict] = {}
+        for start in range(0, len(unique_ids), 900):
+            chunk = unique_ids[start : start + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in cur.execute(
+                f"SELECT {select_cols} FROM documents "
+                f"WHERE collection_id = ? AND id IN ({placeholders})" + filter_sql,
+                (collection_id, *chunk, *filter_params),
+            ).fetchall():
+                by_id[row[0]] = {
+                    "id": row[0],
+                    "document": row[1] or "",
+                    "metadata": _json_loads(row[2]),
+                    "embedding": row[3] if with_embedding else None,
+                }
+        # Requested order, duplicates repeated, missing ids silently absent —
+        # identical to the scan path's ids post-filter.
+        return [by_id[doc_id] for doc_id in ids if doc_id in by_id]
+
     def _fetch_rows_by_id(self, cur, collection_id: int, ids: list[str], with_embedding: bool):
         """Fetch document/metadata (and optionally the raw stored embedding)."""
         select = "id, document, metadata_json" + (", embedding" if with_embedding else "")
@@ -1311,16 +1363,28 @@ class SQLiteExactCollection(BaseCollection):
             and (limit is not None or offset)
         )
         with self._cursor() as cur:
-            rows = self._rows(
-                cur,
-                where=where,
-                where_document=where_document,
-                limit=limit if push_page else None,
-                offset=offset if push_page else None,
-                with_embedding=spec.embeddings,
+            # ids= gets its own fast path: PK point lookups with any filter
+            # compiled into the probe SQL. None means the filter didn't
+            # compile — fall back to the scan plus Python ids post-filter.
+            id_rows = (
+                self._rows_by_ids(cur, ids, where, where_document, spec.embeddings)
+                if ids is not None
+                else None
+            )
+            rows = (
+                id_rows
+                if id_rows is not None
+                else self._rows(
+                    cur,
+                    where=where,
+                    where_document=where_document,
+                    limit=limit if push_page else None,
+                    offset=offset if push_page else None,
+                    with_embedding=spec.embeddings,
+                )
             )
         if not push_page:
-            if ids is not None:
+            if ids is not None and id_rows is None:
                 by_id = {row["id"]: row for row in rows}
                 rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
             if offset:

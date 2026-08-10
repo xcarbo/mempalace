@@ -500,15 +500,193 @@ def test_sqlite_exact_get_ids_with_page_slices_in_python(tmp_path):
     _backend, col = _collection(tmp_path)
     _seed(col, 5)
 
-    # ids force the Python path even with a page: the requested order is kept,
-    # then offset/limit slice the reordered list with no SQL LIMIT/OFFSET.
-    result, selects = _doc_select_sql(
+    # ids keep the requested order, then offset/limit slice the reordered
+    # list in Python: the PK probe SQL must not carry LIMIT/OFFSET (they
+    # apply after reordering, which SQL paging could not express).
+    result, statements = _traced_sql(
         col, lambda: col.get(ids=["d4", "d3", "d2", "d1"], offset=1, limit=2)
     )
     assert result.ids == ["d3", "d2"]
-    assert len(selects) == 1
-    assert "LIMIT" not in selects[0]
-    assert "OFFSET" not in selects[0]
+    probes = [s for s in statements if "FROM documents" in s and "id IN" in s]
+    assert len(probes) == 1
+    assert "LIMIT" not in probes[0]
+    assert "OFFSET" not in probes[0]
+
+
+def test_sqlite_exact_get_ids_probes_pk_instead_of_scanning(tmp_path):
+    """get(ids=) must emit chunked ``id IN`` PK probes, never the full
+    ORDER BY rowid collection scan — that scan JSON-parsed every row's
+    metadata and cost ~835 ms per drawer open on a 185k-row store."""
+    _backend, col = _collection(tmp_path)
+    _seed(col, 5)
+
+    result, statements = _traced_sql(col, lambda: col.get(ids=["d1", "d3"]))
+    assert result.ids == ["d1", "d3"]
+    scans = [s for s in statements if "FROM documents" in s and "ORDER BY rowid" in s]
+    assert not scans, scans
+    probes = [s for s in statements if "FROM documents" in s and "id IN" in s]
+    assert len(probes) == 1
+    # The probe must not drag embedding blobs unless embeddings were asked for.
+    assert "embedding" not in probes[0]
+
+    with_embed, statements = _traced_sql(col, lambda: col.get(ids=["d1"], include=["embeddings"]))
+    assert with_embed.embeddings == [[1.0, 1.0]]
+    probes = [s for s in statements if "FROM documents" in s and "id IN" in s]
+    assert probes and "embedding" in probes[0]
+
+
+def test_sqlite_exact_get_ids_uses_pk_index_without_analyze(tmp_path):
+    """The ids probe must ride the (collection_id, id) primary-key index on a
+    freshly built store with no sqlite_stat1 rows — same stat-independence bar
+    as the where= fast path: a plan that only holds after a manual ANALYZE
+    silently re-creates the latency tail on every fresh cutover build."""
+    _backend, col = _collection(tmp_path)
+    _seed(col, 4)
+    conn = col._handle.conn
+    assert not conn.execute(
+        "SELECT name FROM sqlite_master WHERE name LIKE 'sqlite_stat%'"
+    ).fetchall(), "test premise: no ANALYZE stats present"
+
+    result, statements = _traced_sql(col, lambda: col.get(ids=["d0", "d2"]))
+    assert result.ids == ["d0", "d2"]
+    probe = next(s for s in statements if "FROM documents" in s and "id IN" in s)
+    plan = " | ".join(row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + probe).fetchall())
+    # PRIMARY KEY (collection_id, id) materializes as the table's autoindex;
+    # a bare (collection_id) index walk is the regression.
+    assert "sqlite_autoindex_documents_1" in plan, plan
+    assert "USING INDEX idx_documents_collection " not in plan, plan
+
+
+def test_sqlite_exact_get_ids_chunks_large_id_lists(tmp_path):
+    """Id lists beyond SQLite's bound-parameter comfort zone are probed in
+    900-id chunks; results still come back in requested order."""
+    _backend, col = _collection(tmp_path)
+    _seed(col, 10)
+
+    big = [f"d{i}" for i in range(2500)]  # d10..d2499 don't exist
+    result, statements = _traced_sql(col, lambda: col.get(ids=big))
+    assert result.ids == [f"d{i}" for i in range(10)]
+    probes = [s for s in statements if "FROM documents" in s and "id IN" in s]
+    assert len(probes) == 3  # ceil(2500 / 900)
+
+
+_IDS_EQUIVALENCE_CASES = [
+    ["r0"],  # singleton
+    ["r3"],
+    ["ghost"],  # missing id
+    [],  # empty list
+    ["r1", "r0", "r5"],  # batch, non-rowid order
+    ["r5", "ghost", "r1", "r1", "r5"],  # duplicates + missing interleaved
+    ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"],  # everything
+    ["r7", "r6", "r5", "r4", "r3", "r2", "r1", "r0"],  # everything reversed
+]
+
+_IDS_EQUIVALENCE_FILTERS = [
+    None,
+    {},
+    {"wing": "w1"},
+    {"n": {"$gte": 1}},
+    {"missing": None},
+    {"$or": [{"wing": "w3"}, {"n": 4}]},
+    {"$and": [{"wing": "w1"}, {"flag": True}]},
+]
+
+_IDS_EQUIVALENCE_PAGES = [
+    (None, None),
+    (2, None),
+    (None, 1),
+    (2, 1),
+    (0, None),  # limit=0 is a real bound
+    (-1, None),  # negative bounds slice in Python
+    (None, -2),
+]
+
+
+def test_sqlite_exact_get_ids_fast_path_matches_scan_path(tmp_path, monkeypatch):
+    """The PK-probe ids path must return exactly what the old
+    scan-plus-post-filter path returns — order, duplicates, missing ids,
+    combined filters, and paging included. A silent divergence here changes
+    what a drawer open returns, which no recall metric would catch."""
+    import mempalace.backends.sqlite_exact as se
+
+    _backend, col = _collection(tmp_path)
+    _seed_equivalence_fixture(col)
+
+    for ids in _IDS_EQUIVALENCE_CASES:
+        for where in _IDS_EQUIVALENCE_FILTERS:
+            for where_doc in (None, {"$contains": "beta"}):
+                for limit, offset in _IDS_EQUIVALENCE_PAGES:
+                    kwargs = dict(
+                        ids=ids,
+                        where=where,
+                        where_document=where_doc,
+                        limit=limit,
+                        offset=offset,
+                        include=["documents", "metadatas", "embeddings"],
+                    )
+                    fast = col.get(**kwargs)
+                    with monkeypatch.context() as m:
+                        m.setattr(
+                            se.SQLiteExactCollection,
+                            "_rows_by_ids",
+                            lambda self, *a, **k: None,
+                        )
+                        scan = col.get(**kwargs)
+                    label = (
+                        f"ids={ids!r} where={where!r} where_document={where_doc!r} "
+                        f"limit={limit!r} offset={offset!r}"
+                    )
+                    assert fast.ids == scan.ids, label
+                    assert fast.documents == scan.documents, label
+                    assert fast.metadatas == scan.metadatas, label
+                    assert fast.embeddings == scan.embeddings, label
+
+
+def test_sqlite_exact_get_ids_untranslatable_filter_falls_back(tmp_path):
+    """ids= with a filter SQL cannot express keeps the scan path — same rows,
+    just slower — instead of erroring or dropping the filter."""
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["da", "db"],
+        metadatas=[{'we"ird': "x"}, {'we"ird': "y"}],
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    result, statements = _traced_sql(
+        col, lambda: col.get(ids=["b", "a"], where={'we"ird': "y"}, include=["metadatas"])
+    )
+    assert result.ids == ["b"]
+    assert result.metadatas[0]['we"ird'] == "y"
+    # The fallback is the full scan, not a broken probe.
+    assert any("ORDER BY rowid" in s for s in statements)
+
+
+def test_sqlite_exact_get_ids_scoped_to_collection(tmp_path):
+    """An id that exists in another collection of the same palace must not
+    leak into the probe results (drawers vs closets share id namespaces)."""
+    backend, drawers = _collection(tmp_path, "drawers")
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    closets = backend.get_collection(palace=palace, collection_name="closets", create=True)
+    drawers.add(
+        ids=["shared", "drawer-only"],
+        documents=["drawer shared", "drawer only"],
+        metadatas=[{"kind": "drawer"}, {"kind": "drawer"}],
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    closets.add(
+        ids=["shared", "closet-only"],
+        documents=["closet shared", "closet only"],
+        metadatas=[{"kind": "closet"}, {"kind": "closet"}],
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+
+    result = drawers.get(ids=["shared", "closet-only", "drawer-only"], include=["documents"])
+    assert result.ids == ["shared", "drawer-only"]
+    assert result.documents == ["drawer shared", "drawer only"]
+
+    closet_result = closets.get(ids=["shared", "drawer-only"], include=["documents"])
+    assert closet_result.ids == ["shared"]
+    assert closet_result.documents == ["closet shared"]
 
 
 def test_sqlite_exact_upsert_delete_and_multi_collection_isolation(tmp_path):
