@@ -533,13 +533,50 @@ def check_extraction_safety(
         raise TruncationDetected(message, sqlite_count, extracted)
 
 
-def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None) -> "int | None":
-    """Count rows in ``chroma.sqlite3.embeddings`` for the drawers collection.
+def _sqlite_exact_drawer_count(palace_path: str, collection_name: str) -> "int | None":
+    """Same count for a ``sqlite_exact`` palace, whose schema is its own.
 
-    Used as an independent ground-truth check against the chromadb
-    collection-layer ``count()`` / ``get()``: when the on-disk SQLite
-    row count exceeds the extraction count, the segment metadata is
-    stale and repair would destroy the difference.
+    Split out rather than folded into the chroma query because the two stores
+    share no table: chroma counts ``embeddings`` through ``segments``, the
+    exact backend counts ``documents`` keyed by ``collection_id``.
+    """
+    sqlite_path = os.path.join(palace_path, "sqlite_exact.sqlite3")
+    if not os.path.exists(sqlite_path):
+        return None
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(sqlite_read_uri(sqlite_path), uri=True)
+        try:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM documents d
+                JOIN collections c ON d.collection_id = c.id
+                WHERE c.name = ?
+                """,
+                (collection_name,),
+            ).fetchone()
+            return int(row[0]) if row and row[0] is not None else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None) -> "int | None":
+    """Count drawer rows for the drawers collection, straight from SQLite.
+
+    Used as an independent ground-truth check against the collection-layer
+    ``count()`` / ``get()``: when the on-disk SQLite row count exceeds the
+    extraction count, the segment metadata is stale and repair would destroy
+    the difference. It is also the only drawer count ``:4109`` can afford —
+    chromadb's ``Collection.count()`` segfaults on a large collection.
+
+    Backend-aware by artifact, not by config (2026-08-11): the caller is
+    typically a health probe that must answer for whichever palace it was
+    pointed at, and the sqlite_exact cutover made ``chroma.sqlite3`` absent on
+    the live palace — which read as "palace unreadable" and 503'd the service.
 
     Returns ``None`` when the schema isn't readable (chromadb version
     drift, missing tables, locked file). Callers treat ``None`` as
@@ -548,7 +585,7 @@ def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None)
     collection_name = collection_name or _drawers_collection_name()
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.exists(sqlite_path):
-        return None
+        return _sqlite_exact_drawer_count(palace_path, collection_name)
     try:
         import sqlite3
 

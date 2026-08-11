@@ -553,6 +553,50 @@ def test_sqlite_drawer_count_returns_none_on_unreadable_schema(tmp_path):
     assert repair.sqlite_drawer_count(str(tmp_path)) is None
 
 
+def _make_sqlite_exact_palace(tmp_path, rows_by_collection):
+    """Minimal sqlite_exact store — just the two tables the count reads."""
+    sqlite_path = os.path.join(str(tmp_path), "sqlite_exact.sqlite3")
+    conn = sqlite3.connect(sqlite_path)
+    conn.execute("CREATE TABLE collections (id INTEGER PRIMARY KEY, name TEXT)")
+    conn.execute("CREATE TABLE documents (id TEXT, collection_id INTEGER)")
+    for coll_id, (name, n) in enumerate(rows_by_collection.items(), start=1):
+        conn.execute("INSERT INTO collections (id, name) VALUES (?, ?)", (coll_id, name))
+        conn.executemany(
+            "INSERT INTO documents (id, collection_id) VALUES (?, ?)",
+            [(f"{name}-{i}", coll_id) for i in range(n)],
+        )
+    conn.commit()
+    conn.close()
+    return sqlite_path
+
+
+def test_sqlite_drawer_count_reads_a_sqlite_exact_palace(tmp_path):
+    """No chroma.sqlite3 but a sqlite_exact store → count it, don't return None.
+
+    Regression for the 2026-08-11 cutover: :4109's /health reports "palace
+    unreadable" on a None count, so a chroma-only count 503'd the service the
+    moment the live palace became a sqlite_exact one.
+    """
+    _make_sqlite_exact_palace(tmp_path, {"mempalace_drawers": 7, "mempalace_closets": 3})
+    assert repair.sqlite_drawer_count(str(tmp_path), "mempalace_drawers") == 7
+    assert repair.sqlite_drawer_count(str(tmp_path), "mempalace_closets") == 3
+
+
+def test_sqlite_drawer_count_sqlite_exact_unknown_collection_is_zero(tmp_path):
+    """A store that exists but holds no such collection counts zero, not None."""
+    _make_sqlite_exact_palace(tmp_path, {"mempalace_drawers": 2})
+    assert repair.sqlite_drawer_count(str(tmp_path), "nope") == 0
+
+
+def test_sqlite_drawer_count_prefers_chroma_when_both_present(tmp_path):
+    """Mixed dir is a bug elsewhere, but the chroma answer must still win."""
+    _make_sqlite_exact_palace(tmp_path, {"mempalace_drawers": 7})
+    sqlite3.connect(os.path.join(str(tmp_path), "chroma.sqlite3")).close()
+    # chroma file present but schema-less → the chroma branch returns None
+    # rather than silently falling through to the exact store's 7.
+    assert repair.sqlite_drawer_count(str(tmp_path), "mempalace_drawers") is None
+
+
 @patch("mempalace.repair.shutil")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_default_uses_configured_collection(mock_backend_cls, mock_shutil, tmp_path):
