@@ -16,7 +16,7 @@ import sqlite3
 import sys
 import time
 
-sys.path.insert(0, "/Users/xdev/.local/state/herdr-spawn/tn-gate-260810-231241/worktree")
+sys.path.insert(0, "/Volumes/xData/codeXD/mempalace")  # 2026-08-11 flip: merged HEAD
 from mempalace.backends.sqlite_exact import SQLiteExactBackend  # noqa: E402
 
 CO = "/Volumes/xData/.mempalace-cutover/tn-gate-260810"

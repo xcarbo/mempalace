@@ -23,7 +23,12 @@ SRC = os.path.join(CO, "palace-chroma")
 OUT = os.path.join(CO, "palace-exact")
 BATCH = 2000
 
-sys.path.insert(0, "/Users/xdev/.local/state/herdr-spawn/tn-gate-260810-231241/worktree")
+# 2026-08-11 flip: repointed from the gate worktree to the main repo, which now
+# carries the merged get(ids=) PK-probe fast path (4d3ce51). The build path
+# (add()) and schema are identical between the two; verify.py's spot checks go
+# through get(ids=), so the parity gate now exercises the code that will serve
+# production rather than the pre-merge build.
+sys.path.insert(0, "/Volumes/xData/codeXD/mempalace")
 import hnswlib  # noqa: E402
 
 from mempalace.backends.base import EmbedderIdentity  # noqa: E402
@@ -75,7 +80,21 @@ for coll_id, coll_name in collections.items():
     seg_dir = os.path.join(SRC, seg)
     meta = pickle.load(open(os.path.join(seg_dir, "index_metadata.pickle"), "rb"))
     id_to_label = meta["id_to_label"]
-    ids = list(id_to_label.keys())
+    # 2026-08-11 flip: prune HNSW tombstone phantoms IN the build, against
+    # chroma's authoritative enumeration (chroma_ids.py must run first). The
+    # segment's id_to_label carries ids with no metadata row — 32 of them on
+    # the 08-10 snapshot — which the gate run deleted by hand afterwards. Doing
+    # it here makes the prune deterministic and keeps vectors/ids artifacts and
+    # the store in agreement, so verify.py's full id-set gate is meaningful.
+    authoritative = set(json.load(open(os.path.join(CO, f"chroma_ids_{coll_name}.json"))))
+    all_ids = list(id_to_label.keys())
+    ids = [i for i in all_ids if i in authoritative]
+    pruned = len(all_ids) - len(ids)
+    orphan_ids = sorted(authoritative - set(all_ids))
+    assert not orphan_ids, f"{coll_name}: {len(orphan_ids)} chroma ids absent from HNSW"
+    print(
+        f"\n{coll_name}: pruned {pruned} tombstone phantom id(s) from the HNSW segment", flush=True
+    )
     labels = np.array([id_to_label[i] for i in ids], dtype=np.int64)
 
     idx = hnswlib.Index(space="cosine", dim=384)
@@ -127,11 +146,20 @@ for coll_id, coll_name in collections.items():
             embeddings=X[start : start + BATCH].tolist(),
         )
     assert col.count() == len(ids), f"{coll_name}: {col.count()} != {len(ids)}"
+    assert col.count() == n_chroma, f"{coll_name}: {col.count()} != chroma {n_chroma}"
+    # With the prune above, every surviving id has a metadata row; an empty
+    # document here would mean a real missing doc, not a tombstone.
+    assert missing == 0, f"{coll_name}: {missing} empty documents after the prune"
     print(
         f"  inserted {len(ids)} rows, {missing} empty documents, {time.time() - t0:.0f}s",
         flush=True,
     )
-    report[coll_name] = {"rows": len(ids), "empty_docs": missing, "chroma_meta_count": n_chroma}
+    report[coll_name] = {
+        "rows": len(ids),
+        "empty_docs": missing,
+        "pruned_phantoms": pruned,
+        "chroma_meta_count": n_chroma,
+    }
     np.save(os.path.join(CO, f"vectors_{coll_name}.npy"), X)
     json.dump(ids, open(os.path.join(CO, f"vector_ids_{coll_name}.json"), "w"))
 

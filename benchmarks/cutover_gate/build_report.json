@@ -1,12 +1,14 @@
 {
  "mempalace_drawers": {
-  "rows": 185175,
-  "empty_docs": 32,
-  "chroma_meta_count": 185143
+  "rows": 185393,
+  "empty_docs": 0,
+  "pruned_phantoms": 32,
+  "chroma_meta_count": 185393
  },
  "mempalace_closets": {
-  "rows": 2585,
+  "rows": 2591,
   "empty_docs": 0,
-  "chroma_meta_count": 2585
+  "pruned_phantoms": 0,
+  "chroma_meta_count": 2591
  }
 }
