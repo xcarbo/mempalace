@@ -1104,3 +1104,36 @@ def test_lang_explicit_ignores_entity_languages_fallback():
     cfg = MempalaceConfig(config_dir=tmpdir)
     assert cfg.lang_explicit is None
     assert cfg.lang == "ko"  # display-side fallback still works
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows has no Unix permission bits")
+@pytest.mark.parametrize(
+    "writer",
+    [
+        pytest.param(lambda c: c.init(), id="init"),
+        pytest.param(lambda c: c.set_backend("chroma"), id="set_backend"),
+        pytest.param(lambda c: c.set_embedding_model("all-MiniLM-L6-v2"), id="set_embedding_model"),
+        pytest.param(lambda c: c.set_entity_languages(["en"]), id="set_entity_languages"),
+        pytest.param(lambda c: c.set_hook_setting("daemon", True), id="set_hook_setting"),
+    ],
+)
+def test_config_writers_leave_config_json_owner_only(tmp_path, writer):
+    """config.json holds the outbox secret, so no writer may leave it
+    world-readable.
+
+    ``set_hook_setting`` was the one writer that never chmod'd. ``open(…, "w")``
+    preserves an existing file's mode, so the gap was invisible whenever some
+    other writer had already created the file at 0600 — but when it created
+    config.json itself the file landed at ``0666 & ~umask`` (0644 on a default
+    umask of 022), which is how the live palace ended up with a 48-character
+    plaintext outbox secret readable by every local account.
+    """
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    config_file = tmp_path / "config.json"
+    assert not config_file.exists(), "each writer must be the one that creates the file"
+
+    writer(cfg)
+
+    assert config_file.exists()
+    mode = config_file.stat().st_mode & 0o777
+    assert mode == 0o600, f"config.json left at {oct(mode)}, expected 0o600"

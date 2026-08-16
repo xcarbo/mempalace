@@ -1244,6 +1244,16 @@ class MempalaceConfig:
                 json.dump(self._file_config, f, indent=2, ensure_ascii=False)
         except OSError:
             pass
+        # Every other writer of this file chmods 0600; this one did not. open(…,
+        # "w") keeps an existing file's mode, so the gap only bites when this is
+        # the call that CREATES config.json — it then lands at 0666 & ~umask,
+        # i.e. world-readable on a default umask of 022. config.json holds the
+        # outbox secret, so "usually already 0600" is not a guarantee worth
+        # relying on.
+        try:
+            self._config_file.chmod(0o600)
+        except (OSError, NotImplementedError):
+            pass
 
     def init(self):
         """Create config directory and write default config.json if it doesn't exist."""
