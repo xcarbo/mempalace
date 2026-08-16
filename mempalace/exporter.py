@@ -80,7 +80,11 @@ def export_palace(palace_path: str, output_dir: str, format: str = "markdown") -
     Returns:
         Stats dict: {"wings": N, "rooms": N, "drawers": N}
     """
-    col = get_collection(palace_path, read_only=True)
+    # create=False is required with read_only=True, not optional:
+    # get_collection defaults create=True and sqlite_exact._connect rejects the
+    # combination outright. Export is a pure read and must never conjure an
+    # empty palace at a mistyped path.
+    col = get_collection(palace_path, create=False, read_only=True)
     total = col.count()
 
     if total == 0:
