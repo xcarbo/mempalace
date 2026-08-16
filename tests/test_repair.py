@@ -3227,3 +3227,38 @@ def test_rebuild_from_sqlite_preserves_knowledge_graph_sidecar(tmp_path):
     assert (dest / "knowledge_graph.sqlite3").read_text(encoding="utf-8") == "kg-db"
     assert (dest / "knowledge_graph.sqlite3-wal").read_text(encoding="utf-8") == "kg-wal"
     assert (dest / "knowledge_graph.sqlite3-shm").read_text(encoding="utf-8") == "kg-shm"
+
+
+# ── destination FTS5 heal after a rebuild (1692d1b regression) ─────────
+
+
+def test_vacuum_and_rebuild_fts5_heals_a_malformed_destination_index(tmp_path):
+    """The destination heal our 1692d1b added, re-verified rather than re-applied.
+
+    Merge 5e4d98a (July) silently dropped 1692d1b's destination-side heal from
+    rebuild_from_sqlite, and it never came back — the concern behind follow-up
+    5debef00. The failure it guarded: the bulk upsert leaves the REBUILT
+    palace's FTS5 inverted index malformed (reproduced at ~90k rows; the live
+    palace is ~200k) and the #1823 MCP startup integrity gate then refuses every
+    tool call. A completed rebuild that strands the palace.
+
+    At the 3.7.1 merge upstream turned out to cover this more strictly than we
+    did. rebuild_from_sqlite now always finishes through
+    _vacuum_and_rebuild_fts5(dest_palace, strict=True), which rebuilds the index
+    UNCONDITIONALLY, VACUUMs, then quick_checks and raises on anything still
+    dirty. 1692d1b only healed when quick_check already complained, and merely
+    printed a warning if errors survived.
+
+    This pins the mechanism that does the healing. Teeth verified by deleting
+    the rebuild statement: without it the palace stays malformed and this fails.
+    """
+    palace = _make_fts5_palace(tmp_path, corrupt=True)
+
+    before = repair.sqlite_integrity_errors(palace)
+    assert before, "fixture did not actually corrupt the FTS5 index"
+    assert repair._errors_are_isolated_fts5(before)
+
+    repair._vacuum_and_rebuild_fts5(palace, progress=lambda *_: None, strict=True)
+
+    after = repair.sqlite_integrity_errors(palace)
+    assert not after, f"destination left malformed after the rebuild: {after[:3]}"
