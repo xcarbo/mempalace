@@ -2580,11 +2580,26 @@ def test_preview_legacy_repair_leaves_the_palace_byte_identical(tmp_path, capsys
     """The preview must not change a single byte of a real palace."""
     import hashlib
 
+    # Fork delta: our chroma backend puts every palace into WAL journal mode
+    # (``enable_wal_journal`` in create_collection; note the ``.wal_enabled``
+    # marker). Upstream's palaces stay in rollback-journal mode. Opening a
+    # WAL database — even with ``mode=ro`` — makes SQLite materialise the
+    # ``-shm``/``-wal`` sidecars, so their presence afterwards is expected
+    # bookkeeping, not a write to the palace. The property this test actually
+    # guards is that no palace CONTENT changes, which the chroma.sqlite3
+    # digest below still pins exactly.
+    def _content_tree(root):
+        return sorted(
+            (p.name, p.stat().st_size)
+            for p in root.iterdir()
+            if not p.name.endswith(("-shm", "-wal"))
+        )
+
     palace = tmp_path / "palace"
     _seed_palace(palace, "mempalace_drawers", [(f"d{i}", f"b{i}", {"wing": "w"}) for i in range(6)])
     db = palace / "chroma.sqlite3"
     before = hashlib.sha256(db.read_bytes()).hexdigest()
-    tree_before = sorted((p.name, p.stat().st_size) for p in palace.iterdir())
+    tree_before = _content_tree(palace)
 
     counts = repair._preview_legacy_repair(
         palace_path=str(palace), collection_name="mempalace_drawers"
@@ -2592,7 +2607,7 @@ def test_preview_legacy_repair_leaves_the_palace_byte_identical(tmp_path, capsys
 
     assert counts == {"mempalace_drawers": 6}
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before
-    assert sorted((p.name, p.stat().st_size) for p in palace.iterdir()) == tree_before
+    assert _content_tree(palace) == tree_before
     assert [p for p in tmp_path.iterdir() if p.name.endswith(".backup")] == []
     out = capsys.readouterr().out
     assert "holds 6 rows" in out

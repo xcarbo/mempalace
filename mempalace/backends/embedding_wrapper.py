@@ -11,10 +11,18 @@ def _embed_texts(texts: list[str], is_query: bool = False) -> list[list[float]]:
     """Embed ``texts`` with the configured local embedding function.
 
     ``is_query=True`` routes through the EF's ``embed_query`` so models with
-    asymmetric query/document prompts (bge-small) embed queries correctly —
-    the same query/document split chromadb ≥1.5.9 applies natively. For
-    symmetric models (minilm, embeddinggemma) ``embed_query`` aliases
-    ``__call__``, so this is behavior-neutral.
+    asymmetric query/document prompts (bge-small, nomic) embed queries
+    correctly — the same query/document split chromadb >=1.5.9 applies
+    natively. For symmetric models (minilm, embeddinggemma) ``embed_query``
+    aliases ``__call__``, so this is behavior-neutral.
+
+    Embedding functions return ``list[np.ndarray]`` (float32). ``list(arr)``
+    would unpack that into ``np.float32`` *scalars*, which ChromaDB's
+    ``normalize_embeddings`` rejects outright ("Expected embeddings to be a
+    list of floats or ints..."), so every write through this wrapper must
+    convert to real Python floats. ``.tolist()`` does that in C; the
+    ``float(x)`` branch covers embedders that already hand back plain
+    sequences.
     """
     if not texts:
         return []
@@ -25,7 +33,10 @@ def _embed_texts(texts: list[str], is_query: bool = False) -> list[list[float]]:
         vectors = ef.embed_query(input=texts)
     else:
         vectors = ef(input=texts)
-    return [list(v) for v in vectors]
+    return [
+        v.tolist() if hasattr(v, "tolist") else [float(x) for x in v]  # numpy | plain sequence
+        for v in vectors
+    ]
 
 
 def _as_list(value):

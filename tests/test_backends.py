@@ -517,7 +517,9 @@ def test_palace_wrapper_embeds_for_chroma(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_embed(texts):
+    def fake_embed(texts, is_query=False):
+        # is_query is our fork's asymmetric-model routing flag; the read path
+        # passes it positionally-by-keyword, so the stub must accept it.
         texts = list(texts)
         calls.append(texts)
         return [[float(len(text)), 1.0, 0.0, 0.0] for text in texts]
