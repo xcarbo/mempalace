@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from unittest import mock
 
 import pytest
 
@@ -794,6 +795,76 @@ def test_sqlite_exact_lexical_filtered_rescores_window_not_fts_rank(tmp_path):
 
     assert [hit.id for hit in hits] == ["docA"]
     assert hits[0].score > 0
+
+
+def test_sqlite_exact_lexical_filtered_fast_path_actually_executes(tmp_path):
+    """The filtered FTS join must RUN, not decline.
+
+    It declined on every call from before 3.6.0 until 2026-08-16: the query
+    asked for ``bm25(f)`` on a table *alias* and FTS5's ``bm25()`` only accepts
+    the table name, so SQLite raised ``no such column: f``, the ``except
+    sqlite3.Error`` swallowed it, and the caller silently took the unbounded
+    fall-through path — which reads the ENTIRE match set and JSON-parses every
+    metadata blob in Python (127k parses per query on the live palace; filtered
+    search measured 6-17x slower than unfiltered).
+
+    Nothing caught it because the fallback returns the *same answers*. The only
+    observable difference is which path ran, so that is what this asserts.
+    """
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["needle note", "needle other"],
+        metadatas=[{"wing": "w"}, {"wing": "x"}],
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+
+    with col._cursor() as cur:
+        collection_id = col._collection_id(cur)
+        hits = col._lexical_search_fts_filtered(
+            cur,
+            fts_query="needle",
+            query="needle",
+            n_results=5,
+            window=200,
+            where={"wing": "w"},
+            collection_id=collection_id,
+        )
+
+    # None means "I declined" — a translatable filter must never decline.
+    assert hits is not None, "filtered FTS fast path declined on a translatable filter"
+    assert [hit.id for hit in hits] == ["a"]
+
+
+def test_sqlite_exact_lexical_filtered_fast_path_declines_on_untranslatable_filter(tmp_path):
+    """The decline path still exists and still hands off to the caller — the
+    fix above must not turn an untranslatable filter into an exception."""
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a"],
+        documents=["needle note"],
+        metadatas=[{"wing": "w"}],
+        embeddings=[[1.0, 0.0]],
+    )
+
+    with col._cursor() as cur:
+        collection_id = col._collection_id(cur)
+        with mock.patch.object(
+            sqlite_exact_module,
+            "_compile_where",
+            side_effect=sqlite_exact_module._WhereNotTranslatable("nope"),
+        ):
+            hits = col._lexical_search_fts_filtered(
+                cur,
+                fts_query="needle",
+                query="needle",
+                n_results=5,
+                window=200,
+                where={"wing": "w"},
+                collection_id=collection_id,
+            )
+
+    assert hits is None
 
 
 def test_sqlite_exact_lexical_short_tokens_skip_fts_but_keep_python_fallback(tmp_path):

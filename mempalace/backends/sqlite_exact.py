@@ -1557,21 +1557,7 @@ class SQLiteExactCollection(BaseCollection):
         if not rows:
             return []
         ids = [row[0] for row in rows]
-        docs = []
-        for start in range(0, len(ids), 900):
-            chunk_ids = ids[start : start + 900]
-            placeholders = ",".join("?" for _ in chunk_ids)
-            docs.extend(
-                cur.execute(
-                    f"""
-                    SELECT id, document, metadata_json
-                    FROM documents
-                    WHERE collection_id = ? AND id IN ({placeholders})
-                    """,
-                    (collection_id, *chunk_ids),
-                ).fetchall()
-            )
-        by_id = {doc_id: (doc or "", _json_loads(meta_json)) for doc_id, doc, meta_json in docs}
+        by_id = self._documents_by_id(cur, collection_id, ids)
         candidates = []
         for doc_id, _rank in rows:
             doc_meta = by_id.get(doc_id)
@@ -1582,6 +1568,28 @@ class SQLiteExactCollection(BaseCollection):
                 continue
             candidates.append((doc_id, doc, meta))
         return self._rescore_lexical_candidates(query, candidates, n_results)
+
+    @staticmethod
+    def _documents_by_id(cur, collection_id: int, ids: list[str]) -> dict[str, tuple[str, dict]]:
+        """Batch-fetch document text + parsed metadata for *ids*.
+
+        900 per statement — SQLite's default ``SQLITE_MAX_VARIABLE_NUMBER``
+        ceiling, same chunking as :meth:`_existing_rowids`.
+        """
+        by_id: dict[str, tuple[str, dict]] = {}
+        for start in range(0, len(ids), 900):
+            chunk_ids = ids[start : start + 900]
+            placeholders = ",".join("?" for _ in chunk_ids)
+            for doc_id, doc, meta_json in cur.execute(
+                f"""
+                SELECT id, document, metadata_json
+                FROM documents
+                WHERE collection_id = ? AND id IN ({placeholders})
+                """,
+                (collection_id, *chunk_ids),
+            ).fetchall():
+                by_id[doc_id] = (doc or "", _json_loads(meta_json))
+        return by_id
 
     @staticmethod
     def _rescore_lexical_candidates(
@@ -1626,6 +1634,19 @@ class SQLiteExactCollection(BaseCollection):
         lane's final ranking, which is the regression described there. Returns
         ``None`` when the filter cannot be compiled; the caller falls back to
         the full-window path.
+
+        Two details are load-bearing and both were paid for in measurement:
+
+        1. ``bm25()`` takes the FTS5 **table name**, never an alias. Written as
+           ``bm25(f)`` this raised ``no such column: f`` on every call — from
+           before 3.6.0 until 2026-08-16 the fast path never once executed and
+           the swallowed error said so only at DEBUG.
+        2. The ranked statement selects **ids only**; the documents are fetched
+           afterwards by id. Ranking and projecting in one statement forces
+           ``USE TEMP B-TREE FOR ORDER BY`` to materialise the full document
+           text of the whole match set — measured 2,754 ms on the 201k-row
+           palace, i.e. worse than the fallback it replaces. Rank-then-fetch is
+           383 ms against the fallback's 1,236 ms.
         """
         try:
             where_sql, where_params = _compile_where(where, prefix="d.")
@@ -1634,21 +1655,28 @@ class SQLiteExactCollection(BaseCollection):
         try:
             rows = cur.execute(
                 f"""
-                SELECT f.doc_id, bm25(f) AS rank, d.document, d.metadata_json
-                FROM docs_fts f
-                JOIN documents d ON d.collection_id = f.collection_id AND d.id = f.doc_id
-                WHERE f MATCH ? AND f.collection_id = ? AND ({where_sql})
+                SELECT docs_fts.doc_id, bm25(docs_fts) AS rank
+                FROM docs_fts
+                JOIN documents d
+                  ON d.collection_id = docs_fts.collection_id AND d.id = docs_fts.doc_id
+                WHERE docs_fts MATCH ? AND docs_fts.collection_id = ? AND ({where_sql})
                 ORDER BY rank
                 LIMIT ?
                 """,
                 (fts_query, collection_id, *where_params, window),
             ).fetchall()
         except sqlite3.Error:
-            logger.debug(
+            # WARNING, not DEBUG: a permanently dead fast path that logs at
+            # DEBUG is exactly how the bm25-alias bug survived two releases.
+            logger.warning(
                 "sqlite_exact filtered FTS join failed; using full-window scan", exc_info=True
             )
             return None
-        candidates = [(row[0], row[2] or "", _json_loads(row[3])) for row in rows]
+        if not rows:
+            return []
+        ids = [row[0] for row in rows]
+        by_id = self._documents_by_id(cur, collection_id, ids)
+        candidates = [(doc_id, *by_id[doc_id]) for doc_id, _rank in rows if doc_id in by_id]
         return self._rescore_lexical_candidates(query, candidates, n_results)
 
     def close(self) -> None:
