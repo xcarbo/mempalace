@@ -306,7 +306,9 @@ def test_concurrent_first_calls_load_model_once(patched_lazy_load, monkeypatch):
 def test_get_embedding_function_dispatches_to_bge_small(monkeypatch):
     """model='bge-small' must build BgeSmallONNX, not the MiniLM EF."""
     monkeypatch.setattr(
-        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
     )
     ef = embedding.get_embedding_function(device="cpu", model="bge-small")
     assert isinstance(ef, embedding.BgeSmallONNX)
@@ -322,7 +324,9 @@ def test_get_embedding_function_threads_cap_passed_to_bge_small(monkeypatch):
 
     monkeypatch.setattr(embedding, "BgeSmallONNX", DummyBge)
     monkeypatch.setattr(
-        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
     )
     monkeypatch.setattr(embedding, "_resolve_intra_op_threads", lambda: 3)
 
@@ -340,7 +344,9 @@ def test_cache_key_separates_bge_from_minilm(monkeypatch):
 
     monkeypatch.setattr(embedding, "_build_ef_class", lambda: DummyMiniLM)
     monkeypatch.setattr(
-        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
     )
 
     ml = embedding.get_embedding_function(device="cpu", model="minilm")

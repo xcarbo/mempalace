@@ -278,7 +278,9 @@ def test_concurrent_first_calls_load_model_once(patched_lazy_load, monkeypatch):
 def test_get_embedding_function_dispatches_to_nomic(monkeypatch):
     """model='nomic' must build NomicEmbedONNX at the 384-d default."""
     monkeypatch.setattr(
-        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
     )
     ef = embedding.get_embedding_function(device="cpu", model="nomic")
     assert isinstance(ef, embedding.NomicEmbedONNX)
@@ -294,7 +296,9 @@ def test_get_embedding_function_threads_cap_passed_to_nomic(monkeypatch):
 
     monkeypatch.setattr(embedding, "NomicEmbedONNX", DummyNomic)
     monkeypatch.setattr(
-        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
     )
     monkeypatch.setattr(embedding, "_resolve_intra_op_threads", lambda: 5)
 
