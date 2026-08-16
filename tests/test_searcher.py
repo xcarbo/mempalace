@@ -219,6 +219,12 @@ class TestSearchMemories:
             "/fake/path",
             collection_name="custom_drawers",
             create=False,
+            # Pinned deliberately: the search path is a pure read and must
+            # declare itself read-only, or upstream c6e8783's open-path palace
+            # lease refuses every search started during a mine. Dropping this
+            # kwarg is a silent outage of the CLI, :4109, the hooks and the
+            # cron fleet, so the assertion is the tripwire.
+            read_only=True,
         )
 
     def test_search_memories_filters_in_result(self, palace_path, seeded_collection):
@@ -239,7 +245,9 @@ class TestSearchMemories:
             "ids": [["d1", "d2"]],
         }
 
-        def mock_get_collection(path, collection_name=None, create=False):
+        # read_only= is passed by _open_search_collection since the 3.7.1
+        # merge: a pure read must not take the palace write lease.
+        def mock_get_collection(path, collection_name=None, create=False, read_only=False):
             # First call: drawers. Second call: closets — raise so hybrid
             # degrades to pure drawer search (the catch block covers it).
             if not hasattr(mock_get_collection, "_called"):

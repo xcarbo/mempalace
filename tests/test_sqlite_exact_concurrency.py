@@ -17,6 +17,7 @@ import time
 import traceback
 
 import numpy as np
+import pytest
 
 from mempalace.backends.sqlite_exact import SQLiteExactBackend
 
@@ -201,3 +202,86 @@ def test_threaded_readers_during_writes_stay_clean(tmp_path):
         assert not failures, f"threaded workers raised: {failures}"
     finally:
         backend.close()
+
+
+# ── read-only opens vs a live writer's WAL sidecars ────────────────────
+
+
+def test_read_only_open_waits_out_a_transient_sidecar_mismatch(tmp_path, monkeypatch):
+    """A half-written -wal/-shm pair must be waited out, not treated as fatal.
+
+    Upstream's _connect_read_only raises the moment it sees one sidecar without
+    the other. That state is overwhelmingly transient — SQLite creates and
+    removes the two files microseconds apart — so a reader arriving mid-commit
+    was refused for no reason, roughly one run in five of the multi-process test
+    above. Since every read on this machine (:4109, cron, hooks) is supposed to
+    keep working DURING a mine, a spurious refusal there is an outage.
+    """
+    from mempalace.backends.sqlite_exact import SQLiteExactBackend
+
+    palace_path = str(tmp_path)
+    backend = SQLiteExactBackend()
+    col = backend.get_collection(palace_path, "drawers", create=True)
+    col.add(
+        documents=["seed row palace text"],
+        ids=["seed0"],
+        metadatas=[{"wing": "w0"}],
+        embeddings=_vectors(1, seed=7),
+    )
+    backend.close()
+
+    # Report a mismatched pair for the first two probes, then a consistent one —
+    # exactly the shape of a sidecar transition under a live writer.
+    calls = {"n": 0}
+    real_state = SQLiteExactBackend._wal_sidecar_state
+
+    def flaky_state(db_path):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return (True, False)
+        return real_state(db_path)
+
+    monkeypatch.setattr(SQLiteExactBackend, "_wal_sidecar_state", staticmethod(flaky_state))
+
+    reader = SQLiteExactBackend()
+    try:
+        rcol = reader.get_collection(
+            palace_path, "drawers", create=False, options={"read_only": True}
+        )
+        assert rcol.count() >= 1
+    finally:
+        reader.close()
+    assert calls["n"] >= 3, "the mismatch should have been re-probed, not accepted first time"
+
+
+def test_read_only_open_still_refuses_a_genuinely_broken_sidecar_set(tmp_path, monkeypatch):
+    """The retry must not paper over real corruption.
+
+    A restored backup missing one sidecar stays mismatched forever; that has to
+    keep raising, because mode=ro cannot open it and immutable=1 would silently
+    skip the WAL's rows — a wrong answer, which is worse than an error.
+    """
+    from mempalace.backends.base import BackendError
+    from mempalace.backends.sqlite_exact import SQLiteExactBackend
+
+    palace_path = str(tmp_path)
+    backend = SQLiteExactBackend()
+    col = backend.get_collection(palace_path, "drawers", create=True)
+    col.add(
+        documents=["seed row palace text"],
+        ids=["seed0"],
+        metadatas=[{"wing": "w0"}],
+        embeddings=_vectors(1, seed=8),
+    )
+    backend.close()
+
+    monkeypatch.setattr(
+        SQLiteExactBackend, "_wal_sidecar_state", staticmethod(lambda db_path: (True, False))
+    )
+
+    reader = SQLiteExactBackend()
+    try:
+        with pytest.raises(BackendError, match="incomplete WAL sidecar set"):
+            reader.get_collection(palace_path, "drawers", create=False, options={"read_only": True})
+    finally:
+        reader.close()

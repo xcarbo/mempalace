@@ -1954,7 +1954,21 @@ def _vector_disabled_search(
 
 def _open_search_collection(palace_path: str, collection_name: str):
     try:
-        return get_collection(palace_path, collection_name=collection_name, create=False), None
+        # read_only=True is the single most load-bearing use of the flag in the
+        # tree: this is the one funnel every search opens through — the memp
+        # CLI, the :4109 read API, the session hooks and the cron fleet. Since
+        # upstream c6e8783 a non-read-only open runs _init_schema inside
+        # mine_palace_lock, so without this every search started during a mine
+        # raises MineAlreadyRunning before reading a byte.
+        return (
+            get_collection(
+                palace_path,
+                collection_name=collection_name,
+                create=False,
+                read_only=True,
+            ),
+            None,
+        )
     except BackendMismatchError as e:
         return None, _backend_mismatch_result(e)
     except KeyError as e:

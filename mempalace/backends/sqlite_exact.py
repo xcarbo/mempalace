@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -41,6 +42,14 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 _DB_FILENAME = "sqlite_exact.sqlite3"
+
+# How long a read-only open waits for a half-written -wal/-shm pair to settle
+# before declaring the sidecar set genuinely broken. Sized for a transition, not
+# for a slow writer: the two files appear microseconds apart, so anything still
+# mismatched after a quarter second is a real inconsistency, not a race. See
+# _connect_read_only.
+_READ_ONLY_SIDECAR_SETTLE_SECONDS = 0.25
+_READ_ONLY_SIDECAR_POLL_SECONDS = 0.005
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 # FTS candidate-generation window for lexical_search, mirroring the chroma
 # lane's ``max_candidates=500``: FTS5 rank selects the window, the shared
@@ -1748,13 +1757,34 @@ class SQLiteExactBackend(BaseBackend):
         Returns ``(connection, immutable)``. ``immutable`` is True when the
         database was clean (no WAL) and was opened with ``immutable=1``.
         """
-        wal_exists, shm_exists = SQLiteExactBackend._wal_sidecar_state(db_path)
-        if wal_exists != shm_exists:
-            raise BackendError(
-                "sqlite_exact read-only open found an incomplete WAL sidecar set; "
-                "open the palace after its writer exits cleanly or restore both "
-                "the -wal and -shm files"
-            )
+        # FORK DELTA (3.7.1 merge, 2026-08-16). Upstream raises immediately on a
+        # mismatched sidecar pair. The refusal itself is right — with only one of
+        # -wal/-shm present, mode=ro cannot open and immutable=1 would silently
+        # skip the WAL's uncommitted rows — but a mismatch is overwhelmingly a
+        # TRANSIENT: SQLite creates and removes the two sidecars microseconds
+        # apart, so a reader that arrives mid-transition sees a half-set for an
+        # instant. Treating that instant as fatal defeats the entire point of
+        # read_only=True on this machine, which is that :4109, the cron fleet and
+        # the session hooks keep reading DURING a mine. Measured on the merged
+        # tree with tests/test_sqlite_exact_concurrency.py: roughly one run in
+        # five failed here, with a real writer active and nothing wrong.
+        #
+        # So: re-stat over a short bounded window and only raise if the set is
+        # STILL inconsistent. A genuinely broken palace (a restored backup
+        # missing a sidecar) stays inconsistent and still raises, with the same
+        # message; a live writer resolves in well under one poll.
+        deadline = time.monotonic() + _READ_ONLY_SIDECAR_SETTLE_SECONDS
+        while True:
+            wal_exists, shm_exists = SQLiteExactBackend._wal_sidecar_state(db_path)
+            if wal_exists == shm_exists:
+                break
+            if time.monotonic() >= deadline:
+                raise BackendError(
+                    "sqlite_exact read-only open found an incomplete WAL sidecar set; "
+                    "open the palace after its writer exits cleanly or restore both "
+                    "the -wal and -shm files"
+                )
+            time.sleep(_READ_ONLY_SIDECAR_POLL_SECONDS)
 
         db_uri = Path(db_path).resolve().as_uri()
         if wal_exists:
