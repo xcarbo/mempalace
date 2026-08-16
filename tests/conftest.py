@@ -189,6 +189,7 @@ _AMBIENT_VARS_TO_SCRUB = (
     # Outbox — an exported URL would make tests emit to a real endpoint.
     "MEMPALACE_OUTBOX_URL",
     "MEMPALACE_OUTBOX_SECRET",
+    "MEMPALACE_OUTBOX_SECRET_FILE",
     "MEMPALACE_OUTBOX_WINGS",
     # Ranking behavior — an exported fusion/blend override silently re-scores
     # every ranking assertion, exactly like the rerank leak did.

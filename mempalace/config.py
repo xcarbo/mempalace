@@ -693,17 +693,59 @@ class MempalaceConfig:
         Empty/missing config disables the outbox. Env vars override the
         file config per-field: MEMPALACE_OUTBOX_URL / _SECRET / _WINGS
         (comma-separated).
+
+        The secret resolves in this order, first hit wins:
+
+        1. ``MEMPALACE_OUTBOX_SECRET``
+        2. ``secret_file`` — ``MEMPALACE_OUTBOX_SECRET_FILE``, else the
+           ``secret_file`` key. The file holds the bare secret and nothing else.
+        3. ``secret`` — the literal value in ``config.json``.
+
+        ``secret_file`` exists because neither of the other two can be both
+        safe and universal here. An inline ``secret`` puts the value in
+        ``config.json``, which on this deployment lives on a volume mounted
+        ``noowners`` where chmod cannot isolate it. An env var is safe but only
+        reaches the processes whose shell exported it — ``memp`` also runs from
+        cron and launchd, which get neither ``.zshenv`` nor ``.bashrc``, so a
+        shell export silently drops the secret exactly where nobody is watching.
+        A path read in-process works in every context and lets the secret live
+        somewhere chmod is real.
         """
         block = dict(self._file_config.get("outbox", {}) or {})
         if os.environ.get("MEMPALACE_OUTBOX_URL"):
             block["url"] = os.environ["MEMPALACE_OUTBOX_URL"]
-        if os.environ.get("MEMPALACE_OUTBOX_SECRET"):
-            block["secret"] = os.environ["MEMPALACE_OUTBOX_SECRET"]
         if os.environ.get("MEMPALACE_OUTBOX_WINGS"):
             block["wings"] = [
                 w.strip() for w in os.environ["MEMPALACE_OUTBOX_WINGS"].split(",") if w.strip()
             ]
+
+        env_secret = os.environ.get("MEMPALACE_OUTBOX_SECRET")
+        if env_secret and env_secret.strip():
+            block["secret"] = env_secret.strip()
+        else:
+            secret_file = os.environ.get("MEMPALACE_OUTBOX_SECRET_FILE") or block.get("secret_file")
+            from_file = self._read_secret_file(secret_file)
+            if from_file:
+                block["secret"] = from_file
+        block.pop("secret_file", None)
         return block
+
+    @staticmethod
+    def _read_secret_file(path) -> "str | None":
+        """Read a bare secret from *path*, or ``None`` if unusable.
+
+        Fail-soft on every error: a missing, unreadable or empty file leaves the
+        caller on the next source in the chain rather than raising. The outbox
+        must never be able to break a palace write (see ``outbox.emit``), so
+        this cannot throw either.
+        """
+        if not path or not str(path).strip():
+            return None
+        try:
+            value = Path(str(path).strip()).expanduser().read_text(encoding="utf-8").strip()
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None
+        return value or None
 
     @staticmethod
     def _try_coerce_int(value, minimum=None):
