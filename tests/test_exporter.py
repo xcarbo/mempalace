@@ -132,6 +132,13 @@ def test_export_empty_palace():
         stats = export_palace(palace_path, output_dir)
 
         assert stats == {"wings": 0, "rooms": 0, "drawers": 0}
+        # And it must not have CREATED a palace at that path just by looking.
+        # Before the 3.7.1 read_only fix, get_collection defaulted create=True,
+        # so exporting a mistyped --palace silently littered a new empty palace
+        # on disk and then reported a successful export of nothing.
+        assert not os.path.exists(palace_path), (
+            "export_palace created a palace at a path that did not exist"
+        )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

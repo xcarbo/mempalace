@@ -17,6 +17,7 @@ import re
 from collections import defaultdict
 from datetime import datetime
 
+from .backends import PalaceNotFoundError
 from .palace import get_collection
 
 
@@ -80,12 +81,23 @@ def export_palace(palace_path: str, output_dir: str, format: str = "markdown") -
     Returns:
         Stats dict: {"wings": N, "rooms": N, "drawers": N}
     """
-    # create=False is required with read_only=True, not optional:
-    # get_collection defaults create=True and sqlite_exact._connect rejects the
-    # combination outright. Export is a pure read and must never conjure an
-    # empty palace at a mistyped path.
-    col = get_collection(palace_path, create=False, read_only=True)
-    total = col.count()
+    # create=False is required with read_only=True, not optional: get_collection
+    # defaults create=True and sqlite_exact._connect rejects the combination
+    # outright (ValueError: read-only connections cannot create a palace).
+    #
+    # It also fixes a quieter bug it exposed. With create=True, exporting a path
+    # that did not exist SILENTLY CREATED an empty palace there and then
+    # reported "nothing to export" — so a mistyped --palace littered a new empty
+    # palace on disk and looked like a successful export of an empty one. An
+    # export is a pure read; it has no business creating anything. Missing and
+    # empty are now both reported as zero stats, which keeps this function's
+    # documented return contract, but nothing is written either way.
+    try:
+        col = get_collection(palace_path, create=False, read_only=True)
+        total = col.count()
+    except PalaceNotFoundError:
+        print(f"  No palace at {palace_path} -- nothing to export.")
+        return {"wings": 0, "rooms": 0, "drawers": 0}
 
     if total == 0:
         print("  Palace is empty -- nothing to export.")
