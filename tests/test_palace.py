@@ -290,6 +290,8 @@ def test_get_collection_expands_tilde_instead_of_creating_a_literal_dir(tmp_path
     assert seen["path"] == str(real_palace)
     assert "~" not in seen["path"]
     assert not (tmp_path / "~").exists()
+
+
 def test_candidate_entity_words_drops_overlong_blob():
     """#2063: a long unbroken ASCII run must be collapsed before matching so the
     candidate patterns cannot backtrack catastrophically; such runs are never

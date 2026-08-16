@@ -303,7 +303,9 @@ def test_union_results_use_parent_or_lexical_hit_id():
         ]
     )
 
-    hits, error = _finalize_candidate_hits(
+    # Three-tuple: this fork's _finalize_candidate_hits also returns
+    # lexical_lane, so a search degraded to vector-only is observable.
+    hits, error, _lexical_lane = _finalize_candidate_hits(
         candidate_strategy="union",
         hits=[],
         drawers_col=drawers_col,

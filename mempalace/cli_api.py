@@ -251,6 +251,8 @@ _COLLIDER_ARG_MAP = {
         "source_file": "source_file",
         "max_distance": "max_distance",
         "context": "context",  # re-ranking hint, forwarded verbatim to the tool
+        "since": "since",  # upstream 3.7.1 date window (#1128/#463)
+        "before": "before",
     },
     "status": {},
 }

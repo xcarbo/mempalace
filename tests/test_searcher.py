@@ -1318,13 +1318,25 @@ class TestSearchMemoriesDateFilter:
         assert "since" in result["error"]
 
     def test_pool_truncated_flag_set_when_widened_pool_full(self, palace_path):
-        # n_results=1 -> widened pool = 15; seed 16 in-window drawers so the
-        # backend returns a full pool and the honesty flag must fire.
+        # The flag means "the candidate pool came back FULL, so drawers beyond
+        # it never got a chance to match the window". Seed one more than the
+        # width actually requested so the pool really is full.
+        #
+        # Width is computed, not hardcoded at upstream's 15: this fork fetches
+        # max(_vector_candidate_count, _candidate_pool_size), because our
+        # archive-demotion and reranker floors need a wider vector lane than
+        # the date window alone does. At n_results=1 that is 60, not 15, so the
+        # original 16 drawers could never fill it and the flag correctly stayed
+        # silent. Deriving the number keeps the property under test honest if
+        # either floor moves again.
         from mempalace.palace import get_collection
+        from mempalace.searcher import _candidate_pool_size, _vector_candidate_count
+
+        fetch_width = max(_vector_candidate_count(1, None), _candidate_pool_size(1, True))
 
         col = get_collection(palace_path, create=True)
         ids, docs, metas = [], [], []
-        for i in range(16):
+        for i in range(fetch_width + 1):
             ids.append(f"flag{i}")
             docs.append(f"standup summary entry number {i} about deploy status.")
             metas.append(
@@ -1340,7 +1352,7 @@ class TestSearchMemoriesDateFilter:
             "standup deploy status", palace_path, n_results=1, since="2026-04-01"
         )
         assert result.get("date_filter_pool_truncated") is True
-        assert result["total_before_filter"] >= 15
+        assert result["total_before_filter"] >= fetch_width
 
     def test_pool_truncated_flag_absent_on_small_corpus(self, palace_path, seeded_collection):
         result = search_memories(

@@ -1020,6 +1020,8 @@ def test_treatment_gates_negative_falls_back_to_default(tmp_path):
     cfg = _write_config(tmp_path, embed_context_headers_min_chunks=-1, chunk_boundary_min_chunks=-3)
     assert cfg.embed_context_headers_min_chunks == 16
     assert cfg.chunk_boundary_min_chunks == 16
+
+
 # ── cfg.lang resolution ────────────────────────────────────────────────
 
 

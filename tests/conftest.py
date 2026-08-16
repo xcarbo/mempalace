@@ -42,9 +42,15 @@ _REAL_EMBEDDING_TEST_MODULES = {
     "test_embedding",
     "test_embedding_api",
     "test_embeddinggemma",
-    # Ours: this module tests _embed_texts itself (the is_query routing for
-    # asymmetric models). The fixture below monkeypatches _embed_texts to a
-    # stub, which would shadow the very function under test.
+    # Ours. The autouse fixture below replaces get_embedding_function and
+    # _embed_texts with a deterministic stub for every module NOT listed here —
+    # which is exactly what these modules assert on, so without the opt-out
+    # they test the stub instead of the code (isinstance checks against
+    # BgeSmallONNX / NomicEmbedONNX fail, and _embed_texts' is_query routing is
+    # never reached). Added at the 3.7.1 merge, when the fixture arrived.
+    "test_bge_small",
+    "test_nomic_embed",
+    "test_embedder_identity",
     "test_embedding_wrapper",
 }
 

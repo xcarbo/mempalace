@@ -2632,10 +2632,16 @@ def test_cmd_repair_dry_run_leaves_a_real_palace_byte_identical(tmp_path, capsys
     _seed_palace(palace, "mempalace_drawers", [(f"d{i}", f"b{i}", {"wing": "w"}) for i in range(4)])
 
     def snapshot():
+        # -shm/-wal excluded for the same reason as the sibling preview test
+        # above: this fork puts every palace into WAL journal mode
+        # (enable_wal_journal; note the .wal_enabled marker), where SQLite
+        # materialises those sidecars even on a mode=ro open. They are
+        # bookkeeping, not palace content — every real file, chroma.sqlite3
+        # included, is still hashed and compared byte for byte.
         return {
             str(p.relative_to(palace)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(palace.rglob("*"))
-            if p.is_file()
+            if p.is_file() and not p.name.endswith(("-shm", "-wal"))
         }
 
     before = snapshot()

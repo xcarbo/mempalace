@@ -1104,6 +1104,8 @@ class TestJunkEntityToken:
         for token in ("Bachmeyer", "ForgePoint", "MemoryStack", "Trevor"):
             assert not is_junk_entity_token(token)
             assert not is_junk_entity_token(token, allow_structural=True)
+
+
 # ── ReDoS guard: long ASCII blobs (#2063) ──────────────────────────────
 
 

@@ -2064,6 +2064,8 @@ def _write_watchdog(palace_path: str, op: str):
     finally:
         fired.set()
         timer.cancel()
+
+
 def _clear_chroma_system_cache() -> None:
     """Drop chromadb's process-global ``SharedSystemClient`` cache.
 

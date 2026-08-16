@@ -327,7 +327,9 @@ class TestReadOnlyMode:
 class TestGateExemptions:
     def test_peer_writer_lock_does_not_block_event_append(self, patched_server, monkeypatch):
         monkeypatch.setattr(
-            mcp_server, "_acquire_mcp_writer_lock", lambda: (False, "peer writer active")
+            mcp_server,
+            "_acquire_mcp_writer_lock",
+            lambda tool_name=None: (False, "peer writer active"),
         )
         # Chroma-backed mutating tool is refused...
         assert mcp_server._mcp_peer_writer_refusal(1, "mempalace_add_drawer") is not None
