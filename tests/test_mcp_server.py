@@ -5288,11 +5288,28 @@ def test_status_tool_does_not_acquire_peer_writer_lock(monkeypatch):
     assert mcp_server.tool_status()["total_drawers"] == 0
 
 
-def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
+def test_peer_writer_lock_setup_failure_refuses_and_retries(monkeypatch):
+    """A broken lock MECHANISM refuses the write, and is retried every call.
+
+    Rewritten at the 3.7.1 merge; it previously asserted the opposite on both
+    counts, and upstream is right on both.
+
+    * Fail-CLOSED, not fail-open. We used to continue without peer-writer
+      protection when the lock mechanism itself broke — written in the chroma
+      era. The live backend is now sqlite_exact, where writing without the
+      palace lease is precisely the corruption this lease exists to prevent, so
+      refusing the mutating tool is the safe verdict.
+    * NOT cached. We used to take the first failure as final, reasoning that
+      retrying a broken mechanism cannot help. But lock-directory permissions
+      can be repaired, and a peer can exit, while this long-lived stdio host
+      stays up — so every mutating request gets a fresh ownership attempt.
+    """
     from mempalace import mcp_server, palace
 
     calls = {"count": 0}
 
+    # Keeps our wait_seconds parameter: upstream's mine_palace_lock has no such
+    # argument, so a fake without it would hide a dropped 120s writer wait.
     def broken_mine_palace_lock(palace_path, wait_seconds=0.0):
         calls["count"] += 1
         raise RuntimeError(f"permission denied for {palace_path}")
@@ -5308,11 +5325,11 @@ def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
     ok_first, reason_first = mcp_server._acquire_mcp_writer_lock()
     ok_second, reason_second = mcp_server._acquire_mcp_writer_lock()
 
-    assert ok_first is True
-    assert ok_second is True
-    assert calls["count"] == 1
+    assert ok_first is False
+    assert ok_second is False
+    assert calls["count"] == 2, "a broken lock mechanism must be retried, not cached"
     assert mcp_server._MCP_WRITER_LOCK_FAILED is True
-    assert "continuing without peer-writer protection" in reason_first
+    assert "permission denied" in reason_first
     assert reason_second == reason_first
 
 

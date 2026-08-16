@@ -1814,7 +1814,17 @@ def prefetch_content_hashes(
             batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
             for meta in batch["metadatas"]:
                 meta = meta or {}
-                content_hash_field = meta.get("content_hash")
+                # Fork delta: read ``conversation_content_hash``, not
+                # ``content_hash``. Both this conversation-level dedup (theirs,
+                # 283dae4/54397a5) and our chunk-level dedup (6826f01) shipped
+                # independently and both claimed ``content_hash``, but they hold
+                # different values — a whole-transcript digest here versus a
+                # per-chunk digest there. Our key stayed put because ~201k live
+                # drawers already carry it; this one moved. Sharing the field
+                # would pour every chunk hash in the palace into this
+                # conversation map (200k+ entries scanned on every mine) and mix
+                # two hash namespaces in one field.
+                content_hash_field = meta.get("conversation_content_hash")
                 src = meta.get("source_file")
                 wing = meta.get("wing")
                 if not content_hash_field or not src or not wing:
