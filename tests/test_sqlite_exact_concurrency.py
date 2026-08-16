@@ -66,7 +66,17 @@ def _writer_proc(palace_path, deadline, errors, ops):
 def _reader_proc(palace_path, deadline, errors, ops, seed):
     try:
         backend = SQLiteExactBackend()
-        col = backend.get_collection(palace_path, "drawers", create=False)
+        # read_only=True is load-bearing, not decoration. Since upstream
+        # c6e8783 the non-read-only open path runs _init_schema inside
+        # mine_palace_lock, so a plain get_collection(create=False) — a pure
+        # read — raises MineAlreadyRunning whenever anything else holds the
+        # palace, which on this machine is every mine window. Readers must
+        # declare themselves.
+        # The backend's contract is options={"read_only": True}; the friendly
+        # read_only= kwarg lives one layer up on palace.get_collection.
+        col = backend.get_collection(
+            palace_path, "drawers", create=False, options={"read_only": True}
+        )
         q = _vectors(1, seed=seed)[0]
         count = 0
         while time.time() < deadline:

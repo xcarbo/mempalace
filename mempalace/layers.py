@@ -97,7 +97,7 @@ class Layer1:
     def generate(self) -> str:
         """Pull top drawers from ChromaDB and format as compact L1 text."""
         try:
-            col = _get_collection(self.palace_path, create=False)
+            col = _get_collection(self.palace_path, create=False, read_only=True)
         except Exception:
             return "## L1 — No palace found. Run: mempalace mine <dir>"
 
@@ -216,7 +216,7 @@ class Layer2:
     def retrieve(self, wing: str = None, room: str = None, n_results: int = 10) -> str:
         """Retrieve drawers filtered by wing and/or room."""
         try:
-            col = _get_collection(self.palace_path, create=False)
+            col = _get_collection(self.palace_path, create=False, read_only=True)
         except Exception:
             return "No palace found."
 
@@ -275,7 +275,7 @@ class Layer3:
     def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
         """Semantic search, returns compact result text."""
         try:
-            col = _get_collection(self.palace_path, create=False)
+            col = _get_collection(self.palace_path, create=False, read_only=True)
         except Exception:
             return "No palace found."
 
@@ -330,7 +330,7 @@ class Layer3:
     ) -> list:
         """Return raw dicts instead of formatted text."""
         try:
-            col = _get_collection(self.palace_path, create=False)
+            col = _get_collection(self.palace_path, create=False, read_only=True)
         except Exception:
             return []
 
@@ -452,7 +452,7 @@ class MemoryStack:
 
         # Count drawers
         try:
-            col = _get_collection(self.palace_path, create=False)
+            col = _get_collection(self.palace_path, create=False, read_only=True)
             count = col.count()
             result["total_drawers"] = count
         except Exception:

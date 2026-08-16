@@ -82,6 +82,10 @@ def _get_collection(config=None):
             config.palace_path,
             collection_name=config.collection_name,
             create=False,
+            # Pure read (room traversal / tunnel building). Without this the
+            # open path takes the palace write lease and raises
+            # MineAlreadyRunning during any mine — see upstream c6e8783.
+            read_only=True,
         )
     except Exception:
         return None

@@ -99,7 +99,9 @@ def snapshot(
     # dispatch path has usually imported it already by the time we run.
     from .mcp_server import _collapse_drawer_rows, _fetch_drawer_rows
 
-    col = get_collection(palace_path, collection_name=collection_name, create=False)
+    col = get_collection(
+        palace_path, collection_name=collection_name, create=False, read_only=True
+    )
     if col is None:
         raise ValueError(f"No palace found at {palace_path}")
 

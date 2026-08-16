@@ -80,7 +80,7 @@ def export_palace(palace_path: str, output_dir: str, format: str = "markdown") -
     Returns:
         Stats dict: {"wings": N, "rooms": N, "drawers": N}
     """
-    col = get_collection(palace_path)
+    col = get_collection(palace_path, read_only=True)
     total = col.count()
 
     if total == 0:
