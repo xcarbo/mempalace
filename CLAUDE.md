@@ -123,6 +123,38 @@ Knowledge Graph:
   ENTITY → PREDICATE → ENTITY (with valid_from / valid_to dates)
 ```
 
+## Fork Deltas (this fork only — read before any upstream merge)
+
+`xdev-patches` diverges from `MemPalace/mempalace` in a few places where the divergence is
+deliberate and **silent-revert-shaped**: a clean merge can restore upstream's value, nothing
+raises, and the suite stays green. Two of the 3.7.1 merge's worst moments were this shape.
+
+The register is `tests/test_fork_deltas.py` — every delta has a test that fails loudly. Run it
+first after any upstream merge:
+
+```bash
+uv run pytest tests/test_fork_deltas.py -v
+```
+
+| Delta | Ours | Upstream | Why a silent revert hurts |
+|---|---|---|---|
+| `.mcp.json` | must NOT exist | ships it (`2f72c91`) | Re-arms the MCP server retired 2026-06-16 — every session in this repo regains the `mcp__mempalace__*` **write** surface against the live palace |
+| `NORMALIZE_VERSION` (`palace.py`) | `3` | `2` | At 2 the v3 re-mine no-ops and the 6,066-drawer oversized backlog stays frozen, reporting success |
+| `_open_search_collection` (`searcher.py`) | `read_only=True` | — | Reverted once already, by stage 5 of the 3.7.1 merge. Without it every search during a mine raises `MineAlreadyRunning` |
+| `_main_worktree_root` (`hooks_cli.py`) | take-ours | — | Worktree sessions file into a wing literally named `worktree` |
+| `ID_RECIPE` (`ids.py`) | `"v3"` | same | Pinned, not diverged — a change on either side re-derives every drawer id |
+
+Two rules:
+
+- **When a delta test goes red after a merge, restore OUR value.** Never re-point the
+  assertion at upstream's.
+- **A new delta lands with a test in that file, in the same commit.** Every case above
+  survived a full green suite before it had one.
+
+Watch the ~113 theirs-only files a merge brings in untouched: they never conflict, so a
+conflict-driven review gives them zero attention. `.mcp.json` was one, and it changed
+behaviour by existing rather than by being called.
+
 ## Key Files for Common Tasks
 
 - **Adding an MCP tool**: `mempalace/mcp_server.py` — add handler function + TOOLS dict entry
