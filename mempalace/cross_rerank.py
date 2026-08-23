@@ -191,7 +191,17 @@ def _score_one(query: str, document: str, url: str, model: str, key: str | None)
             if "context" not in detail.lower():
                 raise
             text = text[: max(MIN_TEXT_CHARS, len(text) // 2)]
-            logger.debug("cross-rerank: context rejected, retrying at %d chars", len(text))
+            # WARNING, not debug: a shrink means this candidate was judged on a
+            # truncated drawer, so the score is quietly worse than it looks. The
+            # retry keeps the run alive; it does not make the result correct.
+            # Repeated shrinks mean the server's window is misconfigured, and
+            # that is a silent quality loss nobody would otherwise see.
+            logger.warning(
+                "cross-rerank: server context too small, judging on %d chars instead of %d "
+                "— raise the endpoint's context window",
+                len(text),
+                MAX_TEXT_CHARS,
+            )
     else:
         raise RuntimeError("cross-rerank: document still too long after shrinking")
 
