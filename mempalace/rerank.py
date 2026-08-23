@@ -20,6 +20,11 @@ Off by default; enable by setting both:
     MEMPALACE_RERANK_URL    e.g. http://127.0.0.1:1234/v1/embeddings
     MEMPALACE_RERANK_MODEL  e.g. text-embedding-nomic-embed-text-v1.5@f32
 
+Setting ``MEMPALACE_RERANK_MODE=cross`` swaps the scorer for the cross-encoder
+in :mod:`mempalace.cross_rerank` (URL then points at a completion endpoint).
+Same contract, same blend, stronger signal, one request per candidate instead
+of one for the pool.
+
 Fail-soft by contract: any error — endpoint down, timeout, bad payload —
 leaves the hits unscored, and the searcher keeps first-stage order.
 Search never breaks because the reranker is unavailable.
@@ -38,6 +43,10 @@ logger = logging.getLogger("mempalace_mcp")
 
 RERANK_URL_ENV = "MEMPALACE_RERANK_URL"
 RERANK_MODEL_ENV = "MEMPALACE_RERANK_MODEL"
+# "embedding" (default) = bi-encoder, this module. "cross" = cross-encoder,
+# mempalace.cross_rerank. Both satisfy the same annotate_rerank_scores
+# contract, so the searcher's blend is identical either way.
+RERANK_MODE_ENV = "MEMPALACE_RERANK_MODE"
 
 # Candidates beyond this are left in first-stage order (they can only enter
 # the final top-N if the pool is smaller than the cut, which it never is in
@@ -92,6 +101,22 @@ def annotate_rerank_scores(query: str, pool: list) -> bool:
     """
     if not rerank_enabled() or not pool or not query:
         return False
+
+    if os.environ.get(RERANK_MODE_ENV, "embedding").strip().lower() == "cross":
+        # Cross-encoder: reads query and candidate together and returns a
+        # probability, where this module returns a cosine. The searcher
+        # min-max normalises whatever it finds in `rerank_score`, so the two
+        # scales never meet and no caller has to know which ran.
+        from .cross_rerank import score_pairs
+
+        scores = score_pairs(query, [(h.get("text") or "") for h in pool])
+        if scores is None or len(scores) != len(pool):
+            logger.debug("cross-rerank returned nothing usable; keeping first-stage order")
+            return False
+        for h, sc in zip(pool, scores):
+            h["rerank_score"] = round(sc, 4)
+        return True
+
     try:
         texts = ["search_query: " + query] + [
             "search_document: " + (h.get("text") or "")[:MAX_TEXT_CHARS] for h in pool
