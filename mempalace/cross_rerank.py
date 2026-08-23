@@ -49,6 +49,27 @@ import urllib.request
 
 logger = logging.getLogger("mempalace_mcp")
 
+
+def _env_float(name: str, default: float) -> float:
+    """Read a positive float from the environment, falling back on anything odd.
+
+    Deliberately permissive: these are performance knobs for one endpoint, and a
+    typo in a batch script must not take out the second stage of every search.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("%s=%r must be positive; using %s", name, raw, default)
+        return default
+    return value
+
+
 URL_ENV = "MEMPALACE_RERANK_URL"
 MODEL_ENV = "MEMPALACE_RERANK_MODEL"
 KEY_FILE_ENV = "MEMPALACE_RERANK_KEY_FILE"
@@ -58,7 +79,7 @@ KEY_FILE_ENV = "MEMPALACE_RERANK_KEY_FILE"
 # tokens 16 wins clearly (32 real drawers: 393 ms/doc at 8, 238 at 16, 269 at
 # 24). The knee moves with the server's context and slot count, so this is a
 # measured default for the current endpoint, not a universal constant.
-MAX_WORKERS = 16
+MAX_WORKERS = int(_env_float("MEMPALACE_RERANK_WORKERS", 16))
 # Per-candidate text cap. The judgement is made on the opening of a drawer;
 # sending more costs prompt tokens on every candidate and did not change the
 # verdict in spot checks.
@@ -69,9 +90,13 @@ MIN_TEXT_CHARS = 400
 # Attempts per candidate: the original plus halvings. 2000 -> 1000 -> 500 -> 400
 # reaches the floor, which covers a 512-token window.
 MAX_SHRINKS = 4
-# One candidate, one token. A hung endpoint must not stall search: the caller
-# already treats None as "keep first-stage order".
-TIMEOUT_SECONDS = 20.0
+# One candidate, one token — but the clock covers the server-side QUEUE too, not
+# just generation. A pool deeper than the endpoint's slot count makes later
+# requests wait, and a deep pool degrades superlinearly: 32 candidates ran at
+# 238 ms each, 200 at 1,221 ms, with 136 of the 200 timing out at 20s. So the
+# default is sized for the SHALLOW interactive pool, where a hung endpoint must
+# fail soft quickly, and offline batch work raises it deliberately.
+TIMEOUT_SECONDS = _env_float("MEMPALACE_RERANK_TIMEOUT", 20.0)
 
 _SYSTEM = (
     "Judge whether the Document meets the requirements based on the Query and "
