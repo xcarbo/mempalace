@@ -404,6 +404,13 @@ _STARTUP_INTEGRITY_MAX_MB_DEFAULT = 512.0
 # lifetime. A peer MCP process can still serve read tools, but mutating tools
 # refuse before touching Chroma or the knowledge graph.
 _MCP_WRITER_LOCK_CM = None
+
+# True only while this module is actually SERVING MCP (set by main()). It is not
+# the same question as "was --transport stdio parsed", because _parse_args() runs
+# at IMPORT time against whatever sys.argv the importing process happens to have.
+# Every library caller therefore looks like a default stdio server. See the
+# read-only guard in _get_collection() for what that cost.
+_SERVING_AS_MCP = False
 _MCP_WRITER_READ_ONLY = False
 _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
@@ -1503,8 +1510,22 @@ def _get_collection(create=False):
         # the schema-initializing read/write path. This lets recall coexist
         # with a daemon/HTTP writer. _acquire_mcp_writer_lock() discards this
         # cached read-only collection before a promoted mutation is handled.
+        # _SERVING_AS_MCP gates this. The rule is about a stdio MCP SERVER that
+        # has not yet claimed the palace writer lock — but the test used to be
+        # `_args.transport == "stdio"`, and _args is parsed at import time from
+        # the importing process's argv. Any library caller (the gnome wrappers,
+        # the agent tools, a plain `from mempalace.mcp_server import
+        # tool_add_drawer`) has no --transport flag, so it defaulted to "stdio",
+        # matched this branch, and opened the palace read-only.
+        #
+        # Cost of that, 2026-08-16 to 08-24: EVERY background writer failed with
+        # "attempt to write a readonly database" — night-watcher's digest, the
+        # mempalace-monitor briefing, and palace-gnome's briefing AND verdicts,
+        # every night for eight nights. The subprocess CLI kept working, so the
+        # palace looked healthy from a shell and nothing surfaced it.
         collection_read_only = _READ_ONLY or (
             backend_name == "sqlite_exact"
+            and _SERVING_AS_MCP
             and getattr(_args, "transport", "stdio") == "stdio"
             and _MCP_WRITER_LOCK_CM is None
         )
@@ -8422,6 +8443,12 @@ def main():
     # already protects this process from the same ABI mismatch; here we
     # extend the protection to children.
     os.environ.pop("PYTHONPATH", None)
+
+    # From here on this process IS an MCP server, which is what arms the
+    # read-only-until-promoted guard in _get_collection(). Importing this module
+    # as a library must never arm it.
+    global _SERVING_AS_MCP
+    _SERVING_AS_MCP = True
 
     _install_shutdown_signal_handlers()
 
