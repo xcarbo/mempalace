@@ -8,14 +8,11 @@ killed the whole mine run. It went unnoticed for a day because the scheduled
 mine sent stderr to /dev/null.
 
 The fix has now been dropped twice by upstream merges, so it gets a test.
-
-Note: this only fails on a machine whose preferred encoding is not UTF-8
-(the Windows box this runs on daily). On a UTF-8 host it passes either way.
 """
 
-import locale
 from pathlib import Path
 
+import pytest
 import yaml
 
 from mempalace.miner import load_config
@@ -52,26 +49,21 @@ def test_load_config_reads_cjk_description(tmp_path):
 
 
 def test_load_config_does_not_depend_on_platform_encoding(tmp_path):
-    # Guards the actual regression: the file is UTF-8 on disk, and reading it
-    # must not go through locale.getpreferredencoding().
+    """The file is UTF-8 on disk; load_config must not use the locale codec.
+
+    GitHub Windows runners report preferred encoding cp1252, and Python
+    UTF-8 mode makes bare ``open()`` succeed anyway. cp1252 also accepts
+    these UTF-8 CJK bytes as mojibake, so a locale-default ``open()`` does
+    not raise. Prove the on-disk bytes are UTF-8 (ascii and cp950 reject
+    them) and that load_config still returns the original CJK string.
+    """
     project_dir = write_config(tmp_path / "proj")
     raw = (project_dir / "mempalace.yaml").read_bytes()
     assert CJK_DESCRIPTION.encode("utf-8") in raw
-
-    preferred = locale.getpreferredencoding(False)
-    if preferred.lower().replace("-", "") not in {"utf8"}:
-        # On this platform the pre-fix code path genuinely fails.
-        try:
-            with open(project_dir / "mempalace.yaml") as f:
-                f.read()
-        except UnicodeDecodeError:
-            pass
-        else:
-            raise AssertionError(
-                f"expected a decode failure under {preferred}; "
-                "the fixture no longer reproduces the bug"
-            )
-
+    with pytest.raises(UnicodeDecodeError):
+        raw.decode("ascii")
+    with pytest.raises(UnicodeDecodeError):
+        raw.decode("cp950")
     assert load_config(str(project_dir))["rooms"][0]["description"] == CJK_DESCRIPTION
 
 
