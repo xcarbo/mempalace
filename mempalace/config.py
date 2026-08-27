@@ -1315,7 +1315,7 @@ class MempalaceConfig:
             # dropping legitimate short conversation exchanges. Module-level
             # defaults already apply correctly when these keys are absent.
             default_config = {
-                "palace_path": DEFAULT_PALACE_PATH,
+                "palace_path": self.palace_path,
                 "collection_name": DEFAULT_COLLECTION_NAME,
                 "topic_wings": DEFAULT_TOPIC_WINGS,
                 "hall_keywords": DEFAULT_HALL_KEYWORDS,
