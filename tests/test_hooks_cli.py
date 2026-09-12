@@ -835,6 +835,21 @@ def test_wing_from_transcript_path_strips_parent_dir_with_hyphenated_project():
     assert _wing_from_transcript_path(path) == "react-native"
 
 
+def test_wing_from_transcript_path_fallback_collapses_worktree():
+    """Regression: the fallback path (no cwd in the JSONL) left the flattened
+    ``--claude-worktrees-<wt>`` segment in the encoded folder name, giving every
+    worktree its own wing where the primary cwd-based path already collapses
+    it to <project> (#2388)."""
+    worktree_path = (
+        "/Users/u/.claude/projects/"
+        "-Users-u-projects-gsd-core--claude-worktrees-hardcore-wilbur-48691a/x.jsonl"
+    )
+    non_worktree_path = "/Users/u/.claude/projects/-Users-u-projects-gsd-core/x.jsonl"
+    # Fork: bare hyphenated wing names (no ``wing_`` prefix, hyphens kept).
+    assert _wing_from_transcript_path(worktree_path) == "gsd-core"
+    assert _wing_from_transcript_path(non_worktree_path) == "gsd-core"
+
+
 # --- _wing_from_transcript_path: cwd-from-JSONL primary path ---
 
 
