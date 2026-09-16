@@ -6,7 +6,7 @@ Knows the difference between Riley (a person) and ever (an adverb).
 Built from three sources, in priority order:
   1. Onboarding — what the user explicitly told us
   2. Learned — what we inferred from session history with high confidence
-  3. Researched — what we looked up via Wikipedia for unknown words
+  3. Researched — legacy ``wiki_cache`` entries from older versions, read only
 
 Usage:
     from mempalace.entity_registry import EntityRegistry
@@ -120,55 +120,6 @@ CONCEPT_CONTEXT_PATTERNS = [
     r"\bcould\s+{name}\b",  # "could ever"
     r"\bwill\s+{name}\b",  # "will ever"
     r"(?:the\s+)?{name}\s+(?:of|in|at|for|to)\b",  # "the grace of", "the mark of"
-]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Wikipedia lookup for unknown words
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Phrases in Wikipedia summaries that indicate a personal name
-NAME_INDICATOR_PHRASES = [
-    "given name",
-    "personal name",
-    "first name",
-    "forename",
-    "masculine name",
-    "feminine name",
-    "boy's name",
-    "girl's name",
-    "male name",
-    "female name",
-    "irish name",
-    "welsh name",
-    "scottish name",
-    "gaelic name",
-    "hebrew name",
-    "arabic name",
-    "norse name",
-    "old english name",
-    "is a name",
-    "as a name",
-    "name meaning",
-    "name derived from",
-    "legendary irish",
-    "legendary welsh",
-    "legendary scottish",
-]
-
-PLACE_INDICATOR_PHRASES = [
-    "city in",
-    "town in",
-    "village in",
-    "municipality",
-    "capital of",
-    "district of",
-    "county",
-    "province",
-    "region of",
-    "island of",
-    "mountain in",
-    "river in",
 ]
 
 
@@ -531,7 +482,8 @@ class EntityRegistry:
     def extract_unknown_candidates(self, query: str) -> list:
         """
         Find capitalized words in query that aren't in registry or common words.
-        These are candidates for Wikipedia research.
+        These are candidates for the caller to resolve — the registry itself
+        never looks anything up off the machine.
         """
         from .palace import _candidate_entity_words
 
