@@ -222,3 +222,61 @@ def test_palace_lock_wait_is_jittered(tmp_path, monkeypatch):
     assert len(set(sleeps)) > 1, sleeps
     assert sleeps[0] < sleeps[-2], sleeps  # backs off
     assert max(sleeps) <= palace_mod._PALACE_LOCK_POLL_SECONDS * 1.25 + 1e-9
+
+
+def test_generic_open_failure_names_its_cause(monkeypatch, tmp_path):
+    """A non-lock open failure must say what blocked, not just "Backend open failed".
+
+    palace-write-health cannot tell a real outage from noise when every cause is
+    flattened to the same three words (follow-up c72d994a).
+    """
+    import sqlite3
+
+    from mempalace import mcp_server, palace
+
+    def _boom(*args, **kwargs):
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "sqlite_exact")
+    monkeypatch.setattr(mcp_server._config, "_palace_path_override", None, raising=False)
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path))
+    monkeypatch.setattr(palace, "get_collection", _boom)
+    monkeypatch.setattr(mcp_server, "_collection_cache", None)
+
+    assert mcp_server._get_collection(create=True) is None
+    result = mcp_server._collection_error_or_no_palace()
+    assert result["error"] == "Backend open failed"
+    assert "OperationalError" in result["details"]
+    assert "attempt to write a readonly database" in result["details"]
+
+
+def test_hook_log_carries_the_failure_details(monkeypatch, tmp_path):
+    """hook.log is what the health agent reads, so the cause must reach it."""
+    from mempalace import hooks_cli, mcp_server
+
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        "".join(
+            json.dumps({"message": {"role": "user", "content": f"msg {i}"}}) + "\n"
+            for i in range(5)
+        ),
+        encoding="utf-8",
+    )
+    logged = []
+    monkeypatch.setattr(hooks_cli, "_log", logged.append)
+    monkeypatch.setattr(
+        mcp_server,
+        "tool_diary_write",
+        lambda **kw: {
+            "success": False,
+            "error": "Backend open failed",
+            "details": "Could not open the selected backend collection: OperationalError: disk I/O error",
+        },
+    )
+
+    res = hooks_cli._save_diary_direct(str(transcript), "sess1", wing="w", agent_name="claude")
+
+    assert res == {"count": 0}
+    failed = [line for line in logged if "checkpoint failed" in line]
+    assert failed and "Backend open failed" in failed[0]
+    assert "OperationalError: disk I/O error" in failed[0]

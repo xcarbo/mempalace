@@ -1087,7 +1087,11 @@ def _save_diary_direct(
                 _desktop_toast(f"Checkpoint saved \u2014 {len(messages)} messages archived")
             return {"count": len(messages), "themes": themes}
         else:
-            _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")
+            details = result.get("details")
+            _log(
+                f"Diary checkpoint failed: {result.get('error', 'unknown')}"
+                + (f" ({details})" if details else "")
+            )
     except Exception as e:
         _log(f"Diary checkpoint error: {e}")
     return {"count": 0}

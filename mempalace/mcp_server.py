@@ -1594,7 +1594,7 @@ def _get_collection(create=False):
                     "hint": "Another writer held the palace lock past the wait; retry.",
                 }
                 return None
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "_get_collection generic attempt %d/2 failed (palace=%s, create=%s)",
                     attempt + 1,
@@ -1606,9 +1606,13 @@ def _get_collection(create=False):
                 _collection_cache_palace = None
                 _metadata_cache = None
                 _metadata_cache_time = 0
+                # Name the cause. "Backend open failed" alone made a readonly
+                # database and a busy palace read the same in hook.log, and the
+                # write-health agent alarmed on both (follow-up c72d994a).
                 _collection_open_error = {
                     "error": "Backend open failed",
-                    "details": "Could not open the selected backend collection.",
+                    "details": "Could not open the selected backend collection: "
+                    f"{type(exc).__name__}: {str(exc)[:300]}",
                     "hint": "Run: mempalace status or mempalace repair-status for diagnostics.",
                 }
         return None
