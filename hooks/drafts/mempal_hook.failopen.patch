@@ -1,0 +1,73 @@
+--- a/mempalace-hooks/mempal_hook.sh	2026-09-19 12:13:54
++++ b/mempalace-hooks/mempal_hook.sh	2026-09-19 12:14:08
+@@ -27,7 +27,50 @@
+ # Fail-open: an unparseable payload runs the hook normally.
+ HOOK_PAYLOAD=""
+ HAVE_PAYLOAD=0
++
++# Fail-open (2026-09-19). A palace hook must never trap the agent. That day a
++# usage error from `mempalace hook run` (exit 2 + argparse text on stderr)
++# reached Grok as stop-hook feedback: Grok could not end its turn, looped, and
++# started editing source code unprompted. Harnesses read a hook's exit code and
++# stderr as instructions, so for `hook run` neither is ever forwarded:
++#   - non-zero exit -> logged to hook.log with context, wrapper exits 0 with
++#     EMPTY stdout (a half-written stdout from a crashed run is not a decision);
++#   - exit 0        -> stdout passes through byte-for-byte, so a deliberate
++#     {"decision":"block"} still blocks; any stderr is logged, never forwarded.
++# Losing a checkpoint is recoverable (session-end re-ingests the transcript); a
++# looping agent with write access is not. Every other subcommand keeps plain
++# exec passthrough: a human running `mempal_hook.sh search` wants the real exit.
++hook_log() {
++    {
++        mkdir -p "$HOME/.mempalace/hook_state"
++        printf '[%s] %s\n' "$(date +%H:%M:%S)" "$1" >> "$HOME/.mempalace/hook_state/hook.log"
++    } 2>/dev/null || true
++}
++
++run_hook_failopen() {
++    local tmpdir rc=0 err=""
++    if ! tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/mempal_hook.XXXXXX" 2>/dev/null)"; then
++        hook_log "HOOK FAIL-OPEN: mktemp failed, hook not run ($*)"
++        exit 0
++    fi
++    "$@" >"$tmpdir/out" 2>"$tmpdir/err" <<< "$HOOK_PAYLOAD" || rc=$?
++    # Bounded: a traceback is useful, a 4 MB one is not.
++    err="$(head -c 4000 "$tmpdir/err" 2>/dev/null | tr '\n' ' ')" || err=""
++    if (( rc != 0 )); then
++        hook_log "HOOK FAIL-OPEN: exit $rc from [$*] cwd=$PWD; exited 0 with empty stdout. stderr: ${err:-<none>}"
++    else
++        if [[ -n "$err" ]]; then
++            hook_log "HOOK STDERR (exit 0, stdout passed through) from [$*]: $err"
++        fi
++        cat "$tmpdir/out" 2>/dev/null || true
++    fi
++    rm -rf "$tmpdir" 2>/dev/null || true
++    exit 0
++}
++
+ if [[ "${1:-}" == "hook" && "${2:-}" == "run" ]]; then
++    # The wrapper's own failures (set -e) fail open too.
++    trap 'hook_log "HOOK FAIL-OPEN: wrapper error at line $LINENO ($*)"; exit 0' ERR
+     HOOK_PAYLOAD="$(cat)"
+     HAVE_PAYLOAD=1
+ 
+@@ -95,14 +138,16 @@
+ 
+ if [[ -n "$BIN" && -d "$HOME/.mempalace/palace" ]]; then
+     if (( HAVE_PAYLOAD )); then
+-        exec "$BIN" "$@" <<< "$HOOK_PAYLOAD"
++        run_hook_failopen "$BIN" "$@"
+     fi
+     exec "$BIN" "$@"
+ fi
+ 
+ if (( HAVE_PAYLOAD )); then
+-    exec ssh -o BatchMode=yes -o ConnectTimeout=5 "$CANONICAL_HOST" \
+-        '$HOME/.mempalace/hooks/mempal_hook.sh' "$@" <<< "$HOOK_PAYLOAD"
++    # Same rule over the relay: an unreachable host (ssh exit 255) is the most
++    # likely failure a thin client ever sees.
++    run_hook_failopen ssh -o BatchMode=yes -o ConnectTimeout=5 "$CANONICAL_HOST" \
++        '$HOME/.mempalace/hooks/mempal_hook.sh' "$@"
+ fi
+ exec ssh -o BatchMode=yes -o ConnectTimeout=5 "$CANONICAL_HOST" \
+     '$HOME/.mempalace/hooks/mempal_hook.sh' "$@"
