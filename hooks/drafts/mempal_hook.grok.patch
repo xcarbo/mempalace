@@ -1,0 +1,31 @@
+--- a/mempalace-hooks/mempal_hook.sh	2026-09-19 11:34:56
++++ b/mempalace-hooks/mempal_hook.sh	2026-09-19 11:34:56
+@@ -58,6 +58,28 @@
+         exit 0
+         ;;
+     esac
++
++    # Grok harness routing. Grok fires these hooks through its Claude-compat
++    # layer, reading the same ~/.claude/settings.json entries, so the command
++    # line always says `--harness claude-code`. Its stdin envelope is the tell:
++    # `hookEventName` (camelCase) is a Grok-only key, and Grok also exports
++    # GROK_SESSION_ID to every hook. Rewrite the harness so mempalace swaps
++    # Grok's `updates.jsonl` event stream for the real `chat_history.jsonl`,
++    # files the diary under agent `grok`, and skips subagent payloads.
++    # DEPLOY ORDER: only after the installed mempalace accepts `--harness grok`
++    # — an older build exits 1 with "Unknown harness".
++    if [[ -n "${GROK_SESSION_ID:-}" || "$HOOK_PAYLOAD" == *'"hookEventName"'* ]]; then
++        args=()
++        prev=""
++        for a in "$@"; do
++            if [[ "$prev" == "--harness" && "$a" == "claude-code" ]]; then
++                a="grok"
++            fi
++            args+=("$a")
++            prev="$a"
++        done
++        set -- "${args[@]}"
++    fi
+ fi
+ 
+ BIN=""

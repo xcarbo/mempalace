@@ -1,0 +1,60 @@
+{"type":"system","content":"scrubbed"}
+{"type":"user","content":[{"type":"text","text":"<system-reminder>scrubbed injected context</system-reminder>"}]}
+{"type":"user","content":[{"type":"text","text":"<system-reminder>scrubbed injected context</system-reminder>"}],"synthetic_reason":"system_reminder"}
+{"type":"user","content":[{"type":"text","text":"<system-reminder>scrubbed injected context</system-reminder>"}],"synthetic_reason":"system_reminder"}
+{"type":"user","content":[{"type":"text","text":"human prompt 1"}],"prompt_index":0}
+{"type":"reasoning","id":"scrubbed","summary":[{"type":"summary_text","text":"scrubbed"}],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"backend_tool_call","kind":{"tool_type":"scrubbed","call_id":"scrubbed","input":"scrubbed","name":"x_thread_fetch","id":"scrubbed"}}
+{"type":"reasoning","id":"scrubbed","summary":[],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"backend_tool_call","kind":{"tool_type":"scrubbed","action":{"type":"search","query":"scrubbed","sources":[{"type":"url","url":"scrubbed"},{"type":"url","url":"scrubbed"},{"type":"url","url":"scrubbed"},{"type":"url","url":"scrubbed"},{"type":"url","url":"scrubbed"},{"type":"url","url":"scrubbed"}]},"id":"scrubbed","status":"completed"}}
+{"type":"reasoning","id":"scrubbed","summary":[],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"reasoning","id":"scrubbed","summary":[],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"assistant","content":"assistant reply 1","tool_calls":[{"id":"call_1","name":"run_terminal_command","arguments":"{}"}],"model_id":"grok-4.6-build","model_fingerprint":"scrubbed","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"reasoning","id":"scrubbed","summary":[{"type":"summary_text","text":"scrubbed"}],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"assistant","content":"assistant reply 2","model_id":"grok-4.6-build","model_fingerprint":"scrubbed","reasoning_effort":"high"}
+{"type":"user","content":[{"type":"text","text":"human prompt 2"}],"prompt_index":1}
+{"type":"reasoning","id":"scrubbed","summary":[{"type":"summary_text","text":"scrubbed"}],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"backend_tool_call","kind":{"tool_type":"scrubbed","call_id":"scrubbed","input":"scrubbed","name":"x_thread_fetch","id":"scrubbed"}}
+{"type":"reasoning","id":"scrubbed","summary":[],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"assistant","content":"assistant reply 3","tool_calls":[{"id":"call_1","name":"list_dir","arguments":"{}"}],"model_id":"grok-4.6-build","model_fingerprint":"scrubbed","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"reasoning","id":"scrubbed","summary":[{"type":"summary_text","text":"scrubbed"}],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"backend_tool_call","kind":{"tool_type":"scrubbed","action":{"type":"search","query":"scrubbed","sources":[{"type":"url","url":"scrubbed"},{"type":"url","url":"scrubbed"},{"type":"url","url":"scrubbed"},{"type":"url","url":"scrubbed"},{"type":"url","url":"scrubbed"},{"type":"url","url":"scrubbed"},{"type":"url","url":"scrubbed"},{"type":"url","url":"scrubbed"},{"type":"url","url":"scrubbed"}]},"id":"scrubbed","status":"completed"}}
+{"type":"reasoning","id":"scrubbed","summary":[],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"backend_tool_call","kind":{"tool_type":"scrubbed","call_id":"scrubbed","input":"scrubbed","name":"x_thread_fetch","id":"scrubbed"}}
+{"type":"reasoning","id":"scrubbed","summary":[],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"assistant","content":"assistant reply 4","tool_calls":[{"id":"call_1","name":"read_file","arguments":"{}"}],"model_id":"grok-4.6-build","model_fingerprint":"scrubbed","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"reasoning","id":"scrubbed","summary":[{"type":"summary_text","text":"scrubbed"}],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"assistant","content":"assistant reply 5","tool_calls":[{"id":"call_1","name":"run_terminal_command","arguments":"{}"}],"model_id":"grok-4.6-build","model_fingerprint":"scrubbed","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"reasoning","id":"scrubbed","summary":[{"type":"summary_text","text":"scrubbed"}],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"assistant","content":"","tool_calls":[{"id":"call_1","name":"run_terminal_command","arguments":"{}"}],"model_id":"grok-4.6-build","model_fingerprint":"scrubbed","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"reasoning","id":"scrubbed","summary":[{"type":"summary_text","text":"scrubbed"}],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"assistant","content":"","tool_calls":[{"id":"call_1","name":"run_terminal_command","arguments":"{}"}],"model_id":"grok-4.6-build","model_fingerprint":"scrubbed","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"reasoning","id":"scrubbed","summary":[{"type":"summary_text","text":"scrubbed"}],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"assistant","content":"","tool_calls":[{"id":"call_1","name":"run_terminal_command","arguments":"{}"}],"model_id":"grok-4.6-build","model_fingerprint":"scrubbed","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"reasoning","id":"scrubbed","summary":[{"type":"summary_text","text":"scrubbed"}],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"assistant","content":"","tool_calls":[{"id":"call_1","name":"get_command_or_subagent_output","arguments":"{}"}],"model_id":"grok-4.6-build","model_fingerprint":"scrubbed","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"reasoning","id":"scrubbed","summary":[{"type":"summary_text","text":"scrubbed"}],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"assistant","content":"","tool_calls":[{"id":"call_1","name":"read_file","arguments":"{}"}],"model_id":"grok-4.6-build","model_fingerprint":"scrubbed","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"scrubbed","content":"scrubbed"}
+{"type":"reasoning","id":"scrubbed","summary":[{"type":"summary_text","text":"scrubbed"}],"encrypted_content":"scrubbed","status":"completed"}
+{"type":"assistant","content":"assistant reply 11","tool_calls":[{"id":"call_1","name":"read_file","arguments":"{}"}],"model_id":"grok-4.6-build","model_fingerprint":"scrubbed","reasoning_effort":"high"}

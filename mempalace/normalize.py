@@ -380,6 +380,10 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
     if normalized:
         return [normalized]
 
+    normalized = _try_grok_jsonl(content)
+    if normalized:
+        return [normalized]
+
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
@@ -643,6 +647,50 @@ def _try_pi_jsonl(content: str) -> Optional[str]:
             messages.append(("assistant", text))
 
     if len(messages) >= 2 and has_session_header:
+        return _messages_to_transcript(messages)
+    return None
+
+
+def _try_grok_jsonl(content: str) -> Optional[str]:
+    """Grok sessions (~/.grok/sessions/{urlencoded cwd}/{sessionId}/chat_history.jsonl).
+
+    Flat JSONL keyed by a top-level "type". Human prompts are "user" lines that
+    carry "prompt_index"; the context preamble and injected system reminders are
+    also "user" lines (the latter marked "synthetic_reason") and are skipped.
+    Assistant lines hold content as a plain string, tagged with "model_id".
+    "system", "reasoning" (encrypted), "tool_result" and "backend_tool_call"
+    lines are skipped — operational, not conversation.
+
+    The sibling updates.jsonl is the ACP event stream, not a transcript, and is
+    deliberately not recognized here.
+    """
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    messages = []
+    is_grok = False
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict) or "message" in entry:
+            continue
+
+        entry_type = entry.get("type", "")
+        if entry_type == "user":
+            if "prompt_index" not in entry or "synthetic_reason" in entry:
+                continue
+            is_grok = True
+            text = _extract_content(entry.get("content", ""))
+            if text:
+                messages.append(("user", text))
+        elif entry_type == "assistant":
+            if "model_id" in entry:
+                is_grok = True
+            text = _extract_content(entry.get("content", ""))
+            if text:
+                messages.append(("assistant", text))
+
+    if len(messages) >= 2 and is_grok:
         return _messages_to_transcript(messages)
     return None
 

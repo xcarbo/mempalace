@@ -19,6 +19,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote, unquote
 
 from mempalace.config import MempalaceConfig
 from mempalace.write_routing import (
@@ -150,6 +151,27 @@ def _validate_transcript_path(transcript_path: str) -> Path:
     return path
 
 
+def _grok_human_text(entry) -> Optional[str]:
+    """Return the text of a human prompt line from Grok's ``chat_history.jsonl``.
+
+    Grok writes ``{"type": "user", "content": [{"type": "text", ...}]}`` for the
+    context preamble and every injected system reminder as well as for real
+    prompts. Only a typed prompt carries ``prompt_index``; injected lines carry
+    ``synthetic_reason`` instead, and the preamble carries neither. Returns
+    ``None`` for anything that is not a human prompt.
+    """
+    if not isinstance(entry, dict) or entry.get("type") != "user":
+        return None
+    if "prompt_index" not in entry or "synthetic_reason" in entry:
+        return None
+    content = entry.get("content", "")
+    if isinstance(content, list):
+        content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+    if not isinstance(content, str) or "<command-message>" in content:
+        return None
+    return content
+
+
 def _count_human_messages(transcript_path: str) -> int:
     """Count human messages in a JSONL transcript, skipping command-messages."""
     path = _validate_transcript_path(transcript_path)
@@ -186,6 +208,9 @@ def _count_human_messages(transcript_path: str) -> int:
                             msg_text = payload.get("message", "")
                             if isinstance(msg_text, str) and "<command-message>" not in msg_text:
                                 count += 1
+                    # Grok chat_history.jsonl format
+                    elif _grok_human_text(entry) is not None:
+                        count += 1
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
@@ -911,6 +936,11 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
                             if isinstance(text, str) and text.strip():
                                 if "<command-message>" not in text:
                                     messages.append(text.strip()[:200])
+                    # Grok chat_history.jsonl format
+                    else:
+                        text = _grok_human_text(entry)
+                        if text and text.strip():
+                            messages.append(text.strip()[:200])
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
@@ -1130,7 +1160,13 @@ def _ingest_transcript(transcript_path: str):
         _log(f"transcript ingest hook failed: {exc}")
 
 
-SUPPORTED_HARNESSES = {"claude-code", "codex"}
+SUPPORTED_HARNESSES = {"claude-code", "codex", "grok", "pi"}
+
+# Grok keeps two JSONL files side by side in a session directory. Its
+# Claude-compat hook payload names the ACP event stream as ``transcript_path``;
+# the conversation itself is the sibling.
+_GROK_EVENT_STREAM = "updates.jsonl"
+_GROK_TRANSCRIPT = "chat_history.jsonl"
 
 
 def _diary_agent_for_harness(harness: str) -> str:
@@ -1147,15 +1183,52 @@ def _diary_agent_for_harness(harness: str) -> str:
     return "claude" if harness == "claude-code" else harness
 
 
+def _grok_transcript_path(data: dict, session_id: str) -> str:
+    """Resolve the conversation transcript for a Grok hook payload.
+
+    Grok's compat payload carries ``transcript_path``, but it points at
+    ``updates.jsonl`` (the ACP event stream), which holds no countable user
+    turns and mines as raw protocol JSON. Swap it for the sibling
+    ``chat_history.jsonl``. With no usable path (a native, camelCase-only
+    payload), derive it from the documented layout
+    ``~/.grok/sessions/<urlencoded cwd>/<sessionId>/chat_history.jsonl``.
+    """
+    raw = str(data.get("transcript_path") or data.get("transcriptPath") or "")
+    if raw:
+        path = Path(raw)
+        if path.name == _GROK_EVENT_STREAM:
+            return str(path.with_name(_GROK_TRANSCRIPT))
+        return raw
+    cwd = data.get("cwd")
+    if not isinstance(cwd, str) or not cwd or session_id == "unknown":
+        return ""
+    grok_home = Path(os.environ.get("GROK_HOME") or Path.home() / ".grok")
+    return str(grok_home / "sessions" / quote(cwd, safe="") / session_id / _GROK_TRANSCRIPT)
+
+
 def _parse_harness_input(data: dict, harness: str) -> dict:
     """Parse stdin JSON according to the harness type."""
     if harness not in SUPPORTED_HARNESSES:
         print(f"Unknown harness: {harness}", file=sys.stderr)
         sys.exit(1)
+    if harness == "grok":
+        session_id = _sanitize_session_id(
+            str(data.get("session_id") or data.get("sessionId") or "unknown")
+        )
+        return {
+            "session_id": session_id,
+            "stop_hook_active": bool(
+                data.get("stop_hook_active", data.get("stopHookActive", False))
+            ),
+            "transcript_path": _grok_transcript_path(data, session_id),
+            # A subagent's stop or teardown is not the session's.
+            "skip": bool(data.get("subagentType") or data.get("subagent_type")),
+        }
     return {
         "session_id": _sanitize_session_id(str(data.get("session_id", "unknown"))),
         "stop_hook_active": data.get("stop_hook_active", False),
         "transcript_path": str(data.get("transcript_path", "")),
+        "skip": False,
     }
 
 
@@ -1262,6 +1335,43 @@ def _main_worktree_root(cwd: str) -> Optional[str]:
     return str(root) if str(root) not in ("", "/") else None
 
 
+def _wing_from_cwd(cwd: str) -> Optional[str]:
+    """Derive the project wing from an absolute working directory."""
+    cwd_norm = cwd.replace("\\", "/").rstrip("/")
+    if not cwd_norm:
+        return None
+    # A linked git worktree must resolve to the PROJECT it belongs
+    # to, not the checkout dir's name (which is often the literal
+    # "worktree"). Ordinary checkouts return None and fall through
+    # unchanged.
+    project_root = _main_worktree_root(cwd_norm) or cwd_norm
+
+    # A .palace-wing file in the project root pins the wing
+    # explicitly (bare name, no wing_ prefix); it wins over
+    # leaf-segment derivation. Check the main repo root first so a
+    # pin that is gitignored (and therefore absent from the linked
+    # worktree) is still honoured.
+    for candidate in (project_root, cwd_norm):
+        try:
+            override = Path(candidate) / ".palace-wing"
+            if override.is_file():
+                pinned = override.read_text(encoding="utf-8").strip()
+                if pinned:
+                    return pinned.splitlines()[0].strip()
+        except OSError:
+            pass
+    project = project_root.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    if project:
+        # Bare hyphenated leaf (e.g. ``cc``, ``hunt-1``) — matches
+        # the palace convention used by deliberate writes, so hook
+        # checkpoints land in the same wing instead of a
+        # ``wing_*`` splinter. No registry gate: hook saves must
+        # never fail on an unregistered wing (the write path
+        # creates it).
+        return _bare_wing_slug(project)
+    return None
+
+
 def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
     """Read ``cwd`` from the first JSONL line that records it.
 
@@ -1290,38 +1400,9 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                 cwd = data.get("cwd")
                 if not cwd or not isinstance(cwd, str):
                     continue
-                cwd_norm = cwd.replace("\\", "/").rstrip("/")
-                if not cwd_norm:
-                    continue
-                # A linked git worktree must resolve to the PROJECT it belongs
-                # to, not the checkout dir's name (which is often the literal
-                # "worktree"). Ordinary checkouts return None and fall through
-                # unchanged.
-                project_root = _main_worktree_root(cwd_norm) or cwd_norm
-
-                # A .palace-wing file in the project root pins the wing
-                # explicitly (bare name, no wing_ prefix); it wins over
-                # leaf-segment derivation. Check the main repo root first so a
-                # pin that is gitignored (and therefore absent from the linked
-                # worktree) is still honoured.
-                for candidate in (project_root, cwd_norm):
-                    try:
-                        override = Path(candidate) / ".palace-wing"
-                        if override.is_file():
-                            pinned = override.read_text(encoding="utf-8").strip()
-                            if pinned:
-                                return pinned.splitlines()[0].strip()
-                    except OSError:
-                        pass
-                project = project_root.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
-                if project:
-                    # Bare hyphenated leaf (e.g. ``cc``, ``hunt-1``) — matches
-                    # the palace convention used by deliberate writes, so hook
-                    # checkpoints land in the same wing instead of a
-                    # ``wing_*`` splinter. No registry gate: hook saves must
-                    # never fail on an unregistered wing (the write path
-                    # creates it).
-                    return _bare_wing_slug(project)
+                wing = _wing_from_cwd(cwd)
+                if wing:
+                    return wing
     except OSError:
         pass
     return None
@@ -1365,6 +1446,14 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
     # Normalize path separators for cross-platform (Windows backslashes)
     normalized = transcript_path.replace("\\", "/")
 
+    # Grok names the session's parent directory after the URL-encoded cwd, so
+    # the working directory survives intact and takes the same route as (1).
+    match = re.search(r"/sessions/(%2F[^/]+)/[^/]+/[^/]+\.jsonl$", normalized)
+    if match:
+        grok_wing = _wing_from_cwd(unquote(match.group(1)))
+        if grok_wing:
+            return grok_wing
+
     # 2. Fallback — encoded project folder under .claude/projects/
     match = re.search(r"/\.claude/projects/-([^/]+)", normalized)
     if match:
@@ -1406,6 +1495,10 @@ def hook_stop(data: dict, harness: str):
         _output({})
         return
     parsed = _parse_harness_input(data, harness)
+    if parsed["skip"]:
+        _log(f"HOOK SKIP: subagent payload for session {parsed['session_id']}")
+        _output({})
+        return
     session_id = parsed["session_id"]
     stop_hook_active = parsed["stop_hook_active"]
     transcript_path = parsed["transcript_path"]
@@ -1592,6 +1685,10 @@ def hook_session_end(data: dict, harness: str):
     try:
         parsed = _parse_harness_input(data, harness)
         session_id = parsed["session_id"]
+        if parsed["skip"]:
+            _log(f"HOOK SKIP: subagent payload for session {parsed['session_id']}")
+            _output({})
+            return
         transcript_path = parsed["transcript_path"]
 
         # Read config defensively (mirror hook_stop): a corrupt or unreadable
@@ -1669,6 +1766,10 @@ def hook_precompact(data: dict, harness: str):
         _output({})
         return
     parsed = _parse_harness_input(data, harness)
+    if parsed["skip"]:
+        _log(f"HOOK SKIP: subagent payload for session {parsed['session_id']}")
+        _output({})
+        return
     session_id = parsed["session_id"]
     transcript_path = parsed["transcript_path"]
 
