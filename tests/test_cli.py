@@ -1224,6 +1224,19 @@ def test_main_hook_run_dispatches_session_end():
         mock_cmd.assert_called_once()
 
 
+@pytest.mark.parametrize("harness", ["grok", "pi"])
+def test_main_hook_run_accepts_grok_and_pi_harnesses(harness):
+    with (
+        patch(
+            "sys.argv",
+            ["mempalace", "hook", "run", "--hook", "stop", "--harness", harness],
+        ),
+        patch("mempalace.cli.cmd_hook") as mock_cmd,
+    ):
+        main()
+        mock_cmd.assert_called_once()
+
+
 def test_main_instructions_no_subcommand_prints_help(capsys):
     with patch("sys.argv", ["mempalace", "instructions"]):
         main()

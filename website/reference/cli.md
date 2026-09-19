@@ -160,18 +160,19 @@ mempalace mcp --palace ~/.custom-palace
 
 ## `mempalace hook`
 
-Run hook logic for Claude Code / Codex integration.
+Run hook logic for Claude Code / Codex / Grok / pi integration.
 
 ```bash
 mempalace hook run --hook stop --harness claude-code
 mempalace hook run --hook precompact --harness claude-code
 mempalace hook run --hook session-start --harness codex
+mempalace hook run --hook stop --harness grok
 ```
 
 | Option | Values | Description |
 |--------|--------|-------------|
-| `--hook` | `session-start`, `stop`, `precompact` | Hook name |
-| `--harness` | `claude-code`, `codex` | Harness type |
+| `--hook` | `session-start`, `stop`, `session-end`, `precompact` | Hook name |
+| `--harness` | `claude-code`, `codex`, `grok`, `pi` | Harness type |
 
 ## `mempalace instructions`
 
