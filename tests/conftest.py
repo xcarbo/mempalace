@@ -120,6 +120,19 @@ except ImportError:
 
 
 @pytest.fixture(autouse=True)
+def _fail_fast_backend_lock(monkeypatch):
+    """Backend writes refuse a held palace instantly, as upstream's do.
+
+    This fork makes short backend writers wait (``short_writer_palace_lock``,
+    default 10 s). Every contention test here and upstream asserts the refusal
+    itself, against a holder that never lets go, so under the default each one
+    would sit out the full wait. Tests of the wait opt back in
+    (``tests/test_palace_busy_retry.py``).
+    """
+    monkeypatch.setenv("MEMPALACE_BACKEND_LOCK_WAIT_SECONDS", "0")
+
+
+@pytest.fixture(autouse=True)
 def _no_retrieval_log(monkeypatch):
     """Never append test noise to the user's real retrieval log.
 

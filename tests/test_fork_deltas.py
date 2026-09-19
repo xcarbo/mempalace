@@ -137,3 +137,33 @@ def test_id_recipe_is_v3():
         "id in the live palace. If the change is intended, migrate the palace "
         "first, then update this pin deliberately."
     )
+
+
+def test_backend_writes_take_the_waiting_palace_lock():
+    """Delta 6 — upstream's backends take a bare ``mine_palace_lock(path)``.
+
+    A merge that restores the bare call binds our ``wait_seconds`` default of 0
+    and nothing raises: the suite pins the wait to 0 anyway (conftest), so it
+    stays green while every session hook that ends in the same second as
+    another one loses its diary checkpoint again (hook.log 2026-09-19 11:29:36,
+    "Backend open failed", 34 times before the fix).
+    """
+    backends = Path(inspect.getfile(searcher)).parent / "backends"
+    for name, expected in (("sqlite_exact.py", 3), ("chroma.py", 1)):
+        tree = ast.parse((backends / name).read_text(encoding="utf-8"))
+        calls = [
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        assert "mine_palace_lock" not in calls, (
+            f"FORK DELTA REVERTED: backends/{name} calls bare mine_palace_lock(); "
+            "ours is short_writer_palace_lock(). Bare means wait=0: library "
+            "writers (the session hooks) are refused the instant a transcript "
+            "ingest holds the palace."
+        )
+        assert calls.count("short_writer_palace_lock") == expected, (
+            f"backends/{name}: expected {expected} short_writer_palace_lock() "
+            f"call sites, found {calls.count('short_writer_palace_lock')}. A new "
+            "write path must take the waiting lock too; then update this count."
+        )

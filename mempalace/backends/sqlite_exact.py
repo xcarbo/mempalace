@@ -542,11 +542,11 @@ class SQLiteExactCollection(BaseCollection):
         released. The handle mutex must therefore be the outer context.
         """
         # Late import avoids a palace.py -> backend -> palace.py cycle.
-        from ..palace import mine_palace_lock
+        from ..palace import short_writer_palace_lock
 
         with self._handle.lock:
             self._ensure_open()
-            with mine_palace_lock(self._handle.palace_path):
+            with short_writer_palace_lock(self._handle.palace_path):
                 yield
 
     @contextlib.contextmanager
@@ -1917,9 +1917,9 @@ class SQLiteExactBackend(BaseBackend):
                         # write through a read-only MCP collection.
                         conn.execute("PRAGMA query_only=ON")
                     else:
-                        from ..palace import mine_palace_lock
+                        from ..palace import short_writer_palace_lock
 
-                        with mine_palace_lock(palace_path):
+                        with short_writer_palace_lock(palace_path):
                             self._init_schema(conn)
             except BaseException:
                 conn.close()
@@ -2061,9 +2061,9 @@ class SQLiteExactBackend(BaseBackend):
             if row is None:
                 if not create:
                     raise CollectionNotInitializedError(collection_name)
-                from ..palace import mine_palace_lock
+                from ..palace import short_writer_palace_lock
 
-                with mine_palace_lock(palace_path):
+                with short_writer_palace_lock(palace_path):
                     handle.conn.execute(
                         "INSERT INTO collections(name, created_at) VALUES (?, ?)",
                         (collection_name, _utcnow()),

@@ -1574,6 +1574,26 @@ def _get_collection(create=False):
                 _metadata_cache = None
                 _metadata_cache_time = 0
                 return None
+            except _palace_busy_error() as exc:
+                # The backend already waited its bounded short-writer wait
+                # (palace.short_writer_palace_lock). Do NOT fall into the
+                # generic branch below: it retries blind, doubling the wait
+                # past a hook's budget, and then replaces this message (which
+                # names the holder) with an opaque "Backend open failed" --
+                # hook.log 2026-09-19 11:29:36 is that, and 33 more like it.
+                logger.warning("palace busy opening %s: %s", _config.palace_path, exc)
+                _collection_cache = None
+                _collection_cache_backend = None
+                _collection_cache_palace = None
+                _metadata_cache = None
+                _metadata_cache_time = 0
+                _collection_open_error = {
+                    "success": False,
+                    "error": f"palace busy, write not filed: {exc}",
+                    "error_class": _lock_refusal_error_class(),
+                    "hint": "Another writer held the palace lock past the wait; retry.",
+                }
+                return None
             except Exception:
                 logger.exception(
                     "_get_collection generic attempt %d/2 failed (palace=%s, create=%s)",
@@ -1738,6 +1758,19 @@ def _no_palace():
         "error": "No palace found",
         "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
     }
+
+
+def _palace_busy_error():
+    # Late import: palace.py is heavy and mcp_server imports it lazily elsewhere.
+    from .palace import MineAlreadyRunning
+
+    return MineAlreadyRunning
+
+
+def _lock_refusal_error_class() -> str:
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
+
+    return LOCK_REFUSAL_ERROR_CLASS
 
 
 def _collection_error_or_no_palace():

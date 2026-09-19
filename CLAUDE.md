@@ -142,6 +142,7 @@ uv run pytest tests/test_fork_deltas.py -v
 | `NORMALIZE_VERSION` (`palace.py`) | `3` | `2` | At 2 the v3 re-mine no-ops and the 6,066-drawer oversized backlog stays frozen, reporting success |
 | `_open_search_collection` (`searcher.py`) | `read_only=True` | — | Reverted once already, by stage 5 of the 3.7.1 merge. Without it every search during a mine raises `MineAlreadyRunning` |
 | `_main_worktree_root` (`hooks_cli.py`) | take-ours | — | Worktree sessions file into a wing literally named `worktree` |
+| backend palace lock (`backends/sqlite_exact.py`, `backends/chroma.py`) | `short_writer_palace_lock()` (waits 10 s) | bare `mine_palace_lock()` | Bare binds wait=0: a session hook ending in the same second as another loses its diary checkpoint as "Backend open failed". The suite pins the wait to 0, so it stays green |
 | `ID_RECIPE` (`ids.py`) | `"v3"` | same | Pinned, not diverged — a change on either side re-derives every drawer id |
 
 Two rules:

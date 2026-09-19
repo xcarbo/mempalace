@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -1357,6 +1358,65 @@ def _write_lock_holder(lock_file) -> None:
 # 90-second wait is ~180 cheap flock probes rather than a spin.
 _PALACE_LOCK_POLL_SECONDS = 0.5
 
+# First probe interval of a bounded wait. The poll backs off from here to
+# ``_PALACE_LOCK_POLL_SECONDS`` so a holder that releases within a few
+# milliseconds (the common case: another session's single diary row) costs the
+# waiter milliseconds, not a flat half second.
+_PALACE_LOCK_POLL_FIRST_SECONDS = 0.05
+
+# How long a SHORT writer inside a storage backend waits for the palace lock.
+#
+# The MCP/CLI tool layer already waits (``_MCP_WRITER_LOCK_WAIT_DEFAULT``), but
+# only callers that enter through ``_acquire_mcp_writer_lock``. Library callers
+# do not: the session hooks call ``tool_diary_write`` directly, so their write
+# reached the backend's bare ``mine_palace_lock(path)`` and was refused the
+# instant another session's transcript ingest held the palace. hook.log,
+# 2026-09-19 11:29:36: two sessions ended in the same second and the second
+# one's diary checkpoint was lost. Putting the wait in the backend covers every
+# writer, whichever door it came in through.
+#
+# 10 s by default because the callers that matter are hooks with a 30 s budget;
+# the hard ceiling keeps an env typo from turning a hook into a hang. Long
+# writers (mine, sync, repair) take the lock themselves with no wait and reach
+# the backend re-entrantly, so this never queues one mine behind another.
+_SHORT_WRITER_LOCK_WAIT_ENV = "MEMPALACE_BACKEND_LOCK_WAIT_SECONDS"
+_SHORT_WRITER_LOCK_WAIT_DEFAULT = 10.0
+_SHORT_WRITER_LOCK_WAIT_MAX = 20.0
+
+
+def short_writer_lock_wait_seconds() -> float:
+    """Seconds a backend-level short write waits for the palace lock.
+
+    Unparseable or negative values fall back to the default rather than
+    disabling the wait, the same rule as ``_writer_lock_wait_seconds``: a typo
+    must not silently reinstate the lost-checkpoint failure. Exactly 0 opts out.
+    """
+    raw = os.environ.get(_SHORT_WRITER_LOCK_WAIT_ENV, "").strip()
+    if not raw:
+        return _SHORT_WRITER_LOCK_WAIT_DEFAULT
+    try:
+        seconds = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %.0fs",
+            _SHORT_WRITER_LOCK_WAIT_ENV,
+            raw,
+            _SHORT_WRITER_LOCK_WAIT_DEFAULT,
+        )
+        return _SHORT_WRITER_LOCK_WAIT_DEFAULT
+    if seconds < 0 or seconds != seconds:
+        return _SHORT_WRITER_LOCK_WAIT_DEFAULT
+    return min(seconds, _SHORT_WRITER_LOCK_WAIT_MAX)
+
+
+def short_writer_palace_lock(palace_path: str):
+    """``mine_palace_lock`` with the bounded short-writer wait.
+
+    The one door every backend write takes. Re-entrant like the lock itself, so
+    a miner that already owns the palace passes straight through.
+    """
+    return mine_palace_lock(palace_path, wait_seconds=short_writer_lock_wait_seconds())
+
 
 def _palace_contention_error(resolved: str, lock_path: str, lock_file) -> "MineAlreadyRunning":
     """Build the rich MineAlreadyRunning for a failed palace-lock acquire.
@@ -1479,6 +1539,7 @@ def mine_palace_lock(palace_path: str, wait_seconds: float = 0.0):
     # matches the pathname and retry on the fresh file when it doesn't.
     deadline = time.monotonic() + max(0.0, wait_seconds or 0.0)
     waited = False
+    poll = _PALACE_LOCK_POLL_FIRST_SECONDS
     while True:
         if not os.path.exists(lock_path):
             # Touch atomically: O_CREAT|O_EXCL would fail if a concurrent
@@ -1512,7 +1573,11 @@ def mine_palace_lock(palace_path: str, wait_seconds: float = 0.0):
                             describe_holder(lock_path, read_holder_record(lf)),
                         )
                     lf.close()
-                    time.sleep(min(_PALACE_LOCK_POLL_SECONDS, remaining))
+                    # Backoff with jitter: waiters that arrived together (two
+                    # sessions ending in the same second) must not keep probing
+                    # in lockstep.
+                    time.sleep(min(poll * random.uniform(0.75, 1.25), remaining))
+                    poll = min(poll * 2, _PALACE_LOCK_POLL_SECONDS)
                     continue
                 raise _palace_contention_error(resolved, lock_path, lf)
             if not _mine_lock_file_is_current(lf, lock_path):

@@ -2130,9 +2130,9 @@ class ChromaCollection(BaseCollection):
             yield
             return
         # Late import — palace.py imports ChromaBackend from this module.
-        from ..palace import mine_palace_lock
+        from ..palace import short_writer_palace_lock
 
-        with mine_palace_lock(self._palace_path):
+        with short_writer_palace_lock(self._palace_path):
             with _write_watchdog(self._palace_path, op):
                 yield
 
