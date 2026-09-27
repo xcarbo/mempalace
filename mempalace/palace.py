@@ -1628,6 +1628,14 @@ def mine_palace_lock(palace_path: str, wait_seconds: float = 0.0):
         except Exception:
             logger.debug("Palace-lock release failed", exc_info=True)
         lf.close()
+        # Remove the rendezvous file once released, the same race-safe way the
+        # per-source mine lock does. Without this every short writer left a
+        # file naming a PID that was dead a millisecond later, and the *next*
+        # process's residue GC "reclaimed" it — one INFO line on stderr per
+        # memp invocation, forever, in every agent's tool output and in
+        # hook.log (2026-09-27). Safe: the acquire loop above already retries
+        # on an inode that vanished between open() and lock.
+        _cleanup_mine_lock_file(lock_path)
 
 
 # Backward-compatible alias (previous patch iteration used a single global

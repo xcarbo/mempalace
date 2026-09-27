@@ -379,6 +379,19 @@ def test_kg_value_accepts_colons():
     assert sanitize_kg_value("role: engineer") == "role: engineer"
 
 
+def test_kg_value_rejects_bare_prefix():
+    """``--subject "action:$id"`` with an empty ``$id`` must not become an entity."""
+    for bare in ("action:", "wing_", "drawer_", "  action: "):
+        with pytest.raises(ValueError, match="bare prefix"):
+            sanitize_kg_value(bare, "subject")
+
+
+def test_kg_value_accepts_prefixed_ids():
+    assert sanitize_kg_value("action:drawer_x_follow-ups_0123abcd") == (
+        "action:drawer_x_follow-ups_0123abcd"
+    )
+
+
 def test_kg_value_accepts_parentheses():
     assert sanitize_kg_value("Python (programming)") == "Python (programming)"
 

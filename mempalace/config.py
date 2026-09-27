@@ -129,6 +129,16 @@ def sanitize_kg_value(value: str, field_name: str = "value") -> str:
     if "\x00" in value:
         raise ValueError(f"{field_name} contains null bytes")
 
+    # A bare namespace prefix — "action:", "wing_", "drawer_" — is a shell
+    # variable that expanded to nothing, not an entity. Two such triples reached
+    # the live graph ("action: → belongs_to → wing_dolla", 2026-09-27, and its
+    # 2026-07-27 twin) from `--subject "action:$id"` with $id empty.
+    if value.endswith((":", "_")):
+        raise ValueError(
+            f"{field_name} {value!r} is a bare prefix with nothing after it "
+            "(an empty shell variable?)"
+        )
+
     return strip_lone_surrogates(value)
 
 

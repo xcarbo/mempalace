@@ -21,6 +21,10 @@ Register:
 4. ``hooks_cli._main_worktree_root`` exists and is used for wing derivation.
 5. ``ids.ID_RECIPE == "v3"`` — identical to upstream today, pinned because a
    change on EITHER side moves every drawer id in a 200k-drawer palace.
+6. Backend writes take ``short_writer_palace_lock`` (upstream: bare
+   ``mine_palace_lock``, wait=0).
+7. ``palace.mine_palace_lock`` removes its lock file on release (upstream leaves
+   it, so every next process "reclaims" a dead holder and logs it).
 """
 
 from __future__ import annotations
@@ -167,3 +171,28 @@ def test_backend_writes_take_the_waiting_palace_lock():
             f"call sites, found {calls.count('short_writer_palace_lock')}. A new "
             "write path must take the waiting lock too; then update this count."
         )
+
+
+def test_palace_lock_file_is_removed_on_release(tmp_path, monkeypatch):
+    """Delta 7 — upstream's ``mine_palace_lock`` never unlinks its file.
+
+    Every short writer (each ``memp`` invocation opens the backend under this
+    lock) then leaves a file naming a PID that is dead a moment later, and the
+    NEXT process's residue GC "reclaims" it with an INFO line on stderr — one
+    per call, forever, in every agent's tool output and in hook.log (found
+    2026-09-27, 22 lines that day in hook.log alone). A merge that drops the
+    ``_cleanup_mine_lock_file`` call in the release path restores exactly that
+    and nothing raises.
+    """
+    from mempalace.palace import mine_palace_lock
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    lock_dir = tmp_path / ".mempalace" / "locks"
+    with mine_palace_lock(str(tmp_path / "palace")):
+        assert list(lock_dir.glob("mine_palace_*.lock")), "lock file must exist while held"
+    assert not list(lock_dir.glob("mine_palace_*.lock")), (
+        "FORK DELTA REVERTED: mine_palace_lock left its lock file behind on "
+        "release. Ours calls _cleanup_mine_lock_file(lock_path) in the outer "
+        "finally; without it every memp call logs a lock-residue GC reclaim."
+    )

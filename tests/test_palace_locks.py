@@ -387,22 +387,25 @@ def test_lock_holder_identity_persists_across_release(tmp_path, monkeypatch):
     # under ``tmp_path`` regardless of platform.
     _isolate_home(monkeypatch, tmp_path)
     palace = str(tmp_path / "palace")
+    lock_dir = tmp_path / ".mempalace" / "locks"
     for _ in range(5):
         with mine_palace_lock(palace):
-            pass
-
-    # Locate the lock file. The key derivation is internal but we can find
-    # it by scanning the mempalace locks dir for mine_palace_*.lock entries.
-    lock_dir = tmp_path / ".mempalace" / "locks"
-    lock_files = list(lock_dir.glob("mine_palace_*.lock"))
-    assert lock_files, "expected the palace lock file to exist after acquire/release"
-    # Read as bytes so the byte-0 sentinel (\x00) is preserved without
-    # decode quirks; the bound is on the file size, not its line count.
-    body = lock_files[0].read_bytes()
-    # Body is byte-0 sentinel + identity (no trailing accumulation).
-    # Identity is ``f"{pid} {sys.argv[:3]}"``; cap at a generous bound that
-    # still rules out unbounded growth across the 5 re-acquires.
-    assert len(body) < 1024, f"lock body must not grow across re-acquires; got {len(body)} bytes"
+            # Locate the lock file. The key derivation is internal but we can
+            # find it by scanning the locks dir for mine_palace_*.lock entries.
+            lock_files = list(lock_dir.glob("mine_palace_*.lock"))
+            assert lock_files, "expected the palace lock file to exist while held"
+            # Read as bytes so the byte-0 sentinel (\x00) is preserved without
+            # decode quirks; the bound is on the file size, not its line count.
+            body = lock_files[0].read_bytes()
+            # Body is byte-0 sentinel + one holder record, never an accumulation.
+            assert len(body) < 1024, (
+                f"lock body must not grow across re-acquires; got {len(body)} bytes"
+            )
+        # Released: the rendezvous file is removed, so the next process finds
+        # nothing to "reclaim" (2026-09-27 — one GC log line per memp call).
+        assert not list(lock_dir.glob("mine_palace_*.lock")), (
+            "palace lock file must be removed on release"
+        )
 
 
 def test_mine_global_lock_is_alias_for_back_compat(tmp_path, monkeypatch):
