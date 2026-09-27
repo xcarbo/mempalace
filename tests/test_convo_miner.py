@@ -204,8 +204,53 @@ def test_mine_convos_chrome_only_session_files_zero_drawers(capsys):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_mine_convos_keeps_claude_reply_text_after_horizontal_rule(capsys):
+    """A Claude Code reply with a ``---`` rule mid-reply is filed verbatim.
+
+    The exchange chunker used to end the response at the rule and drop every
+    line up to the next user turn, so the second half of the reply never
+    reached the palace (upstream #2591).
+    """
+    reply = (
+        "Here is the plan for the release.\n\n"
+        "1. Freeze the branch.\n"
+        "2. Run the full suite.\n\n"
+        "---\n\n"
+        "## After the rule\n\n"
+        "AFTER_RULE_MARKER: tag the commit, publish the wheel, then post the notes."
+    )
+    turns = [
+        ("user", "How do we cut the release?"),
+        ("assistant", reply),
+        ("user", "And if it breaks?"),
+        ("assistant", "Yank the release and repoint latest to the previous tag."),
+        ("user", "Who writes the changelog?"),
+        ("assistant", "Whoever merged the last feature curates it by theme."),
+    ]
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(tmpdir, "session.jsonl"), "w") as f:
+            for role, text in turns:
+                content = text if role == "user" else [{"type": "text", "text": text}]
+                f.write(
+                    json.dumps({"type": role, "message": {"role": role, "content": content}}) + "\n"
+                )
+
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test")
+        capsys.readouterr()
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        resolved = str(Path(tmpdir).resolve() / "session.jsonl")
+        docs = col.get(where={"source_file": resolved}, include=["documents"])["documents"]
+        assert any(reply in d for d in docs), docs
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_mine_convos_does_not_reprocess_short_files(capsys):
-    """Files below MIN_CHUNK_SIZE get a sentinel so they are skipped on re-run."""
+    """A file shorter than MIN_CHUNK_SIZE is filed, not dropped, and skipped on re-run."""
     tmpdir = tempfile.mkdtemp()
     try:
         # A file too short to produce any chunks
@@ -223,6 +268,8 @@ def test_mine_convos_does_not_reprocess_short_files(capsys):
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")
         assert file_already_mined(col, resolved_file)
+        stored = col.get(where={"source_file": resolved_file}, include=["documents"])
+        assert "hi" in stored["documents"]
 
         # Second run -- file should be skipped
         mine_convos(tmpdir, palace_path, wing="test")

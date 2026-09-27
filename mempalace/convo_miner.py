@@ -366,38 +366,46 @@ def _chunk_by_exchange(
 ) -> list:
     """One user turn (>) + the AI response that follows = one or more chunks.
 
-    The full AI response is preserved verbatim.  When the combined
-    user-turn + response exceeds chunk_size the response is split across
-    consecutive drawers so nothing is silently discarded.
+    Every non-blank line lands in a chunk. A response runs until the next
+    user turn — a ``---`` rule inside it is part of the response — and any
+    text before the first user turn is filed as its own unit. When a unit
+    exceeds chunk_size it is split across consecutive drawers.
     """
     chunks = []
     i = 0
+    # Separator between the previous unit and the next one as it stood in the
+    # source: the newline ending that unit plus the blank lines trimmed off it.
+    # A unit small enough to join the previous drawer is joined with it.
+    gap = "\n"
+
+    preamble = []
+    while i < len(lines) and not lines[i].strip().startswith(">"):
+        preamble.append(lines[i])
+        i += 1
+    raw_preamble = "\n".join(preamble)
+    _emit_bounded(chunks, raw_preamble.strip("\n"), chunk_size, min_chunk_size, chunk_overlap)
+    gap = "\n" * (len(raw_preamble) - len(raw_preamble.rstrip("\n")) + 1)
 
     while i < len(lines):
-        line = lines[i]
-        if line.strip().startswith(">"):
-            user_turn = line.strip()
+        user_turn = lines[i].strip()
+        i += 1
+
+        ai_lines = []
+        while i < len(lines) and not lines[i].strip().startswith(">"):
+            # Preserve the line as-is — blank lines and indentation carry meaning
+            # (paragraph breaks, list/code structure) and must survive verbatim.
+            ai_lines.append(lines[i])
             i += 1
 
-            ai_lines = []
-            while i < len(lines):
-                next_line = lines[i]
-                if next_line.strip().startswith(">") or next_line.strip().startswith("---"):
-                    break
-                # Preserve the line as-is — blank lines and indentation carry meaning
-                # (paragraph breaks, list/code structure) and must survive verbatim.
-                ai_lines.append(next_line)
-                i += 1
+        # Join on newline (not space) so line structure, blank lines, and
+        # indentation reach the drawer unchanged. Trim only trailing blank
+        # lines produced by the loop stopping at the next `>` turn.
+        raw_response = "\n".join(ai_lines)
+        ai_response = raw_response.rstrip("\n")
+        content = f"{user_turn}\n{ai_response}" if ai_response else user_turn
 
-            # Join on newline (not space) so line structure, blank lines, and
-            # indentation reach the drawer unchanged. Trim only trailing blank
-            # lines produced by the loop stopping at the next `>` turn.
-            ai_response = "\n".join(ai_lines).rstrip("\n")
-            content = f"{user_turn}\n{ai_response}" if ai_response else user_turn
-
-            _emit_bounded(chunks, content, chunk_size, min_chunk_size, chunk_overlap)
-        else:
-            i += 1
+        _emit_bounded(chunks, content, chunk_size, min_chunk_size, chunk_overlap, joiner=gap)
+        gap = "\n" * (len(raw_response) - len(ai_response) + 1)
 
     return chunks
 
@@ -408,13 +416,16 @@ def _emit_bounded(
     chunk_size: int,
     min_chunk_size: int,
     chunk_overlap: int = 0,
+    joiner: str = "\n",
 ) -> None:
     """Append ``content`` as one or more drawers, none exceeding ``chunk_size``.
 
-    The ``min_chunk_size`` floor gates the WHOLE call (drops the input if
-    its stripped length is at or below the floor, treated as noise). Once
-    the input passes the floor, everything is emitted so a small trailing
-    remainder is preserved instead of silently dropped.
+    Nothing but whitespace is ever dropped. A unit whose stripped length is
+    at or below ``min_chunk_size`` is too small to be a useful drawer on its
+    own, so it is appended to the previous drawer (joined by ``joiner``,
+    which callers pass as the separator that stood between the two units in
+    the source) when that still fits in ``chunk_size``, and emitted as its
+    own drawer otherwise.
 
     Forced splits (one exchange past ``chunk_size``) pull the boundary back
     to a line break or space in the trailing half of the window instead of
@@ -424,8 +435,13 @@ def _emit_bounded(
     Callers must keep ``chunk_overlap <= chunk_size // 2`` (validated in
     ``chunk_exchanges``) or the window stops advancing.
     """
-    if len(content.strip()) <= min_chunk_size:
+    if not content.strip():
         return
+    if len(content.strip()) <= min_chunk_size and chunks:
+        merged = chunks[-1]["content"] + joiner + content
+        if len(merged) <= chunk_size:
+            chunks[-1]["content"] = merged
+            return
     n = len(content)
     start = 0
     while start < n:
@@ -458,7 +474,7 @@ def _chunk_by_paragraph(
         return chunks
 
     for para in paragraphs:
-        _emit_bounded(chunks, para, chunk_size, min_chunk_size, chunk_overlap)
+        _emit_bounded(chunks, para, chunk_size, min_chunk_size, chunk_overlap, joiner="\n\n")
 
     return chunks
 
@@ -1150,7 +1166,6 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
 def _normalize_convo_conversations(
     filepath: Path,
     source_file: str,
-    cfg_min_chunk_size: int,
     collection,
     wing: str,
     agent: str,
@@ -1159,8 +1174,9 @@ def _normalize_convo_conversations(
 ) -> Optional[list]:
     """Normalize a transcript file into its individual conversations,
     registering it as filed when there's nothing worth mining. Returns None
-    when the caller should skip the file (normalize failed, or normalized
-    content is too short to chunk).
+    when the caller should skip the file (normalize failed, or the normalized
+    content is only whitespace). A short transcript is still mined: the
+    chunker keeps text below the min chunk size rather than dropping it.
 
     Kept as separate conversations rather than joined into one string so
     dedup can hash and skip per conversation — a Claude.ai privacy export
@@ -1175,8 +1191,7 @@ def _normalize_convo_conversations(
             _register_file(collection, source_file, wing, agent, extract_mode)
         return None
 
-    total_len = sum(len(c.strip()) for c in conversations)
-    if not conversations or total_len < cfg_min_chunk_size:
+    if not any(c.strip() for c in conversations):
         if not dry_run:
             _register_file(collection, source_file, wing, agent, extract_mode)
         return None
@@ -1310,7 +1325,6 @@ def _mine_convos_impl(
         conversations = _normalize_convo_conversations(
             filepath,
             source_file,
-            cfg_min_chunk_size,
             collection,
             wing,
             agent,
