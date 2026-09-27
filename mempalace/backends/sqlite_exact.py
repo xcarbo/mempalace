@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 import numpy as np
 
+from ._magic import has_sqlite_magic
 from .base import (
     BackendClosedError,
     BackendError,
@@ -2167,15 +2168,16 @@ class SQLiteExactBackend(BaseBackend):
         behind because the SQLite header is written on the first statement,
         not on connection. The 16-byte ``SQLite format 3\\x00`` magic prefix
         accepts every real palace while rejecting empty / garbage files. See #1893.
+
+        The probe goes through :func:`mempalace.backends._magic.has_sqlite_magic`
+        and never opens a plain descriptor on the file: ``detect()`` runs on
+        nearly every MCP tool call, and closing a non-SQLite descriptor on the
+        database this backend already holds a WAL connection to drops every
+        POSIX lock the process owns on that inode -- including the SHARED lock
+        that stops an external ``close()`` from checkpointing and unlinking the
+        live ``-wal`` / ``-shm`` sidecars.
         """
-        db_path = os.path.join(path, _DB_FILENAME)
-        if not os.path.isfile(db_path):
-            return False
-        try:
-            with open(db_path, "rb") as f:
-                return f.read(16) == b"SQLite format 3\x00"
-        except OSError:
-            return False
+        return has_sqlite_magic(os.path.join(path, _DB_FILENAME))
 
     def create_collection(self, palace_path: str, collection_name: str) -> SQLiteExactCollection:
         return self.get_collection(palace_path, collection_name, create=True)
