@@ -276,7 +276,7 @@ def test_hook_log_carries_the_failure_details(monkeypatch, tmp_path):
 
     res = hooks_cli._save_diary_direct(str(transcript), "sess1", wing="w", agent_name="claude")
 
-    assert res == {"count": 0}
+    assert res == {"drawers_filed": 0, "messages_folded": 0}
     failed = [line for line in logged if "checkpoint failed" in line]
     assert failed and "Backend open failed" in failed[0]
     assert "OperationalError: disk I/O error" in failed[0]
