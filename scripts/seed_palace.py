@@ -52,7 +52,7 @@ def ro(path):
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 
 
-def select_rows(src, wings, exclude_rooms, since):
+def select_rows(src, wings, exclude_rooms, since, exclude_drawers=()):
     """Return {collection_name: [(id, document, metadata_json, embedding)]}."""
     marks = ",".join("?" * len(wings))
     sql = (
@@ -67,6 +67,9 @@ def select_rows(src, wings, exclude_rooms, since):
     if since:
         sql += " AND d.updated_at >= ?"
         params.append(since)
+    for drawer in exclude_drawers:
+        sql += " AND d.id <> ? AND COALESCE(d.parent_drawer_id, '') <> ?"
+        params += [drawer, drawer]
     out = {}
     for (name,) in src.execute("SELECT name FROM collections ORDER BY id"):
         out[name] = src.execute(sql, [name] + params).fetchall()
@@ -101,6 +104,29 @@ def copy_drawers(dest, rows_by_collection):
                 embeddings=[np.frombuffer(r[3], dtype=np.float32).tolist() for r in chunk],
             )
         print(f"  {name}: upserted {len(rows)}")
+        drop_stale_chunks(col, rows)
+
+
+def drop_stale_chunks(col, rows):
+    """Delete destination chunks a rewritten drawer no longer has.
+
+    A drawer rewritten in place (a /preclean roadmap) keeps its id but can come
+    back with fewer chunks. Upsert alone would leave the old tail chunks behind,
+    and /full stitching by parent_drawer_id would serve them as part of the
+    drawer. For every parent copied here, the source's chunk set is the truth.
+    """
+    by_parent = {}
+    for r in rows:
+        parent = json.loads(r[2]).get("parent_drawer_id")
+        if parent:
+            by_parent.setdefault(parent, set()).add(r[0])
+    stale = []
+    for parent, keep in by_parent.items():
+        have = col.get(where={"parent_drawer_id": parent}, include=[])["ids"]
+        stale += [i for i in have if i not in keep]
+    if stale:
+        col.delete(ids=stale)
+        print(f"  dropped {len(stale)} stale chunk(s): {', '.join(sorted(stale))}")
 
 
 def select_kg(src_kg, wings, drawer_ids):
@@ -149,6 +175,12 @@ def main():
     ap.add_argument("--wing", action="append", required=True, help="wing to copy (repeatable)")
     ap.add_argument("--exclude-room", action="append", default=[], help="room to skip (repeatable)")
     ap.add_argument("--since", help="only rows updated at or after this ISO time")
+    ap.add_argument(
+        "--exclude-drawer",
+        action="append",
+        default=[],
+        help="drawer id to skip, with its chunks (repeatable)",
+    )
     ap.add_argument("--apply", action="store_true", help="write; default is a dry run")
     args = ap.parse_args()
 
@@ -160,7 +192,7 @@ def main():
 
     src = ro(os.path.join(src_dir, DB_NAME))
     check_embedder(src, os.path.join(dest, DB_NAME))
-    rows = select_rows(src, args.wing, args.exclude_room, args.since)
+    rows = select_rows(src, args.wing, args.exclude_room, args.since, args.exclude_drawer)
     drawer_ids = [r[0] for r in rows.get("mempalace_drawers", [])]
     src_kg = ro(args.src_kg)
     triples, entities = select_kg(src_kg, args.wing, drawer_ids)
