@@ -130,37 +130,55 @@ def drop_stale_chunks(col, rows):
 
 
 def select_kg(src_kg, wings, drawer_ids):
-    """Triples naming a copied wing or drawer, and the entities they use."""
+    """Triples naming a copied wing or drawer, and the entities they use.
+
+    Rows come back as dicts keyed by column name: an older KG grew its columns
+    by ALTER TABLE, so their order differs from a fresh one (see copy_kg).
+    """
+
+    def rows(sql, params=()):
+        cur = src_kg.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        return (dict(zip(cols, r)) for r in cur)
+
     keys = set(wings) | {f"wing_{w}" for w in wings}
     likes = [f"%{w}%" for w in wings]
     cond = " OR ".join(["subject LIKE ? OR object LIKE ?"] * len(likes))
     params = [p for like in likes for p in (like, like)]
     triples = {}
-    for row in src_kg.execute(f"SELECT * FROM triples WHERE {cond}", params):
-        triples[row[0]] = row
+    for row in rows(f"SELECT * FROM triples WHERE {cond}", params):
+        triples[row["id"]] = row
     base_ids = {i.split("_chunk_")[0] for i in drawer_ids}
-    for row in src_kg.execute("SELECT * FROM triples WHERE source_drawer_id IS NOT NULL"):
-        if row[10] in base_ids:
-            triples[row[0]] = row
-    names = {t[1] for t in triples.values()} | {t[3] for t in triples.values()} | keys
-    entities = [e for e in src_kg.execute("SELECT * FROM entities") if e[0] in names]
+    for row in rows("SELECT * FROM triples WHERE source_drawer_id IS NOT NULL"):
+        if row["source_drawer_id"] in base_ids:
+            triples[row["id"]] = row
+    names = (
+        {t["subject"] for t in triples.values()} | {t["object"] for t in triples.values()} | keys
+    )
+    entities = [e for e in rows("SELECT * FROM entities") if e["id"] in names]
     return list(triples.values()), entities
 
 
 def copy_kg(dest_kg, triples, entities):
+    """Insert by column NAME: a positional copy between KGs whose columns were
+    added in a different order puts values in the wrong columns."""
     KnowledgeGraph(dest_kg).close()  # creates the canonical schema
     con = sqlite3.connect(dest_kg)
-    tcols = [r[1] for r in con.execute("PRAGMA table_info(triples)")]
-    ecols = [r[1] for r in con.execute("PRAGMA table_info(entities)")]
+
+    def insert(table, rows):
+        cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+        if rows:
+            missing = set(cols) - set(rows[0])
+            if missing:
+                sys.exit(f"source {table} lacks columns {sorted(missing)}")
+        con.executemany(
+            f"INSERT OR IGNORE INTO {table} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+            [[row[c] for c in cols] for row in rows],
+        )
+
     with con:
-        con.executemany(
-            f"INSERT OR IGNORE INTO entities ({','.join(ecols)}) VALUES ({','.join('?' * len(ecols))})",
-            [e[: len(ecols)] for e in entities],
-        )
-        con.executemany(
-            f"INSERT OR IGNORE INTO triples ({','.join(tcols)}) VALUES ({','.join('?' * len(tcols))})",
-            [t[: len(tcols)] for t in triples],
-        )
+        insert("entities", entities)
+        insert("triples", triples)
     con.close()
 
 
