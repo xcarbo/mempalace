@@ -5267,6 +5267,57 @@ def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
     assert '"ok": true' in response["result"]["content"][0]["text"]
 
 
+def test_peer_writer_guard_does_not_gate_kg_tools(monkeypatch):
+    """kg_add/kg_invalidate/kg_supersede never touch the drawer store (#2297).
+
+    Upstream #2423. ``memp`` dispatches through ``handle_request``, so a gated
+    KG tool was refused for as long as a hook mine held the palace lock.
+    """
+    from mempalace import mcp_server
+
+    names = ("mempalace_kg_add", "mempalace_kg_invalidate", "mempalace_kg_supersede")
+    for name in names:
+        assert name in mcp_server._MUTATING_TOOLS, f"{name} must stay a palace-write tool"
+        assert name in mcp_server._PEER_WRITER_EXEMPT_TOOLS, (
+            f"{name} must be exempt from the peer-writer lease"
+        )
+
+    def forbidden_lock(*_args, **_kwargs):
+        raise AssertionError("KG tools should not acquire the peer-writer lock")
+
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", forbidden_lock)
+
+    for name in names:
+        # Replace the handler so the test exercises the gate, not the KG
+        # write path (which would need a live KnowledgeGraph fixture).
+        monkeypatch.setitem(
+            mcp_server.TOOLS,
+            name,
+            {
+                "description": "test KG tool",
+                "input_schema": {"type": "object", "properties": {}},
+                "handler": lambda: {"ok": True},
+            },
+        )
+        response = mcp_server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": {}},
+            }
+        )
+        assert "error" not in response, f"{name} must not be refused under a peer writer"
+        assert '"ok": true' in response["result"]["content"][0]["text"]
+
+    # Read-only mode keeps refusing them: the exemption is the peer-writer
+    # lease only, not operator read-only.
+    monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
+    for name in names:
+        assert name in mcp_server._READ_ONLY_REFUSED_TOOLS
+        assert mcp_server._mcp_read_only_refusal(1, name) is not None
+
+
 def test_status_tool_does_not_acquire_peer_writer_lock(monkeypatch):
     from mempalace import mcp_server
 
