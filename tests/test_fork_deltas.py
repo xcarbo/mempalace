@@ -25,6 +25,9 @@ Register:
    ``mine_palace_lock``, wait=0).
 7. ``palace.mine_palace_lock`` removes its lock file on release (upstream leaves
    it, so every next process "reclaims" a dead holder and logs it).
+8. An exchange drawer with no ``convo_chunker_version`` still counts as mined
+   (upstream 3.11 counts it stale, so its first convo mine re-mines every
+   transcript still on disk). #2591 was taken forward-only in 5878576.
 """
 
 from __future__ import annotations
@@ -196,3 +199,44 @@ def test_palace_lock_file_is_removed_on_release(tmp_path, monkeypatch):
         "release. Ours calls _cleanup_mine_lock_file(lock_path) in the outer "
         "finally; without it every memp call logs a lock-residue GC reclaim."
     )
+
+
+def test_exchange_drawer_without_chunker_stamp_counts_as_mined(tmp_path):
+    """Delta 8 — #2591 was taken forward-only (5878576).
+
+    Upstream 3.11 stamps exchange drawers with ``convo_chunker_version`` and
+    its ``palace/mined.py::_meta_is_current`` reads a missing stamp as stale.
+    Pulled in by any pick that touches the mined-set checks (#2567, #2593),
+    that silently turns the next ``mine --mode convos`` into a re-mine of
+    every conversation file still on disk. If the re-mine has been decided
+    and run, retire this delta deliberately; never just re-point it.
+    """
+    from mempalace.backends.base import PalaceRef
+    from mempalace.backends.sqlite_exact import SQLiteExactBackend
+    from mempalace.palace import file_already_mined, prefetch_mined_set
+
+    backend = SQLiteExactBackend()
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    col = backend.get_collection(palace=palace, collection_name="mempalace_drawers", create=True)
+    src = str(tmp_path / "session.jsonl")
+    col.add(
+        ids=["d1"],
+        documents=["> question\nanswer"],
+        metadatas=[
+            {
+                "wing": "w",
+                "room": "r",
+                "source_file": src,
+                "source_mtime": 1.0,
+                "extract_mode": "exchange",
+                "normalize_version": NORMALIZE_VERSION,
+                "chunk_total": 1,
+            }
+        ],
+        embeddings=[[1.0, 0.0]],
+    )
+    assert file_already_mined(col, src, extract_mode="exchange"), (
+        "an unstamped exchange drawer reads as stale: the next convo mine "
+        "re-mines every transcript on disk"
+    )
+    assert src in prefetch_mined_set(col, extract_mode="exchange")

@@ -145,6 +145,7 @@ uv run pytest tests/test_fork_deltas.py -v
 | backend palace lock (`backends/sqlite_exact.py`, `backends/chroma.py`) | `short_writer_palace_lock()` (waits 10 s) | bare `mine_palace_lock()` | Bare binds wait=0: a session hook ending in the same second as another loses its diary checkpoint as "Backend open failed". The suite pins the wait to 0, so it stays green |
 | `ID_RECIPE` (`ids.py`) | `"v3"` | same | Pinned, not diverged — a change on either side re-derives every drawer id |
 | `mine_palace_lock` release (`palace.py`) | calls `_cleanup_mine_lock_file` | leaves the file | Every `memp` call then finds the previous call's dead holder and logs a "lock-residue GC: reclaiming" line on stderr — noise in every agent's tool output and in hook.log, one per process forever |
+| exchange stale check (`palace.py` mined-set) | no `convo_chunker_version` check | missing stamp = stale (3.11) | Any pick of upstream's `palace/mined.py` makes the next `mine --mode convos` re-mine every transcript still on disk. #2591 was taken forward-only (5878576) |
 
 Two rules:
 
