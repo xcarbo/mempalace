@@ -1513,3 +1513,51 @@ def test_concurrent_first_open_single_connection_no_leak(tmp_path, monkeypatch):
     backend.close()
     with pytest.raises(sqlite3.ProgrammingError):
         created[0].execute("SELECT 1")
+
+
+def test_sqlite_exact_metadata_only_update_keeps_document_embedding_and_fts(tmp_path):
+    """A wing/room move must not touch the document, its vector or its FTS row.
+
+    Upstream #2576 (metadata-only fast path). The FTS row is keyed by rowid
+    here, so the check that it survived is a lexical hit under the new wing.
+    """
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["rareterm alpha note", "plain beta note"],
+        metadatas=[{"wing": "w", "room": "r", "keep": 1}, {"wing": "w", "room": "r"}],
+        embeddings=[[1, 0], [0, 1]],
+    )
+    col.update(
+        ids=["a", "missing"], metadatas=[{"wing": "target", "last_modified": "t"}, {"wing": "x"}]
+    )
+
+    got = col.get(ids=["a"], include=["documents", "metadatas", "embeddings"])
+    assert got["documents"] == ["rareterm alpha note"]
+    assert got["metadatas"][0] == {"wing": "target", "room": "r", "keep": 1, "last_modified": "t"}
+    assert list(got["embeddings"][0]) == [1.0, 0.0]
+    hits = col.lexical_search(query="rareterm", n_results=5, where={"wing": "target"}).hits
+    assert [hit.id for hit in hits] == ["a"]
+    assert col.lexical_search(query="rareterm", n_results=5, where={"wing": "w"}).hits == []
+    # The generated wing column follows the JSON, so an indexed wing filter sees the move.
+    assert col.get(where={"wing": "target"})["ids"] == ["a"]
+
+
+def test_sqlite_exact_metadata_only_update_skips_fts_rewrite(tmp_path):
+    """The fast path must not delete and re-insert the FTS row."""
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a"],
+        documents=["rareterm alpha note"],
+        metadatas=[{"wing": "w", "room": "r"}],
+        embeddings=[[1, 0]],
+    )
+    calls = []
+    original = col._replace_fts
+    col._replace_fts = lambda *a, **k: (calls.append(a), original(*a, **k))
+    col.update(ids=["a"], metadatas=[{"room": "moved"}])
+    assert calls == []
+    col.update(ids=["a"], documents=["rareterm gamma note"])
+    assert len(calls) == 1
+    hits = col.lexical_search(query="gamma", n_results=5, where={"room": "moved"}).hits
+    assert [hit.id for hit in hits] == ["a"]
