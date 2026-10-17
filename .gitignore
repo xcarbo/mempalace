@@ -42,3 +42,6 @@ venv/
 
 # /whats-next snapshots (generated from the palace roadmap, never source of truth)
 whats-next*.md
+
+# fleet: the real server list is private (~/.config/mempalace/fleet.servers.json)
+scripts/fleet.servers.json

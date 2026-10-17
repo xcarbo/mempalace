@@ -1,0 +1,548 @@
+#!/usr/bin/env bun
+// fleet: see and update mempalace on every server, from the Mini.
+//
+//   scripts/fleet status [server|all] [--json]
+//   scripts/fleet deploy <server|all> [--dry-run] [--api] [--ref <sha>] [--fresh-deps]
+//   scripts/fleet rollback <server> [--api] [--dry-run]
+//
+// Servers live in ~/.config/mempalace/fleet.servers.json (FLEET_CONFIG overrides),
+// kept out of this public repo; scripts/fleet.servers.example.json shows the shape.
+// The box half of every step is
+// scripts/fleet_remote.sh, piped to `ssh <box> bash -s`. The Mini dials the
+// boxes, never the reverse; fleet touches code and venvs, never ~/.mempalace.
+//
+// Deploy, per box: git archive the ref -> new source dir -> new uv venv on the
+// box's own Python -> smoke test against the live palace (read-only) -> swap
+// the ~/opt/mempalace/.venv symlink by rename(2) -> restart mempalace-api ->
+// /stats must answer with no fewer drawers, else flip back. The old venv stays,
+// so `fleet rollback` is one more symlink flip. The Mini row is report-only:
+// it runs an editable install, so there is nothing to deploy.
+
+import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir, hostname, userInfo, homedir } from "node:os";
+import { join } from "node:path";
+import {
+  type Config,
+  type Server,
+  ago,
+  describeDiff,
+  parseConfig,
+  parseKv,
+  remoteHeader,
+  renderTable,
+  selectServers,
+  shPath,
+} from "./fleet_lib.ts";
+
+const HERE = import.meta.dir;
+const REMOTE_SCRIPT = readFileSync(join(HERE, "fleet_remote.sh"), "utf8");
+const INCOMING = "~/opt/.fleet/incoming";
+const SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15"];
+
+// ── process helpers ─────────────────────────────────────────────────────
+
+interface Ran {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+async function run(argv: string[], opts: { stdin?: string | Blob; timeoutMs?: number; cwd?: string } = {}): Promise<Ran> {
+  const p = Bun.spawn(argv, {
+    stdin: opts.stdin === undefined ? "ignore" : typeof opts.stdin === "string" ? new Blob([opts.stdin]) : opts.stdin,
+    stdout: "pipe",
+    stderr: "pipe",
+    cwd: opts.cwd,
+    timeout: opts.timeoutMs,
+  });
+  const [stdout, stderr, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+  return { code: p.signalCode ? 124 : code, stdout, stderr };
+}
+
+function gitSync(repo: string, ...args: string[]): string {
+  const r = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+  if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString().trim()}`);
+  return r.stdout.toString().trim();
+}
+
+function gitTry(repo: string, ...args: string[]): string | null {
+  try {
+    return gitSync(repo, ...args);
+  } catch {
+    return null;
+  }
+}
+
+function sha256(data: string | Uint8Array): string {
+  return new Bun.CryptoHasher("sha256").update(data).digest("hex");
+}
+
+// ── remote calls ────────────────────────────────────────────────────────
+
+function boxEnv(s: Server, cfg: Config): { vars: Record<string, string>; paths: Record<string, string> } {
+  const b = s.box;
+  return {
+    vars: {
+      EXPECT_PY: b.expect_python,
+      EXPECT_SQLITE: b.expect_sqlite,
+      API_UNIT: b.api_unit,
+      API_PORT: String(b.api_port),
+      KEEP: String(b.keep),
+      EXTRA_PKGS: b.extra_packages.join(" "),
+      BACKUP_TIMER: s.backup_timer,
+      API_HASH_FILES: cfg.source.api_files.join(" "),
+      BRANCH: cfg.source.branch,
+      OWNER: `${userInfo().username}@${hostname()}`,
+    },
+    paths: { VENV_LINK: b.venv_link, SRC_LINK: b.src_link, API_LINK: b.api_link, PYBIN: b.python },
+  };
+}
+
+interface RemoteResult extends Ran {
+  kv: Record<string, string>;
+}
+
+async function remote(
+  cfg: Config,
+  s: Server,
+  cmd: string,
+  vars: Record<string, string> = {},
+  paths: Record<string, string> = {},
+  timeoutMs = 30_000,
+): Promise<RemoteResult> {
+  const env = boxEnv(s, cfg);
+  const script = remoteHeader({ ...env.vars, ...vars, CMD: cmd }, { ...env.paths, ...paths }) + REMOTE_SCRIPT;
+  const r = await run(["ssh", ...SSH_OPTS, s.ssh, "bash -s"], { stdin: script, timeoutMs });
+  return { ...r, kv: parseKv(r.stdout) };
+}
+
+function lastLines(text: string, n = 6): string {
+  return text.trim().split("\n").slice(-n).join("\n");
+}
+
+// ── status ──────────────────────────────────────────────────────────────
+
+interface MiniRefs {
+  branchSha: string;
+  apiSha: string;
+  apiHashes: Record<string, string>;
+}
+
+function miniRefs(cfg: Config): MiniRefs {
+  const branchSha = gitSync(cfg.source.repo, "rev-parse", "--verify", `${cfg.source.branch}^{commit}`);
+  const apiSha = gitSync(cfg.source.api_repo, "rev-parse", "HEAD");
+  const apiHashes: Record<string, string> = {};
+  for (const f of cfg.source.api_files) {
+    const r = Bun.spawnSync(["git", "-C", cfg.source.api_repo, "show", `HEAD:${f}`], { stdout: "pipe" });
+    apiHashes[f] = r.exitCode === 0 ? sha256(r.stdout) : "";
+  }
+  return { branchSha, apiSha, apiHashes };
+}
+
+function commitDiff(cfg: Config, deployed: string, head: string): string {
+  if (!deployed) return "no record";
+  const full = gitTry(cfg.source.repo, "rev-parse", "--verify", "--quiet", `${deployed}^{commit}`);
+  if (!full) return `unknown commit ${deployed}`;
+  const behind = Number(gitSync(cfg.source.repo, "rev-list", "--count", `${full}..${head}`));
+  const ahead = Number(gitSync(cfg.source.repo, "rev-list", "--count", `${head}..${full}`));
+  const paths = gitSync(cfg.source.repo, "diff", "--name-only", full, head).split("\n");
+  return describeDiff(behind, ahead, paths);
+}
+
+const HEADERS = ["server", "commit", "vs " /* + branch */, "version", "py/sqlite", "drawers", "api", "api code", "backup", "rollback"];
+
+async function statusLocal(cfg: Config, s: Server, refs: MiniRefs): Promise<string[]> {
+  const l = s.local;
+  const head = gitSync(cfg.source.repo, "rev-parse", "HEAD");
+  const dirty = gitSync(cfg.source.repo, "status", "--porcelain", "--untracked-files=no") !== "";
+  const [ver, py] = await Promise.all([
+    run([l.mempalace_bin, "--version"], { timeoutMs: 20_000 }),
+    run([l.python, "-c", "import sys, sqlite3; print(sys.version.split()[0], sqlite3.sqlite_version)"], { timeoutMs: 20_000 }),
+  ]);
+  let drawers = "-";
+  let api = "down";
+  try {
+    const r = await fetch(`http://127.0.0.1:${l.api_port}/stats`, { signal: AbortSignal.timeout(5000) });
+    drawers = String(((await r.json()) as { drawers: number }).drawers);
+    api = "up";
+  } catch {}
+  const apiDirty = gitSync(cfg.source.api_repo, "status", "--porcelain", "--untracked-files=no") !== "";
+  let backup = "-";
+  if (l.backup_dir && l.backup_glob) {
+    let newest = 0;
+    for (const f of new Bun.Glob(l.backup_glob).scanSync({ cwd: l.backup_dir })) {
+      newest = Math.max(newest, Bun.file(join(l.backup_dir, f)).lastModified);
+    }
+    let result = "";
+    try {
+      const tail = readFileSync(l.backup_log, "utf8").trim().split("\n").at(-1) ?? "";
+      result = /backup complete/.test(tail) ? "ok" : "see log";
+    } catch {}
+    backup = newest ? `${ago(new Date(newest))} ${result}`.trim() : "none found";
+  }
+  return [
+    s.name,
+    head.slice(0, 8) + (dirty ? "*" : ""),
+    commitDiff(cfg, head, refs.branchSha) + " (editable)",
+    (ver.stdout.trim() || ver.stderr.trim()).replace(/^MemPalace /, ""),
+    py.stdout.trim().replace(" ", "/"),
+    drawers,
+    api,
+    `source @${refs.apiSha.slice(0, 8)}${apiDirty ? " dirty" : ""}`,
+    backup,
+    "-",
+  ];
+}
+
+function backupCell(kv: Record<string, string>): string {
+  if (!kv.backup_unit) return "no timer";
+  if (["active", "activating"].includes(kv.backup_state)) return "running now";
+  const last = kv.backup_last_trigger ? new Date(kv.backup_last_trigger.replace(/^\w+ /, "").replace(" UTC", "Z").replace(" ", "T")) : null;
+  const when = last && !Number.isNaN(last.getTime()) ? ago(last) : "never";
+  const ok = kv.backup_result === "success" && kv.backup_exit === "0";
+  return `${when} ${ok ? "ok" : `FAILED (${kv.backup_result}, exit ${kv.backup_exit})`}`;
+}
+
+async function statusBox(cfg: Config, s: Server, refs: MiniRefs): Promise<string[]> {
+  const blank = (label: string, detail: string) => [s.name, label, detail.slice(0, 90), "", "", "", "", "", "", ""];
+  if (!s.enabled) return blank("disabled", s.note);
+  const r = await remote(cfg, s, "probe");
+  if (r.code !== 0 && !r.kv.host) {
+    const why = r.code === 124 ? "timed out" : lastLines(r.stderr, 1) || `ssh exit ${r.code}`;
+    return blank("UNREACHABLE", `${s.ssh}: ${why}`);
+  }
+  const kv = r.kv;
+  const deployed = (kv.deployed_from || "").split(" ")[0];
+  let commit = deployed || "?";
+  if (kv.core_id !== "dir" && kv.core_id !== deployed) commit += ` (venv ${kv.core_id}!)`;
+  const [pyv, sqlv] = (kv.pyinfo || "").split(" ");
+  const pyOk = pyv === s.box.expect_python && sqlv === s.box.expect_sqlite;
+  const apiUp = kv.api_drawers !== "";
+  const diffFiles = cfg.source.api_files.filter((f) => kv[`api_sha256:${f}`] !== refs.apiHashes[f]);
+  const apiId = (kv.api_deployed_from || "").split(" ")[0];
+  const apiCode = diffFiles.length === 0 ? `= mini @${refs.apiSha.slice(0, 8)}` : `DIFFERS: ${diffFiles.join(",")}`;
+  return [
+    s.name,
+    commit,
+    commitDiff(cfg, deployed, refs.branchSha),
+    (kv.version || "?").replace(/^MemPalace /, ""),
+    `${pyv || "?"}/${sqlv || "?"}${pyOk ? "" : " !"}`,
+    apiUp ? kv.api_drawers : "-",
+    apiUp ? "up" : `DOWN (${kv.api_active || "?"})`,
+    apiCode + (apiId ? ` [${apiId}]` : ""),
+    backupCell(kv),
+    kv.core_prev || (kv.core_id === "dir" ? "pre-fleet" : "-"),
+  ];
+}
+
+async function cmdStatus(cfg: Config, target: string | undefined, json: boolean): Promise<number> {
+  const refs = miniRefs(cfg);
+  const servers = selectServers(cfg, target);
+  const rows = await Promise.all(
+    servers.map((s) =>
+      (s.kind === "local" ? statusLocal(cfg, s, refs) : statusBox(cfg, s, refs)).catch((e: Error) => [
+        s.name,
+        `ERROR: ${e.message}`,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+      ]),
+    ),
+  );
+  const headers = HEADERS.map((h) => (h === "vs " ? `vs ${cfg.source.branch} @${refs.branchSha.slice(0, 8)}` : h));
+  if (json) {
+    console.log(JSON.stringify(rows.map((r) => Object.fromEntries(headers.map((h, i) => [h, r[i]]))), null, 2));
+  } else {
+    console.log(renderTable(headers, rows));
+  }
+  return rows.some((r) => /UNREACHABLE|ERROR|DOWN|FAILED|DIFFERS|!/.test(r.join(" "))) ? 1 : 0;
+}
+
+// ── deploy / rollback ───────────────────────────────────────────────────
+
+interface Opts {
+  dryRun: boolean;
+  api: boolean;
+  ref?: string;
+  freshDeps: boolean;
+}
+
+class StepFailed extends Error {}
+
+function log(msg: string) {
+  console.log(msg);
+}
+
+async function rstep(cfg: Config, s: Server, title: string, cmd: string, vars = {}, paths = {}, timeoutMs = 60_000) {
+  log(`  → ${title}`);
+  const r = await remote(cfg, s, cmd, vars, paths, timeoutMs);
+  const progress = r.stderr.trimEnd();
+  if (progress) log(progress.split("\n").map((l) => `    ${l.replace(/^  /, "")}`).join("\n"));
+  if (r.code !== 0) throw new StepFailed(`${title} failed on ${s.name}${r.code === 124 ? " (timed out)" : ""}`);
+  return r.kv;
+}
+
+async function upload(s: Server, file: string, remoteName: string) {
+  const dest = `${INCOMING}/${remoteName}`;
+  const cmd = `mkdir -p ${shPath(INCOMING)} && cat > ${shPath(dest)}`;
+  const r = await run(["ssh", ...SSH_OPTS, s.ssh, cmd], { stdin: Bun.file(file), timeoutMs: 120_000 });
+  if (r.code !== 0) throw new StepFailed(`upload to ${s.name} failed: ${lastLines(r.stderr, 2)}`);
+  return dest;
+}
+
+function checkSource(repo: string, label: string) {
+  const dirty = gitSync(repo, "status", "--porcelain", "--untracked-files=no");
+  if (dirty) throw new Error(`${label} checkout ${repo} is dirty; commit or stash first:\n${dirty}`);
+}
+
+function resolveRef(cfg: Config, ref: string | undefined): string {
+  checkSource(cfg.source.repo, "mempalace");
+  const sha = gitTry(cfg.source.repo, "rev-parse", "--verify", "--quiet", `${ref ?? cfg.source.branch}^{commit}`);
+  if (!sha) throw new Error(`'${ref}' is not a commit in ${cfg.source.repo}`);
+  const onBranch = Bun.spawnSync(["git", "-C", cfg.source.repo, "merge-base", "--is-ancestor", sha, cfg.source.branch]);
+  if (onBranch.exitCode !== 0) throw new Error(`${sha.slice(0, 8)} is not on ${cfg.source.branch}; only that branch ships`);
+  return sha;
+}
+
+function drawerCount(kv: Record<string, string>): number | null {
+  return /^\d+$/.test(kv.api_drawers ?? "") ? Number(kv.api_drawers) : null;
+}
+
+async function verifyApi(cfg: Config, s: Server, before: number): Promise<number> {
+  const kv = await rstep(cfg, s, `restart ${s.box.api_unit} and wait for /stats`, "restart_api", {}, {}, 90_000);
+  const after = Number(kv.api_drawers);
+  log(`    /stats: ${after} drawers (was ${before})`);
+  // Hooks may file drawers during a deploy, so more is fine; fewer is not.
+  if (after < before) throw new StepFailed(`/stats reports ${after} drawers after the swap, ${before} before`);
+  return after;
+}
+
+async function deployBox(cfg: Config, s: Server, opts: Opts, sha: string): Promise<void> {
+  const id = sha.slice(0, 8);
+  const tag = opts.dryRun ? " (dry run)" : "";
+  log(`\n== ${s.name} (${s.ssh})${tag}`);
+  let apiSha = "";
+  if (opts.api) {
+    checkSource(cfg.source.api_repo, "mempalace-api");
+    apiSha = gitSync(cfg.source.api_repo, "rev-parse", "HEAD");
+  }
+  const apiId = apiSha.slice(0, 8);
+
+  log("  → probe (read-only)");
+  const probe = await remote(cfg, s, "probe");
+  if (!probe.kv.host) throw new StepFailed(`cannot reach ${s.name}: ${lastLines(probe.stderr, 2)}`);
+  const kv = probe.kv;
+  if (kv.lock) throw new StepFailed(`another fleet run holds the lock on ${s.name}: ${kv.lock}`);
+  const deployed = (kv.deployed_from || "").split(" ")[0];
+  const liveCore = kv.core_id === "dir" ? deployed : kv.core_id;
+  const doCore = liveCore !== id;
+  const doApi = opts.api && kv.api_id !== apiId;
+  log(`    live: core ${kv.core_id === "dir" ? `${deployed} (pre-fleet dirs)` : kv.core_id}, api ${kv.api_id}, ${kv.api_drawers || "?"} drawers`);
+  if (!doCore && !doApi) {
+    log(`    ${s.name} already runs ${id}${opts.api ? ` and api ${apiId}` : ""}; nothing to do`);
+    return;
+  }
+  const before = drawerCount(kv);
+  if (before === null) throw new StepFailed(`${s.name}'s read API is not answering /stats; fix that before deploying`);
+  if (["active", "activating"].includes(kv.backup_state)) throw new StepFailed(`backup ${kv.backup_unit} is running on ${s.name}; try later`);
+
+  const plan = [
+    doCore && `core ${liveCore} → ${id}${kv.core_id === "dir" ? ` (first fleet deploy: the real .venv and mempalace-src dirs become .venv.${deployed || "pre-fleet"} / mempalace-src.${deployed || "pre-fleet"}, and the paths become symlinks)` : ""}`,
+    doApi && `api ${kv.api_id} → ${apiId}${kv.api_id === "dir" ? " (the real mempalace-api dir is kept as mempalace-api.pre-fleet)" : ""}`,
+  ].filter(Boolean);
+  for (const p of plan) log(`    plan: ${p}`);
+
+  const steps = [
+    "lock",
+    doCore && `git archive ${id} → ${INCOMING}/${id}.tar.gz`,
+    doApi && `git archive mempalace-api ${apiId} → ${INCOMING}/api-${apiId}.tar.gz`,
+    doCore && `stage ~/opt/mempalace-src.${id} + uv venv ${s.box.venv_link}.${id} on ${s.box.python}${opts.freshDeps ? " (fresh deps)" : " (deps pinned to the live venv)"}`,
+    doCore && `smoke test: imports, Python ${s.box.expect_python} / SQLite ${s.box.expect_sqlite}, mempalace --version, read-only memp status, live api code imports`,
+    doApi && `stage ~/opt/mempalace-api.${apiId} and check it imports`,
+    "refuse if a backup started meanwhile",
+    doCore && `swap ${s.box.src_link} and ${s.box.venv_link} (rename, atomic)`,
+    doApi && `swap ${s.box.api_link} (rename, atomic)`,
+    `restart ${s.box.api_unit}, /stats must report >= ${before} drawers; else roll back and restart again`,
+    "append to ~/opt/.fleet/deploys.log, prune to the last " + s.box.keep + ", unlock",
+  ].filter(Boolean) as string[];
+
+  if (opts.dryRun) {
+    for (const st of steps) log(`  → would ${st}`);
+    return;
+  }
+
+  const tmp = mkdtempSync(join(tmpdir(), "fleet-"));
+  let locked = false;
+  const swapped: string[] = [];
+  try {
+    await rstep(cfg, s, "lock", "lock");
+    locked = true;
+    let tarball = "";
+    let apiTarball = "";
+    if (doCore) {
+      log(`  → git archive ${id} and upload`);
+      const f = join(tmp, `${id}.tar.gz`);
+      gitSync(cfg.source.repo, "archive", "--format=tar.gz", "-o", f, sha);
+      tarball = await upload(s, f, `${id}.tar.gz`);
+    }
+    if (doApi) {
+      log(`  → git archive mempalace-api ${apiId} and upload`);
+      const f = join(tmp, `api-${apiId}.tar.gz`);
+      gitSync(cfg.source.api_repo, "archive", "--format=tar.gz", "-o", f, apiSha);
+      apiTarball = await upload(s, f, `api-${apiId}.tar.gz`);
+    }
+    if (doCore) {
+      log("    (building the venv takes a minute)");
+      const st = await rstep(cfg, s, `stage + smoke test ${id}`, "stage_core", { ID: id, FRESH_DEPS: opts.freshDeps ? "1" : "0" }, { TARBALL: tarball }, 600_000);
+      log(`    smoke: ${st.smoke_version}, Python/SQLite ${st.smoke_pyinfo}, memp status ${st.smoke_drawers} drawers`);
+    }
+    if (doApi) {
+      const apiApiBranch = gitSync(cfg.source.api_repo, "rev-parse", "--abbrev-ref", "HEAD");
+      await rstep(cfg, s, `stage api ${apiId}`, "stage_api", { API_ID: apiId, API_BRANCH: apiApiBranch, ID: doCore ? id : "" }, { API_TARBALL: apiTarball });
+    }
+    await rstep(cfg, s, "check no backup is running", "preswap");
+    try {
+      if (doCore) {
+        const sw = await rstep(cfg, s, `swap core ${liveCore} → ${id}`, "swap_core", { ID: id });
+        swapped.push("core");
+        log(`    core: ${sw.core_from} → ${sw.core_to}`);
+      }
+      if (doApi) {
+        const sw = await rstep(cfg, s, `swap api → ${apiId}`, "swap_api", { API_ID: apiId });
+        swapped.push("api");
+        log(`    api: ${sw.api_from} → ${sw.api_to}`);
+      }
+      await verifyApi(cfg, s, before);
+    } catch (e) {
+      if (swapped.length === 0) throw e;
+      log(`  !! ${(e as Error).message}; rolling back ${swapped.join(" + ")}`);
+      for (const comp of swapped.reverse()) await rstep(cfg, s, `roll back ${comp}`, "rollback", { COMPONENT: comp });
+      let after = "unknown";
+      try {
+        after = String(await verifyApi(cfg, s, before));
+      } catch (e2) {
+        log(`  !! the API did not come back after rollback either: ${(e2 as Error).message}`);
+      }
+      await rstep(cfg, s, "log the rollback", "finish", { LOG_MSG: `deploy ${id} FAILED, rolled back (${(e as Error).message}); drawers ${after}` });
+      throw new StepFailed(`deploy of ${id} to ${s.name} failed and was ROLLED BACK: ${(e as Error).message}`);
+    }
+    const msg = [doCore && `core ${liveCore}->${id}`, doApi && `api ${kv.api_id}->${apiId}`].filter(Boolean).join(" ");
+    await rstep(cfg, s, "log + prune", "finish", { LOG_MSG: `deploy ${msg} ok by ${userInfo().username}@${hostname()}` });
+    log(`  ✓ ${s.name} now runs ${msg}`);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+    if (locked) await remote(cfg, s, "unlock").catch(() => {});
+  }
+}
+
+async function cmdDeploy(cfg: Config, target: string, opts: Opts): Promise<number> {
+  const sha = resolveRef(cfg, opts.ref);
+  log(`deploying ${cfg.source.branch} ${sha.slice(0, 8)} from ${cfg.source.repo}`);
+  for (const s of selectServers(cfg, target)) {
+    if (!s.enabled) {
+      log(`\n== ${s.name}: disabled, skipped${s.note ? ` (${s.note})` : ""}`);
+      continue;
+    }
+    if (s.kind === "local") {
+      const head = gitSync(cfg.source.repo, "rev-parse", "HEAD");
+      log(`\n== ${s.name}: editable install from ${cfg.source.repo} at ${head.slice(0, 8)}; report only, not touched`);
+      continue;
+    }
+    try {
+      await deployBox(cfg, s, opts, sha);
+    } catch (e) {
+      console.error(`\nFAILED: ${(e as Error).message}`);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+async function cmdRollback(cfg: Config, target: string, opts: Opts): Promise<number> {
+  const [s] = selectServers(cfg, target);
+  if (target === "all") throw new Error("rollback takes one server, not all");
+  if (s.kind !== "box" || !s.enabled) throw new Error(`${s.name} is not an enabled box`);
+  log(`== ${s.name} (${s.ssh})${opts.dryRun ? " (dry run)" : ""}`);
+  const probe = await remote(cfg, s, "probe");
+  if (!probe.kv.host) throw new Error(`cannot reach ${s.name}: ${lastLines(probe.stderr, 2)}`);
+  const kv = probe.kv;
+  if (kv.lock) throw new Error(`another fleet run holds the lock on ${s.name}: ${kv.lock}`);
+  const comps = ["core", ...(opts.api ? ["api"] : [])];
+  for (const c of comps) {
+    const cur = c === "core" ? kv.core_id : kv.api_id;
+    const prev = c === "core" ? kv.core_prev : kv.api_prev;
+    if (!prev) throw new Error(`no previous ${c} recorded on ${s.name}; nothing to roll back to`);
+    log(`  plan: ${c} ${cur} → ${prev}`);
+  }
+  const before = drawerCount(kv) ?? 0;
+  if (opts.dryRun) {
+    log(`  → would lock, flip ${comps.join(" + ")}, restart ${s.box.api_unit}, check /stats >= ${before}, log, unlock`);
+    return 0;
+  }
+  await rstep(cfg, s, "lock", "lock");
+  try {
+    const moved: string[] = [];
+    for (const c of comps) {
+      const r = await rstep(cfg, s, `roll back ${c}`, "rollback", { COMPONENT: c });
+      moved.push(`${c} ${r[`${c}_from`]}->${r[`${c}_to`]}`);
+    }
+    let result = "ok";
+    try {
+      await verifyApi(cfg, s, before);
+    } catch (e) {
+      result = `API CHECK FAILED: ${(e as Error).message}`;
+    }
+    await rstep(cfg, s, "log + prune", "finish", { LOG_MSG: `rollback ${moved.join(" ")} ${result} by ${userInfo().username}@${hostname()}` });
+    log(result === "ok" ? `  ✓ ${s.name}: ${moved.join(", ")}` : `  !! ${result}`);
+    return result === "ok" ? 0 : 1;
+  } finally {
+    await remote(cfg, s, "unlock").catch(() => {});
+  }
+}
+
+// ── main ────────────────────────────────────────────────────────────────
+
+const USAGE = `usage:
+  fleet status [server|all] [--json]
+  fleet deploy <server|all> [--dry-run] [--api] [--ref <sha>] [--fresh-deps]
+  fleet rollback <server> [--api] [--dry-run]
+config: ~/.config/mempalace/fleet.servers.json (override with FLEET_CONFIG)`;
+
+async function main(argv: string[]): Promise<number> {
+  const pos: string[] = [];
+  const opts: Opts = { dryRun: false, api: false, freshDeps: false };
+  let json = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--dry-run" || a === "-n") opts.dryRun = true;
+    else if (a === "--api") opts.api = true;
+    else if (a === "--fresh-deps") opts.freshDeps = true;
+    else if (a === "--json") json = true;
+    else if (a === "--ref") opts.ref = argv[++i];
+    else if (a === "-h" || a === "--help") {
+      console.log(USAGE);
+      return 0;
+    } else if (a.startsWith("-")) throw new Error(`unknown flag ${a}\n${USAGE}`);
+    else pos.push(a);
+  }
+  const cfg = parseConfig(readFileSync(process.env.FLEET_CONFIG ?? join(homedir(), ".config/mempalace/fleet.servers.json"), "utf8"));
+  const [cmd, target] = pos;
+  if (cmd === "status") return cmdStatus(cfg, target, json);
+  if (!target) throw new Error(USAGE);
+  if (cmd === "deploy") return cmdDeploy(cfg, target, opts);
+  if (cmd === "rollback") return cmdRollback(cfg, target, opts);
+  throw new Error(USAGE);
+}
+
+main(process.argv.slice(2)).then(
+  (code) => process.exit(code),
+  (e: Error) => {
+    console.error(e instanceof StepFailed ? `FAILED: ${e.message}` : e.message);
+    process.exit(2);
+  },
+);

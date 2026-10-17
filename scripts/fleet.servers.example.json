@@ -1,0 +1,38 @@
+{
+  "source": {
+    "repo": "/Volumes/xData/codeXD/mempalace",
+    "branch": "xdev-patches",
+    "api_repo": "/Volumes/xData/codeXD/mempalace-api"
+  },
+  "servers": [
+    {
+      "name": "mini",
+      "kind": "local",
+      "enabled": true,
+      "note": "canonical palace; editable install, deploy reports only",
+      "paths": {
+        "mempalace_bin": "/Users/xdev/.pyenv/versions/3.14.6/bin/mempalace",
+        "python": "/Users/xdev/.pyenv/versions/3.14.6/bin/python",
+        "backup_dir": "/Volumes/xData/.mempalace-backups",
+        "backup_glob": "mempalace-*.tar.gz",
+        "backup_log": "/Volumes/xData/.mempalace-backups/backup.log"
+      }
+    },
+    {
+      "name": "box-a",
+      "kind": "box",
+      "enabled": true,
+      "note": "one client's palace",
+      "ssh": "xdev@box-a",
+      "backup_timer": "box-a-palace-backup.timer"
+    },
+    {
+      "name": "box-b",
+      "kind": "box",
+      "enabled": false,
+      "note": "listed but not deployed to",
+      "ssh": "xdev@box-b"
+    }
+  ],
+  "_comment": "Example only. The real list is private: ~/.config/mempalace/fleet.servers.json (or FLEET_CONFIG)."
+}

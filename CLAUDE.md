@@ -157,6 +157,29 @@ Watch the ~113 theirs-only files a merge brings in untouched: they never conflic
 conflict-driven review gives them zero attention. `.mcp.json` was one, and it changed
 behaviour by existing rather than by being called.
 
+## Deploying to the servers
+
+Every palace server (the Mini plus one Hetzner box per client) is seen and updated with
+`scripts/fleet`, run on the Mini. The server list is private and stays out of this public repo:
+`~/.config/mempalace/fleet.servers.json` (`FLEET_CONFIG` overrides); `scripts/fleet.servers.example.json`
+shows the shape.
+
+```bash
+scripts/fleet status                      # one row per server: commit, drift, versions, drawers, API, backup
+scripts/fleet deploy <box> --dry-run      # every step, nothing changed
+scripts/fleet deploy <box>                # xdev-patches HEAD; --ref <sha>, --api also ships mempalace-api
+scripts/fleet rollback <box>              # flip back to the previous venv (run again to flip forward)
+bun test scripts/fleet.test.ts
+```
+
+- Only commits on `xdev-patches` ship, from a clean checkout, as a `git archive`. Never rsync a tree to a box.
+- A box keeps `~/opt/mempalace/.venv`, `~/opt/mempalace-src` and `~/opt/mempalace-api` as symlinks to
+  `<name>.<sha>` dirs; a deploy builds a new one beside them and swaps the link by rename, so a running
+  hook never sees a half-installed venv. Venvs are built with uv on the box's own Python 3.14.6 /
+  SQLite 3.53.4, never a uv-managed Python, with dependencies pinned to the live venv (`--fresh-deps` drops that).
+- fleet touches code and venvs only, never `~/.mempalace`. The Mini is report-only (editable install).
+- State and the deploy log are in `~/opt/.fleet/` on each box.
+
 ## Key Files for Common Tasks
 
 - **Adding an MCP tool**: `mempalace/mcp_server.py` — add handler function + TOOLS dict entry
