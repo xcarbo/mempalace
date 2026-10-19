@@ -1175,6 +1175,7 @@ def _ingest_transcript(transcript_path: str):
         _log_hook_write_blocked(routing, "transcript ingest")
         return
 
+    wing = _ingest_wing(str(path))
     try:
         if routing.use_daemon:
             try:
@@ -1183,7 +1184,7 @@ def _ingest_transcript(transcript_path: str):
                     {
                         "source": str(path),
                         "mode": "convos",
-                        "wing": "sessions",
+                        "wing": wing,
                         "agent": "mempalace",
                     },
                     dedupe_key=_daemon_mine_dedupe_key(str(path), "convos"),
@@ -1208,10 +1209,10 @@ def _ingest_transcript(transcript_path: str):
                 "--mode",
                 "convos",
                 "--wing",
-                "sessions",
+                wing,
             ]
         )
-        _log(f"Transcript ingest started: {path.name}")
+        _log(f"Transcript ingest started: {path.name} -> {wing}")
     except OSError:
         pass
     except Exception as exc:
@@ -1433,20 +1434,18 @@ def _wing_from_cwd(cwd: str) -> Optional[str]:
     return None
 
 
-def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
-    """Read ``cwd`` from the first JSONL line that records it.
+def _jsonl_cwds(transcript_path: str):
+    """Yield each ``cwd`` recorded in the first 200 lines of a JSONL transcript.
 
     Claude Code stores the absolute working directory on most message
     types (tool_use, tool_result, user/assistant turns), but not all
-    (e.g. queue-operation lines lack it). Scan up to 200 lines to find
-    the first record that includes a non-empty cwd, then derive the
-    wing from its leaf path segment. Returns ``None`` if the file is
+    (e.g. queue-operation lines lack it). Yields nothing if the file is
     unreadable, empty, or contains no cwd.
     """
     try:
         path = Path(transcript_path).expanduser()
         if not path.is_file():
-            return None
+            return
         with path.open("r", encoding="utf-8", errors="replace") as f:
             for i, line in enumerate(f):
                 if i >= 200:
@@ -1458,14 +1457,19 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                     data = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
                     continue
-                cwd = data.get("cwd")
-                if not cwd or not isinstance(cwd, str):
-                    continue
-                wing = _wing_from_cwd(cwd)
-                if wing:
-                    return wing
+                cwd = data.get("cwd") if isinstance(data, dict) else None
+                if cwd and isinstance(cwd, str):
+                    yield cwd
     except OSError:
-        pass
+        return
+
+
+def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
+    """Derive the wing from the first JSONL ``cwd`` that yields one."""
+    for cwd in _jsonl_cwds(transcript_path):
+        wing = _wing_from_cwd(cwd)
+        if wing:
+            return wing
     return None
 
 
@@ -1554,6 +1558,32 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
 
     # 4. Default
     return "sessions"
+
+
+def _workstation_wing() -> str:
+    """Wing for sessions started in the home directory (no project)."""
+    if sys.platform == "darwin":
+        return "mac_workstation"
+    if sys.platform.startswith("win"):
+        return "windows_workstation"
+    return "linux_workstation"
+
+
+def _ingest_wing(transcript_path: str) -> str:
+    """Wing for a hook-ingested transcript: the project the session ran in.
+
+    Same derivation the diary uses (``_wing_from_transcript_path``: cwd first,
+    worktrees collapsed to the main repo, ``.palace-wing`` pin honoured), so a
+    project's transcripts land in the same wing as its code drawers. A session
+    started in the home directory belongs to no project and goes to the
+    machine's workstation wing.
+    """
+    home = str(Path.home()).replace("\\", "/").rstrip("/").lower()
+    for cwd in _jsonl_cwds(transcript_path):
+        if cwd.replace("\\", "/").rstrip("/").lower() == home:
+            return _workstation_wing()
+        break
+    return _wing_from_transcript_path(transcript_path)
 
 
 def hook_stop(data: dict, harness: str):
