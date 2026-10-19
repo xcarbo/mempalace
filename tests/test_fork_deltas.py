@@ -28,6 +28,13 @@ Register:
 8. An exchange drawer with no ``convo_chunker_version`` still counts as mined
    (upstream 3.11 counts it stale, so its first convo mine re-mines every
    transcript still on disk). #2591 was taken forward-only in 5878576.
+9. Hook transcript ingest files under ``hooks_cli._ingest_wing`` (the diary's
+   own derivation, so ``.palace-wing`` pins and worktrees resolve), not the
+   literal ``sessions`` wing, and not upstream's second derivation.
+10. ``wing_split`` takes its targets from ``hooks_cli`` (upstream: suffix match
+    else snake_case, which names a project differently from the hook), and
+    ``apply_split`` does not drop the source wing's hallway records (upstream
+    does; here that would empty ``hallways.json``).
 """
 
 from __future__ import annotations
@@ -240,3 +247,21 @@ def test_exchange_drawer_without_chunker_stamp_counts_as_mined(tmp_path):
         "re-mines every transcript on disk"
     )
     assert src in prefetch_mined_set(col, extract_mode="exchange")
+
+
+def test_transcript_ingest_files_under_the_derived_project_wing():
+    """Delta 9: the hook must not hard-code ``sessions`` or grow a second derivation."""
+    ingest = inspect.getsource(hooks_cli._ingest_transcript)
+    assert "_ingest_wing(" in ingest
+    assert '"sessions"' not in ingest
+    derive = inspect.getsource(hooks_cli._ingest_wing)
+    assert "_wing_from_transcript_path(" in derive
+
+
+def test_wing_split_shares_the_hooks_derivation_and_keeps_hallways():
+    """Delta 10: split targets match what a new transcript of the project gets."""
+    from mempalace import wing_split
+
+    resolve = inspect.getsource(wing_split.resolve_target)
+    assert "_wing_from_jsonl_cwd" in resolve and "_wing_from_transcript_path" in resolve
+    assert "hallway" not in inspect.getsource(wing_split.apply_split).split('"""')[2].lower()
