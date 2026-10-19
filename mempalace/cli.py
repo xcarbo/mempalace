@@ -1462,6 +1462,114 @@ def cmd_hallways(args):
         print(f"    {label}")
 
 
+def cmd_wings(args):
+    """`mempalace wings split`: one wing per source project (mempalace/wing_split.py)."""
+    from .wing_split import (
+        apply_split,
+        assert_split_pending_matches_plan,
+        existing_wings,
+        load_split_plan,
+        plan_split,
+        plan_targets,
+        save_split_plan,
+        split_pending_path,
+        split_plan_path,
+        write_split_pending,
+    )
+
+    if getattr(args, "wings_action", None) != "split":
+        print("usage: mempalace wings split --wing WING [--yes] [--plan-dir DIR]")
+        sys.exit(2)
+    palace_path = (
+        os.path.expanduser(args.palace) if getattr(args, "palace", None) else None
+    ) or MempalaceConfig().palace_path
+    config = MempalaceConfig(palace_path=palace_path)
+    wing = args.wing
+    plan_dir = getattr(args, "plan_dir", None)
+    from .palace import get_collection
+
+    def report(plan):
+        projects = plan["projects"]
+        print(
+            f"  {wing}: {len(projects)} source projects, "
+            f"{sum(p['drawers'] for p in projects.values())} drawers to move, "
+            f"{plan['unresolved']} without a project (stay)."
+        )
+        print("  Targets:")
+        targets = plan_targets(plan)
+        for target, n in list(targets.items())[:25]:
+            entries = [p for p in projects.values() if p["target"] == target]
+            hows = ", ".join(sorted({p["how"] for p in entries}))
+            new = "" if any(p.get("existing") for p in entries) else "  NEW"
+            print(f"    {target:<32} {n:>7}  ({hows}){new}")
+        if len(targets) > 25:
+            print(f"    ... {len(targets) - 25} more targets in the plan file")
+
+    plan_file = split_plan_path(config, wing, plan_dir)
+    marker = split_pending_path(config, wing, plan_dir)
+    if not getattr(args, "yes", False):
+        if os.path.exists(marker):
+            # Re-planning now would see only the drawers not yet moved and
+            # overwrite the plan the interrupted split is following, edited
+            # targets included, so the rest would split by different targets.
+            print(
+                f"  A split of {wing} was interrupted. Its plan at {plan_file} is kept as is; "
+                "re-run with --yes to finish it."
+            )
+            return
+        col = get_collection(palace_path, create=False, read_only=True)
+        plan = plan_split(col, wing, existing_wings(col))
+        if not plan["projects"]:
+            print(f"  No drawer in {wing} carries a project key; nothing to split.")
+            return
+        path = save_split_plan(config, plan, plan_dir)
+        report(plan)
+        print(f"\n  Plan saved to {path}. Edit targets there, then re-run with --yes.")
+        return
+
+    try:
+        plan = load_split_plan(config, wing, plan_dir)
+    except FileNotFoundError:
+        print(f"  No plan for {wing}. Run without --yes first to create {plan_file}.")
+        sys.exit(1)
+    except ValueError as exc:
+        print(f"  Plan at {plan_file} is invalid: {exc}")
+        sys.exit(1)
+    report(plan)
+    from .backends import CollectionNotInitializedError
+    from .palace import get_closets_collection
+
+    col = get_collection(palace_path, create=False)
+    # Only a closet collection that was never created means "no closets". Any
+    # other failure to open it must stop the command with its marker kept, or
+    # the closet phase is skipped for good.
+    try:
+        closets_col = get_closets_collection(palace_path, create=False)
+    except CollectionNotInitializedError:
+        closets_col = None
+    # The marker pins the plan targets of a split that started; it is removed
+    # only after every phase has run, and a retry must match the pinned plan.
+    if os.path.exists(marker):
+        try:
+            assert_split_pending_matches_plan(config, wing, plan, plan_dir)
+        except ValueError as exc:
+            print(f"  {exc}")
+            sys.exit(1)
+        print("  Resuming an interrupted split: finishing drawers and closets.")
+    else:
+        write_split_pending(config, wing, plan, plan_dir)
+    try:
+        result = apply_split(col, plan, closets_col=closets_col)
+    except KeyboardInterrupt:
+        print("\n  Interrupted. Rows already moved stay moved; re-run --yes to finish the rest.")
+        raise
+    os.remove(marker)
+    print(
+        f"\n  Moved {result['moved']} drawers into {len(result['per_target'])} wings and "
+        f"{result['closets_moved']} closets; {result['skipped']} skipped."
+    )
+
+
 def cmd_status(args):
     from .miner import status
 
@@ -3162,6 +3270,25 @@ def main():
     )
     p_migrate_wings.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
 
+    p_wings = sub.add_parser(
+        "wings", help="Wing maintenance: split a transcript wing by source project"
+    )
+    wings_sub = p_wings.add_subparsers(dest="wings_action")
+    p_wings_split = wings_sub.add_parser(
+        "split",
+        help="Re-key a machine-level transcript wing into one wing per source project "
+        "(plan file first; --yes applies)",
+    )
+    p_wings_split.add_argument("--wing", required=True, help="Wing to split")
+    p_wings_split.add_argument(
+        "--yes", action="store_true", help="Apply the saved plan (<plan-dir>/split-<wing>.json)"
+    )
+    p_wings_split.add_argument(
+        "--plan-dir",
+        default=None,
+        help="Directory for the plan and pending files (default: <palace>/wings)",
+    )
+
     p_locks = sub.add_parser(
         "locks",
         help="Inspect ~/.mempalace/locks — holder PID/argv/age per lock file (--gc sweeps residues)",
@@ -3468,6 +3595,7 @@ def main():
         "migrate": cmd_migrate,
         "migrate-wings": cmd_migrate_wings,
         "hallways": cmd_hallways,
+        "wings": cmd_wings,
         "status": cmd_status,
     }
     dispatch[args.command](args)
