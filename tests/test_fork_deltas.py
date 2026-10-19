@@ -35,6 +35,9 @@ Register:
     else snake_case, which names a project differently from the hook), and
     ``apply_split`` does not drop the source wing's hallway records (upstream
     does; here that would empty ``hallways.json``).
+11. ``hooks_cli._wing_from_cwd`` walks up from a subfolder cwd to the nearest
+    ``.palace-wing``/``.git`` (stopping at ``~`` and the projects root). Upstream
+    names the wing after the cwd leaf, so ``repo/src`` files under ``src``.
 """
 
 from __future__ import annotations
@@ -265,3 +268,12 @@ def test_wing_split_shares_the_hooks_derivation_and_keeps_hallways():
     resolve = inspect.getsource(wing_split.resolve_target)
     assert "_wing_from_jsonl_cwd" in resolve and "_wing_from_transcript_path" in resolve
     assert "hallway" not in inspect.getsource(wing_split.apply_split).split('"""')[2].lower()
+
+
+def test_wing_from_cwd_walks_up_to_the_project_root(tmp_path, monkeypatch):
+    """Delta 11: a subfolder session belongs to the repo that contains it."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    repo = tmp_path / "code" / "acme"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "src").mkdir()
+    assert hooks_cli._wing_from_cwd(str(repo / "src")) == "acme"

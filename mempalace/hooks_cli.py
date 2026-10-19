@@ -1397,23 +1397,58 @@ def _main_worktree_root(cwd: str) -> Optional[str]:
     return str(root) if str(root) not in ("", "/") else None
 
 
+def _walk_up_project_root(cwd_norm: str) -> Optional[str]:
+    """Nearest ancestor of ``cwd`` (cwd included) holding ``.palace-wing`` or ``.git``.
+
+    A session started in ``repo/src`` belongs to ``repo``. The walk stops before
+    the projects root (``~/code``, ``/Volumes/xData/codeXD``) and ``~``: they
+    are containers, not projects, even when something there is a git repo.
+    Returns ``None`` when nothing is found, which keeps the cwd-leaf behaviour.
+    """
+    stops = set()
+    home = Path.home()
+    for stop in (home, home / "code", Path("/Volumes/xData/codeXD")):
+        stops.add(str(stop).replace("\\", "/").rstrip("/"))
+        try:
+            stops.add(str(stop.resolve()).replace("\\", "/").rstrip("/"))
+        except OSError:
+            pass
+    current = cwd_norm
+    for _ in range(40):
+        if not current or current in stops:
+            return None
+        try:
+            base = Path(current)
+            if (base / ".palace-wing").is_file() or (base / ".git").exists():
+                return current
+        except OSError:
+            return None
+        parent = current.rsplit("/", 1)[0]
+        if parent == current or not parent:
+            return None
+        current = parent
+    return None
+
+
 def _wing_from_cwd(cwd: str) -> Optional[str]:
     """Derive the project wing from an absolute working directory."""
     cwd_norm = cwd.replace("\\", "/").rstrip("/")
     if not cwd_norm:
         return None
+    # A session in a subfolder belongs to the project that contains it.
+    found = _walk_up_project_root(cwd_norm) or cwd_norm
     # A linked git worktree must resolve to the PROJECT it belongs
     # to, not the checkout dir's name (which is often the literal
     # "worktree"). Ordinary checkouts return None and fall through
     # unchanged.
-    project_root = _main_worktree_root(cwd_norm) or cwd_norm
+    project_root = _main_worktree_root(found) or found
 
     # A .palace-wing file in the project root pins the wing
     # explicitly (bare name, no wing_ prefix); it wins over
     # leaf-segment derivation. Check the main repo root first so a
     # pin that is gitignored (and therefore absent from the linked
     # worktree) is still honoured.
-    for candidate in (project_root, cwd_norm):
+    for candidate in (project_root, found, cwd_norm):
         try:
             override = Path(candidate) / ".palace-wing"
             if override.is_file():
