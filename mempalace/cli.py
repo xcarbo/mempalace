@@ -1468,6 +1468,7 @@ def cmd_wings(args):
         apply_split,
         assert_split_pending_matches_plan,
         existing_wings,
+        filter_plan,
         load_split_plan,
         plan_split,
         plan_targets,
@@ -1519,6 +1520,10 @@ def cmd_wings(args):
             return
         col = get_collection(palace_path, create=False, read_only=True)
         plan = plan_split(col, wing, existing_wings(col))
+        allow_file = getattr(args, "allow_wings", None)
+        if allow_file:
+            with open(os.path.expanduser(allow_file), encoding="utf-8") as f:
+                plan = filter_plan(plan, {line.strip() for line in f if line.strip()})
         if not plan["projects"]:
             print(f"  No drawer in {wing} carries a project key; nothing to split.")
             return
@@ -3282,6 +3287,12 @@ def main():
     p_wings_split.add_argument("--wing", required=True, help="Wing to split")
     p_wings_split.add_argument(
         "--yes", action="store_true", help="Apply the saved plan (<plan-dir>/split-<wing>.json)"
+    )
+    p_wings_split.add_argument(
+        "--allow-wings",
+        default=None,
+        metavar="FILE",
+        help="Plan only into the wings listed in FILE (one per line); the rest stay",
     )
     p_wings_split.add_argument(
         "--plan-dir",

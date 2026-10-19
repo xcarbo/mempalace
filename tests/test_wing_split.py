@@ -289,12 +289,52 @@ def test_pending_marker_pins_the_plan_targets(tmp_path):
 
 def test_ingest_wing_is_the_project_for_a_repo_root_and_a_subfolder(tmp_path, home):
     repo = tmp_path / "code" / "acme"
-    (repo / "sub").mkdir(parents=True)
-    root = _transcript(tmp_path / "a.jsonl", str(repo))
-    sub = _transcript(tmp_path / "b.jsonl", str(repo / "sub"))
-    assert hooks_cli._ingest_wing(root) == "acme"
-    # A subfolder session takes the subfolder's own name (same as the diary).
-    assert hooks_cli._ingest_wing(sub) == "sub"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "sub" / "deep").mkdir(parents=True)
+    assert hooks_cli._ingest_wing(_transcript(tmp_path / "a.jsonl", str(repo))) == "acme"
+    # A subfolder session walks up to the repo that contains it.
+    assert hooks_cli._ingest_wing(_transcript(tmp_path / "b.jsonl", str(repo / "sub"))) == "acme"
+    deep = _transcript(tmp_path / "c.jsonl", str(repo / "sub" / "deep"))
+    assert hooks_cli._ingest_wing(deep) == "acme"
+
+
+def test_subfolder_without_a_repo_keeps_the_cwd_leaf(tmp_path, home):
+    plain = tmp_path / "scratch" / "notes"
+    plain.mkdir(parents=True)
+    assert hooks_cli._ingest_wing(_transcript(tmp_path / "a.jsonl", str(plain))) == "notes"
+
+
+def test_walk_up_honours_the_nearest_palace_wing_pin(tmp_path, home):
+    repo = tmp_path / "code" / "utilities" / "torq"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".palace-wing").write_text("torq-terminal\n")
+    nested = repo / "pkg" / "inner"
+    nested.mkdir(parents=True)
+    assert hooks_cli._ingest_wing(_transcript(tmp_path / "a.jsonl", str(nested))) == "torq-terminal"
+    (repo / "pkg" / ".palace-wing").write_text("torq-pkg\n")
+    assert hooks_cli._ingest_wing(_transcript(tmp_path / "b.jsonl", str(nested))) == "torq-pkg"
+
+
+def test_walk_up_stops_at_home_and_the_projects_root(tmp_path, home):
+    # A repo AT ~ (dotfiles) or at the projects root must not swallow its children.
+    (home / ".git").mkdir()
+    (home / "code").mkdir()
+    (home / "code" / ".git").mkdir()
+    loose = home / "code" / "loose"
+    loose.mkdir()
+    assert hooks_cli._ingest_wing(_transcript(tmp_path / "a.jsonl", str(loose))) == "loose"
+    docs = home / "Documents"
+    docs.mkdir()
+    assert hooks_cli._ingest_wing(_transcript(tmp_path / "b.jsonl", str(docs))) == "documents"
+
+
+def test_walk_up_from_a_worktree_subfolder_collapses_to_the_main_project(tmp_path, home):
+    main = tmp_path / "code" / "acme"
+    (main / ".git" / "worktrees" / "w").mkdir(parents=True)
+    wt = tmp_path / "spawn" / "worktree"
+    (wt / "src").mkdir(parents=True)
+    (wt / ".git").write_text(f"gitdir: {main}/.git/worktrees/w\n")
+    assert hooks_cli._ingest_wing(_transcript(tmp_path / "a.jsonl", str(wt / "src"))) == "acme"
 
 
 def test_ingest_wing_honours_the_palace_wing_pin_and_a_linked_worktree(tmp_path, home):
@@ -353,3 +393,38 @@ def test_cli_plans_by_default_and_applies_only_with_yes(tmp_path, monkeypatch, c
     cli.main()
     assert wing_of_a() == "acme"
     assert not (plans / "split-sessions.pending").exists()
+
+
+# ── gone worktrees and the allow-list ────────────────────────────────────────
+
+
+def test_collapse_worktree_key_finds_the_repo_either_side_of_the_marker():
+    known = {"xcmail", "mempalace", "mini-utils"}
+    assert wing_split.collapse_worktree_key(
+        "-Users-me-utilities-xcmail--worktrees-polish", known
+    ) == ("xcmail")
+    assert wing_split.collapse_worktree_key(
+        "-Users-me--herdr-worktrees-mempalace-memaudit2", known
+    ) == ("mempalace")
+    assert wing_split.collapse_worktree_key(
+        "-Users-me--herdr-worktrees-mini-utils-x-eval", known
+    ) == ("mini-utils")
+    # A branch name never becomes a wing.
+    assert (
+        wing_split.collapse_worktree_key("-Users-me--herdr-worktrees-unknown-thing", known) is None
+    )
+    assert wing_split.collapse_worktree_key("-Users-me-dev-acme", known) is None
+
+
+def test_filter_plan_keeps_only_allowed_targets_and_counts_the_rest_as_staying():
+    plan = {
+        "wing": "sessions",
+        "unresolved": 1,
+        "projects": {
+            "a": {"target": "acme", "drawers": 3},
+            "b": {"target": "junk", "drawers": 2},
+        },
+    }
+    out = wing_split.filter_plan(plan, {"acme"})
+    assert list(out["projects"]) == ["a"]
+    assert out["unresolved"] == 3

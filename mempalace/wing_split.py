@@ -227,6 +227,59 @@ def snap_to_existing(name: str, known: Iterable[str]) -> Optional[str]:
     return best
 
 
+_WORKTREE_RE = re.compile(
+    r"^(?P<repo>.*?)-+\.?(?:claude-|codex-|herdr-)?worktrees?-(?P<rest>.+)$", re.I
+)
+
+
+def collapse_worktree_key(key: str, known: Iterable[str]) -> Optional[str]:
+    """The existing wing a deleted worktree checkout belonged to, or ``None``.
+
+    ``<repo>--worktrees-<name>`` and ``.worktrees/<name>`` encode the repo in
+    front of the marker; ``~/.herdr/worktrees/<repo>-<branch>`` encodes it
+    after. Only a match against an existing wing counts, so a branch name can
+    never become a wing.
+    """
+    # The home directory's own name is a container, never a project.
+    skip = _NO_PROJECT_WINGS | {Path.home().name}
+    known = [w for w in known if w not in skip]
+    match = _WORKTREE_RE.match(key.strip())
+    if not match:
+        return None
+
+    def by_repo() -> Optional[str]:
+        repo = match.group("repo").strip("-")
+        if not repo:
+            return None
+        snapped = snap_to_existing(resolve_target(repo, [])[0], known)
+        return snapped if snapped not in skip else None
+
+    def by_branch_prefix() -> Optional[str]:
+        rest = match.group("rest").lower()
+        best: Optional[str] = None
+        for wing in known:
+            name = wing.lower()
+            if (rest == name or rest.startswith(name + "-")) and (
+                best is None or len(wing) > len(best)
+            ):
+                best = wing
+        return best
+
+    # ``~/.herdr/worktrees/<repo>-<branch>`` names the repo after the marker;
+    # everywhere else it is in front.
+    if "herdr-worktrees" in key.lower():
+        return by_branch_prefix() or by_repo()
+    return by_repo() or by_branch_prefix()
+
+
+def filter_plan(plan: dict, allowed: Iterable[str]) -> dict:
+    """Drop every project whose target is not in ``allowed``; those drawers stay."""
+    allowed = set(allowed)
+    kept = {k: v for k, v in plan["projects"].items() if v["target"] in allowed}
+    dropped = sum(int(v["drawers"]) for k, v in plan["projects"].items() if k not in kept)
+    return {**plan, "projects": kept, "unresolved": plan["unresolved"] + dropped}
+
+
 def plan_split(col, wing: str, existing_wings: Iterable[str] = ()) -> dict:
     """Group the wing's drawers by project key and resolve targets.
 
@@ -251,9 +304,11 @@ def plan_split(col, wing: str, existing_wings: Iterable[str] = ()) -> dict:
     projects = {}
     for key in sorted(counts, key=lambda k: -counts[k]):
         target, how = resolve_target(key, samples[key])
-        if how == "path":
-            snapped = snap_to_existing(target, known)
-            if snapped:
+        if how in ("path", "none"):
+            snapped = collapse_worktree_key(key, known) or (
+                snap_to_existing(target, known) if how == "path" else None
+            )
+            if snapped and snapped not in _NO_PROJECT_WINGS:
                 target, how = snapped, "existing"
         if target == wing or how == "none":
             unresolved += counts[key]
