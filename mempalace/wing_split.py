@@ -272,9 +272,26 @@ def collapse_worktree_key(key: str, known: Iterable[str]) -> Optional[str]:
     return by_repo() or by_branch_prefix()
 
 
+def frozen_wings() -> set[str]:
+    """Wings that must never receive drawers here (their home moved to another palace).
+
+    One name per line in ``$MEMPALACE_FROZEN_WINGS`` or
+    ``~/.config/mempalace/frozen-wings.txt``; ``#`` starts a comment.
+    """
+    path = os.environ.get("MEMPALACE_FROZEN_WINGS") or os.path.expanduser(
+        "~/.config/mempalace/frozen-wings.txt"
+    )
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = [line.split("#", 1)[0].strip() for line in f]
+    except OSError:
+        return set()
+    return {line for line in lines if line}
+
+
 def filter_plan(plan: dict, allowed: Iterable[str]) -> dict:
     """Drop every project whose target is not in ``allowed``; those drawers stay."""
-    allowed = set(allowed)
+    allowed = set(allowed) - frozen_wings()
     kept = {k: v for k, v in plan["projects"].items() if v["target"] in allowed}
     dropped = sum(int(v["drawers"]) for k, v in plan["projects"].items() if k not in kept)
     return {**plan, "projects": kept, "unresolved": plan["unresolved"] + dropped}
@@ -310,7 +327,7 @@ def plan_split(col, wing: str, existing_wings: Iterable[str] = ()) -> dict:
             )
             if snapped and snapped not in _NO_PROJECT_WINGS:
                 target, how = snapped, "existing"
-        if target == wing or how == "none":
+        if target == wing or how == "none" or target in frozen_wings():
             unresolved += counts[key]
             continue
         projects[key] = {
@@ -368,6 +385,11 @@ def load_split_plan(config: MempalaceConfig, wing: str, directory: Optional[str]
         if not target:
             raise ValueError(f"project {key!r} has no target wing")
         entry["target"] = sanitize_name(str(target), "wing")
+    frozen = sorted({e["target"] for e in projects.values()} & frozen_wings())
+    if frozen:
+        raise ValueError(
+            f"plan targets frozen wings (moved to another palace): {', '.join(frozen)}"
+        )
     return plan
 
 

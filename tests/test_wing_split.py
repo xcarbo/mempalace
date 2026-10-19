@@ -428,3 +428,25 @@ def test_filter_plan_keeps_only_allowed_targets_and_counts_the_rest_as_staying()
     out = wing_split.filter_plan(plan, {"acme"})
     assert list(out["projects"]) == ["a"]
     assert out["unresolved"] == 3
+
+
+# ── frozen wings: homes that moved to another palace ─────────────────────────
+
+
+def test_frozen_wings_never_become_plan_targets_and_a_stale_plan_is_refused(tmp_path, monkeypatch):
+    frozen = tmp_path / "frozen.txt"
+    frozen.write_text("# moved to pcore-hel1\nacme  # Phil\n")
+    monkeypatch.setenv("MEMPALACE_FROZEN_WINGS", str(frozen))
+    (tmp_path / "p").mkdir()
+    col = _palace(tmp_path / "p")
+    plan = wing_split.plan_split(col, "sessions", set())
+    assert [e["target"] for e in plan["projects"].values()] == ["beta"]
+    assert plan["unresolved"] == 1 + 2  # the unattributable drawer + acme's two
+
+    config = MempalaceConfig(palace_path=str(tmp_path))
+    wing_split.save_split_plan(
+        config, {"wing": "sessions", "projects": {"k": {"target": "acme", "drawers": 1}}}
+    )
+    with pytest.raises(ValueError, match="frozen wings"):
+        wing_split.load_split_plan(config, "sessions")
+    assert wing_split.filter_plan({"projects": {}, "unresolved": 0}, {"acme"})["projects"] == {}
