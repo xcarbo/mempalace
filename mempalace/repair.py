@@ -43,10 +43,21 @@ from datetime import datetime
 import re
 from typing import Callable, Iterator, Optional
 
-from chromadb.errors import NotFoundError as ChromaNotFoundError
-
-from .backends.chroma import ChromaBackend, checkpoint_wal, hnsw_capacity_status
+from .backends.chroma import (
+    ChromaBackend,
+    _chroma_not_found_error,
+    checkpoint_wal,
+    hnsw_capacity_status,
+)
 from .config import sqlite_read_uri
+
+
+def __getattr__(name: str):
+    # ``repair.ChromaNotFoundError`` predates the lazy chromadb import (fork delta
+    # in backends.chroma); keep it resolvable for callers and tests.
+    if name == "ChromaNotFoundError":
+        return _chroma_not_found_error()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 COLLECTION_NAME = "mempalace_drawers"
@@ -325,7 +336,7 @@ def _delete_collection_if_exists(backend, palace_path: str, collection_name: str
         if _is_missing_collection_value_error(exc):
             return
         raise
-    except (FileNotFoundError, ChromaNotFoundError):
+    except (FileNotFoundError, _chroma_not_found_error()):
         return
 
 

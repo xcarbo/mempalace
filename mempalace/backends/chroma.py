@@ -19,9 +19,6 @@ from numbers import Integral
 from pathlib import Path
 from typing import Any, Optional
 
-import chromadb
-from chromadb.errors import NotFoundError as _ChromaNotFoundError
-
 from ..config import sqlite_read_uri
 from ._magic import has_sqlite_magic
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
@@ -39,6 +36,33 @@ from .base import (
     UnsupportedFilterError,
     _IncludeSpec,
 )
+
+
+# chromadb is imported on first use, never at module load. Importing it costs
+# 0.3 to 0.55 s per process, and every palace in the fleet is sqlite_exact, so a
+# memp call, a hook or a write that never opens a chroma palace paid that for
+# nothing (fork delta, see tests/test_fork_deltas.py). ``chromadb`` stays
+# reachable as a module attribute through __getattr__ so callers and tests that
+# reach for ``mempalace.backends.chroma.chromadb`` still get the real module.
+def _chromadb():
+    import chromadb
+
+    return chromadb
+
+
+def _chroma_not_found_error() -> type[Exception]:
+    from chromadb.errors import NotFoundError
+
+    return NotFoundError
+
+
+def __getattr__(name: str) -> Any:
+    if name == "chromadb":
+        return _chromadb()
+    if name == "_ChromaNotFoundError":
+        return _chroma_not_found_error()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 logger = logging.getLogger(__name__)
 
@@ -2883,7 +2907,7 @@ class ChromaBackend(BaseBackend):
             # The pin lives in the client's memory, not on disk, so a new
             # client starts unpinned.
             self._hnsw_pinned.pop(palace_path, None)
-            cached = chromadb.PersistentClient(path=palace_path)
+            cached = _chromadb().PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
             # chroma.sqlite3 lazily, so the stat captured before the call
@@ -2977,12 +3001,12 @@ class ChromaBackend(BaseBackend):
         disk change. See :attr:`_quarantined_paths` for the gate logic.
         """
         ChromaBackend._prepare_palace_for_open(palace_path)
-        return chromadb.PersistentClient(path=palace_path)
+        return _chromadb().PersistentClient(path=palace_path)
 
     @staticmethod
     def backend_version() -> str:
         """Return the installed chromadb package version string."""
-        return chromadb.__version__
+        return _chromadb().__version__
 
     # ------------------------------------------------------------------
     # BaseBackend surface
@@ -3027,7 +3051,7 @@ class ChromaBackend(BaseBackend):
         if create:
             try:
                 collection = client.get_collection(collection_name, **ef_kwargs)
-            except _ChromaNotFoundError:
+            except _chroma_not_found_error():
                 collection = client.create_collection(
                     collection_name,
                     metadata=_hnsw_creation_metadata(options),
@@ -3041,7 +3065,7 @@ class ChromaBackend(BaseBackend):
         else:
             try:
                 collection = client.get_collection(collection_name, **ef_kwargs)
-            except _ChromaNotFoundError as e:
+            except _chroma_not_found_error() as e:
                 raise CollectionNotInitializedError(palace_path) from e
             except ValueError as e:
                 explanation = self._explain_ef_mismatch(e, palace_path)

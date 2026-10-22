@@ -277,3 +277,25 @@ def test_wing_from_cwd_walks_up_to_the_project_root(tmp_path, monkeypatch):
     (repo / ".git").mkdir(parents=True)
     (repo / "src").mkdir()
     assert hooks_cli._wing_from_cwd(str(repo / "src")) == "acme"
+
+
+def test_chromadb_is_not_imported_at_module_load():
+    """Delta 12: no module-level chromadb import on the memp / hook / server path.
+
+    Upstream imports chromadb eagerly in backends/chroma.py, mcp_server.py and
+    repair.py. That is 0.3 to 0.55 s per process on a fleet that is all
+    sqlite_exact, and a merge that restores any one of the three imports passes
+    every other test. Checked in a fresh interpreter, because this suite has
+    long since imported chromadb itself.
+    """
+    import subprocess
+    import sys
+
+    # Answer through the exit code: mcp_server points stdout at stderr on import.
+    probe = (
+        "import sys; import mempalace.mcp_server, mempalace.repair, mempalace.palace; "
+        "sys.exit(3 if 'chromadb' in sys.modules else 0)"
+    )
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert out.returncode != 3, "a module-level chromadb import came back"
+    assert out.returncode == 0, out.stderr[-2000:]

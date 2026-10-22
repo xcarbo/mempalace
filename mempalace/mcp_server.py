@@ -68,12 +68,12 @@ from .config import (  # noqa: E402
     strip_lone_surrogates,
 )
 from .version import __version__  # noqa: E402
-from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
 
 from .backends.chroma import (  # noqa: E402
     ChromaBackend,
     ChromaCollection,
     _HNSW_WRITE_DEFAULTS,
+    _chroma_not_found_error,
     _pin_hnsw_threads,
     hnsw_capacity_status,
     reset_hnsw_capacity_cache,
@@ -1683,7 +1683,7 @@ def _get_collection(create=False):
                 # collections, mirroring the backend-layer fix from #1262.
                 try:
                     raw = client.get_collection(_config.collection_name, **ef_kwargs)
-                except _ChromaNotFoundError:
+                except _chroma_not_found_error():
                     raw = client.create_collection(
                         _config.collection_name,
                         metadata={
@@ -6415,9 +6415,11 @@ def _installed_dist_state() -> tuple[dict[str, str], dict[str, str]]:
 
 # Baseline: what was installed at the moment this module was imported, which is
 # the moment the code being served was loaded. Every watched distribution is
-# already in sys.modules by now — mempalace by definition, chromadb through the
-# unconditional `from chromadb.errors import NotFoundError as _ChromaNotFoundError`
-# above — so this snapshot describes the code actually running.
+# read from installed metadata, not from sys.modules: mempalace is loaded by
+# definition, and chromadb is imported lazily (backends.chroma, fork delta), so on
+# a sqlite_exact palace it may never load at all. If chromadb is upgraded before
+# its first import in this process, the gate reports it stale and asks for a
+# restart, which errs the safe way.
 #
 # Both sides of the comparison are therefore read the same way, from the same
 # metadata, and that is what keeps the gate honest. Comparing a live
