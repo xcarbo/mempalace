@@ -433,17 +433,32 @@ def set_palace_embedder_identity(
     return old, new
 
 
+def get_collection_read_only(palace_path: str, **kwargs):
+    """``get_collection`` for read paths (search, status): never takes the
+    palace write lock, so it works while a mine holds it. A read-only open
+    cannot create, so ``create`` is always False."""
+    kwargs.pop("create", None)
+    return get_collection(palace_path, create=False, read_only=True, **kwargs)
+
+
 def get_closets_collection(
     palace_path: str,
     create: bool = True,
     backend: Optional[str] = None,
+    read_only: bool = False,
 ):
-    """Get the closets collection — the searchable index layer."""
+    """Get the closets collection — the searchable index layer.
+
+    Searches pass ``read_only=True``: a writable open initialises the schema
+    under the palace write lock, so a search during a mine waited 10 s on the
+    closets alone (2026-10-24).
+    """
     return get_collection(
         palace_path,
         collection_name="mempalace_closets",
-        create=create,
+        create=create and not read_only,
         backend=backend,
+        read_only=read_only,
     )
 
 

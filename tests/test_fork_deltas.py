@@ -43,6 +43,7 @@ Register:
 from __future__ import annotations
 
 import ast
+import os
 import inspect
 from pathlib import Path
 
@@ -342,3 +343,125 @@ def test_sqlite_exact_offset_page_seeks_instead_of_skipping(tmp_path):
     assert all("OFFSET" not in s for s in reads), reads
     # Metadata-only sweeps also leave the document text unread.
     assert all("document," not in s.split("FROM")[0] for s in reads), reads
+
+
+def test_convo_mine_takes_the_lock_after_its_prefetch(tmp_path, monkeypatch):
+    """Delta 14: the palace-wide prefetch runs before the mine takes the lock.
+
+    Upstream wraps the whole convo mine in mine_palace_lock, so the read-only
+    prefetch (a full-palace scan) held off every other writer, and hook diary
+    saves were dropped after their 10 s wait (134 in the Mini's hook.log by
+    2026-10-24). Same rows filed either way, so only the order shows it.
+    """
+    import contextlib
+
+    from mempalace import convo_miner
+
+    events = []
+    real_mined, real_hashes = convo_miner.prefetch_mined_set, convo_miner.prefetch_content_hashes
+
+    @contextlib.contextmanager
+    def recording_lock(palace_path, wait_seconds=0.0):
+        events.append("lock")
+        yield
+        events.append("unlock")
+
+    def mined(*a, **k):
+        events.append("prefetch_mined")
+        return real_mined(*a, **k)
+
+    def hashes(*a, **k):
+        events.append("prefetch_hashes")
+        return real_hashes(*a, **k)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(convo_miner, "mine_palace_lock", recording_lock)
+    monkeypatch.setattr(convo_miner, "prefetch_mined_set", mined)
+    monkeypatch.setattr(convo_miner, "prefetch_content_hashes", hashes)
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    (convo_dir / "chat.txt").write_text(
+        "> what is the plan\nWe ship the palace fix first, then the daemon.\n\n"
+        "> and after that\nThe batch job, then preclean uses it.\n"
+    )
+    convo_miner.mine_convos(str(convo_dir), str(tmp_path / "palace"), wing="t")
+
+    assert "lock" in events and events[-1] == "unlock", events
+    lock_at = events.index("lock")
+    assert all(
+        events.index(p) < lock_at for p in ("prefetch_mined", "prefetch_hashes") if p in events
+    )
+    assert "prefetch_mined" in events, events
+
+
+def _hold_lock_until_released(palace_path, ready_flag, release_flag):
+    """Child process: hold the palace write lock until told to let go."""
+    import os as _os
+    import time as _time
+
+    from mempalace.palace import mine_palace_lock
+
+    with mine_palace_lock(palace_path):
+        open(ready_flag, "w").close()
+        for _ in range(3000):
+            if _os.path.exists(release_flag):
+                return
+            _time.sleep(0.01)
+
+
+def test_reads_work_while_another_process_holds_the_write_lock(tmp_path, monkeypatch, capsys):
+    """Delta 15: `memp search` (plain and --json) and `memp status` never wait
+    on, or fail at, the palace write lock.
+
+    Delta 3 made _open_search_collection read-only, but plain `memp search`
+    opened through another door, the closets open in search_memories was
+    writable, and so was `memp status`. While any mine ran, plain search and
+    status raised MineAlreadyRunning and --json search waited 10 s
+    (2026-10-24). Behavioural, because the fix lives in four call sites.
+    """
+    import multiprocessing
+    import time
+
+    from mempalace import miner, searcher
+    from mempalace.palace import MineAlreadyRunning, get_backend_for_palace, get_collection
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # Every fleet palace is sqlite_exact; the suite's default backend is chroma.
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    palace = str(tmp_path / "palace")
+    col = get_collection(palace, create=True)
+    col.add(
+        ids=["d1"], documents=["ship the palace fix first"], metadatas=[{"wing": "w", "room": "r"}]
+    )
+    # Drop the cached writable handle, or the reads below would reuse it and a
+    # writable reopen would go unseen.
+    get_backend_for_palace(palace).close_palace(palace)
+
+    ready, release = str(tmp_path / "ready"), str(tmp_path / "release")
+    holder = multiprocessing.get_context("spawn").Process(
+        target=_hold_lock_until_released, args=(palace, ready, release)
+    )
+    holder.start()
+    try:
+        for _ in range(1000):
+            if os.path.exists(ready):
+                break
+            time.sleep(0.01)
+        assert os.path.exists(ready), "child never took the palace lock"
+
+        started = time.time()
+        try:
+            searcher.search("palace fix", palace)
+            result = searcher.search_memories("palace fix", palace)
+            miner.status(palace)
+        except MineAlreadyRunning as e:
+            raise AssertionError(f"FORK DELTA REVERTED: a read took the write lock: {e}")
+        out = capsys.readouterr().out
+        assert "Error opening palace" not in out, out
+        assert result.get("results"), result
+        assert time.time() - started < 8, "a read waited on the write lock"
+    finally:
+        open(release, "w").close()
+        holder.join(timeout=10)
+        if holder.is_alive():
+            holder.terminate()

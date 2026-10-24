@@ -885,7 +885,15 @@ def search(
             before_dt=before_dt,
         )
 
-    col = _open_collection_or_explain(palace_path, opener=get_collection)
+    # Read-only, like _open_search_collection: a writable open takes the
+    # palace write lock to initialise the schema, so plain `memp search`
+    # failed with MineAlreadyRunning whenever a mine was running (2026-10-24).
+    col = _open_collection_or_explain(
+        palace_path,
+        opener=lambda path, **kw: get_collection(
+            path, **{**kw, "create": False, "read_only": True}
+        ),
+    )
     if col is None:
         if not os.path.isdir(palace_path):
             raise SearchError(f"No palace found at {palace_path}")
@@ -2295,7 +2303,7 @@ def search_memories(
     # Gather closet hits (best-per-source) to build a boost lookup.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
     try:
-        closets_col = get_closets_collection(palace_path, create=False)
+        closets_col = get_closets_collection(palace_path, create=False, read_only=True)
         ckwargs = {
             "query_texts": [query],
             "n_results": n_results * 2,

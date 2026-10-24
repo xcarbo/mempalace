@@ -33,6 +33,7 @@ from .palace import (
     file_already_mined,
     get_closets_collection,
     get_collection,
+    get_collection_read_only,
     mine_lock,
     mine_palace_lock,
     purge_file_closets,
@@ -2257,7 +2258,9 @@ def status(palace_path: str):
         _print_status(total, wing_rooms)
         return
 
-    col = _open_collection_or_explain(palace_path)
+    # Read-only: status only counts and reads, and a writable open fails
+    # with MineAlreadyRunning while a mine holds the lock (2026-10-24).
+    col = _open_collection_or_explain(palace_path, opener=get_collection_read_only)
     if col is None:
         return
 

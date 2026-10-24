@@ -8,6 +8,7 @@ Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
 Same palace as project mining. Different ingest strategy.
 """
 
+import contextlib
 import errno
 import os
 import sys
@@ -1070,6 +1071,14 @@ def mine_convos(
     corrupt anything, and skipping the lock lets dry-run probes coexist
     with a live mine.
 
+    Fork delta: the lock is taken after the read-only prefetch, not before
+    it. The prefetch scans the whole palace (seconds on a 328k-drawer palace,
+    once 30 minutes); holding the lock through it shut out every other
+    writer, and hook diary saves gave up after their 10 s wait. Taking it
+    later is safe: ``_file_chunks_locked`` re-checks each file under the lock,
+    and the chunk-level content gate catches a conversation another mine
+    filed in between. A second mine still raises ``MineAlreadyRunning``.
+
     Chunking parameters (chunk_size, min_chunk_size) are read from
     MempalaceConfig inside :func:`_mine_convos_impl` so `config.json`
     governs both this path and the project-file miner in `miner.py`.
@@ -1086,7 +1095,7 @@ def mine_convos(
             include_subagents=include_subagents,
         )
 
-    with mine_palace_lock(palace_path):
+    with contextlib.ExitStack() as held:
         return _mine_convos_impl(
             convo_dir,
             palace_path,
@@ -1096,6 +1105,7 @@ def mine_convos(
             dry_run=dry_run,
             extract_mode=extract_mode,
             include_subagents=include_subagents,
+            take_write_lock=lambda: held.enter_context(mine_palace_lock(palace_path)),
         )
 
 
@@ -1229,7 +1239,11 @@ def _mine_convos_impl(
     dry_run: bool = False,
     extract_mode: str = "exchange",
     include_subagents: bool = False,
+    take_write_lock=None,
 ):
+    """Mine ``convo_dir``. ``take_write_lock``, when given, is called once the
+    read-only prefetch is done; it takes the palace write lock for the rest of
+    the run (see :func:`mine_convos`)."""
     from .config import MempalaceConfig
 
     palace_config = MempalaceConfig(palace_path=palace_path)
@@ -1294,6 +1308,8 @@ def _mine_convos_impl(
         if collection is not None and palace_config.convo_content_dedup
         else {}
     )
+    if take_write_lock is not None:
+        take_write_lock()
 
     total_drawers = 0
     total_dedup_skipped = 0

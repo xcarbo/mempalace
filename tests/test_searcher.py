@@ -18,7 +18,6 @@ from mempalace.searcher import (
     SearchError,
     _result_drawer_id,
     build_where_filter,
-    get_collection,
     search,
     search_memories,
 )
@@ -730,7 +729,16 @@ class TestSearchCLI:
                 search("anything", fake_palace_path)
 
         mock_probe.assert_not_called()
-        mock_open.assert_called_once_with(fake_palace_path, opener=get_collection)
+        mock_open.assert_called_once()
+        assert mock_open.call_args.args == (fake_palace_path,)
+        # Fork delta 15: the CLI search opens read-only, so it never waits on
+        # (or fails at) the palace write lock while a mine runs.
+        opener = mock_open.call_args.kwargs["opener"]
+        with patch("mempalace.searcher.get_collection") as mock_get:
+            opener(fake_palace_path, collection_name="c", create=True)
+        mock_get.assert_called_once_with(
+            fake_palace_path, collection_name="c", create=False, read_only=True
+        )
 
 
 # ── _tokenize stop-word filter ─────────────────────────────────────────
