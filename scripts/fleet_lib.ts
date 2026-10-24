@@ -12,6 +12,7 @@ export interface BoxPaths {
   expect_python: string;
   expect_sqlite: string;
   api_unit: string;
+  daemon_unit: string;
   api_port: number;
   keep: number;
   extra_packages: string[];
@@ -57,6 +58,7 @@ const BOX_DEFAULTS: BoxPaths = {
   expect_python: "3.14.6",
   expect_sqlite: "3.53.4",
   api_unit: "mempalace-api.service",
+  daemon_unit: "mempalace-daemon.service",
   api_port: 4109,
   keep: 3,
   extra_packages: ["fastapi>=0.115", "uvicorn[standard]>=0.34"],

@@ -131,6 +131,7 @@ cmd_probe() {
   emit pyinfo "$("$py" -c 'import sys, sqlite3; print(sys.version.split()[0], sqlite3.sqlite_version)' 2>&1 | head -1 || true)"
   emit pyhome "$(sed -n 's/^home = //p' "$VENV_LINK/pyvenv.cfg" 2>/dev/null || true)"
   emit api_active "$(systemctl --user is-active "$API_UNIT" 2>/dev/null || true)"
+  emit daemon_active "$(systemctl --user is-active "${DAEMON_UNIT:-}" 2>/dev/null || true)"
   emit api_drawers "$(api_drawers)"
   emit api_id "$(link_id "$API_LINK" mempalace-api.)"
   emit api_prev "$(cat "$STATE_DIR/api.prev" 2>/dev/null || true)"
@@ -315,6 +316,13 @@ cmd_restart_api() {
   done
   [ -n "$n" ] || die "$API_UNIT gave no /stats answer within 60s"
   emit api_drawers "$n"
+  # The write-queue daemon imports the venv once, at start: restart it onto
+  # the new code too. Only where it is installed; a box without one is fine.
+  if [ -n "${DAEMON_UNIT:-}" ] && systemctl --user is-enabled "$DAEMON_UNIT" >/dev/null 2>&1; then
+    systemctl --user restart "$DAEMON_UNIT"
+    sleep 2
+    emit daemon_active "$(systemctl --user is-active "$DAEMON_UNIT" 2>/dev/null || true)"
+  fi
 }
 
 cmd_finish() { # log + prune

@@ -184,6 +184,24 @@ bun test scripts/fleet.test.ts
   hook never sees a half-installed venv. Venvs are built with uv on the box's own Python 3.14.6 /
   SQLite 3.53.4, never a uv-managed Python, with dependencies pinned to the live venv (`--fresh-deps` drops that).
 - fleet touches code and venvs only, never `~/.mempalace`. The Mini is report-only (editable install).
+- fleet restarts `mempalace-daemon.service` after the API on any box where it is enabled.
+
+## Write queue (daemon + batches, this fork)
+
+- `mempalace daemon` is a **shared write queue**, not the palace owner (fork delta 16). It runs as
+  `com.mempalace.daemon` on the Mini and `mempalace-daemon.service` on each box (unit files in
+  claude-mech `machines/<machine>/`). It imports mempalace once at start: after a commit on the Mini,
+  `launchctl kickstart -k gui/$(id -u)/com.mempalace.daemon`.
+- `memp submit <batch.json|->` puts a batch in the on-disk queue and prints `queued <job-id>` at
+  once, daemon up or not; `memp job <id>` shows queued / running / succeeded / failed.
+- A batch: `{"wing": "<w>", "steps": [{"id": "f1", "tool": "add-drawer", "args": {...}},
+  {"tool": "kg-add", "args": {"subject": "action:${f1.drawer_id}", ...}},
+  {"tool": "update-drawer", "args": {..., "if_unchanged": "<sha>"}, "on_conflict": "park"}]}`.
+  Steps run in order under one palace lock (a busy palace re-queues the whole batch, nothing
+  written). `${id.field}` reads an earlier step's result. A refused check-and-set marked `park` is
+  filed verbatim as an open follow-up in the batch's wing. Deletes are not batchable.
+- Hooks hand their diary saves and transcript ingests to the daemon when it is up with
+  `"write_routing": {"hooks": "prefer"}` in `~/.mempalace/config.json`, and write directly when not.
 - State and the deploy log are in `~/opt/.fleet/` on each box.
 
 ## Key Files for Common Tasks

@@ -86,6 +86,7 @@ function boxEnv(s: Server, cfg: Config): { vars: Record<string, string>; paths: 
       EXPECT_PY: b.expect_python,
       EXPECT_SQLITE: b.expect_sqlite,
       API_UNIT: b.api_unit,
+      DAEMON_UNIT: b.daemon_unit,
       API_PORT: String(b.api_port),
       KEEP: String(b.keep),
       EXTRA_PKGS: b.extra_packages.join(" "),
@@ -317,6 +318,10 @@ async function verifyApi(cfg: Config, s: Server, before: number): Promise<number
   const kv = await rstep(cfg, s, `restart ${s.box.api_unit} and wait for /stats`, "restart_api", {}, {}, 90_000);
   const after = Number(kv.api_drawers);
   log(`    /stats: ${after} drawers (was ${before})`);
+  if (kv.daemon_active) {
+    log(`    ${s.box.daemon_unit}: restarted, ${kv.daemon_active}`);
+    if (kv.daemon_active !== "active") throw new StepFailed(`${s.box.daemon_unit} is ${kv.daemon_active} after the restart`);
+  }
   // Hooks may file drawers during a deploy, so more is fine; fewer is not.
   if (after < before) throw new StepFailed(`/stats reports ${after} drawers after the swap, ${before} before`);
   return after;

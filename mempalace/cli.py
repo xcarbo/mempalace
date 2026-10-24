@@ -1242,6 +1242,90 @@ def _submit_daemon_cli_job(kind: str, payload: dict, args, *, background: bool) 
         sys.exit(exit_code)
 
 
+def cmd_submit(args):
+    """Queue a batch of palace writes and return at once (fork).
+
+    The batch goes straight into the daemon's on-disk queue, so the reply is a
+    confirmation that it is durably queued whether or not the daemon is up; a
+    running daemon picks it up within half a second, a stopped one when it
+    starts. The batch is checked first, so a malformed one is refused here.
+    """
+    import hashlib
+    import json
+
+    from .daemon import (
+        HOOK_PROBE_TIMEOUT,
+        QueueStore,
+        canonical_palace_path,
+        get_client_if_running,
+        queue_path,
+    )
+    from .service import validate_batch
+
+    try:
+        raw = sys.stdin.read() if args.file == "-" else Path(args.file).read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"mempalace: cannot read batch {args.file}: {e}", file=sys.stderr)
+        sys.exit(2)
+    if not isinstance(payload, dict):
+        print("mempalace: a batch is a JSON object with a 'steps' list", file=sys.stderr)
+        sys.exit(2)
+    try:
+        validate_batch(payload)
+    except ValueError as e:
+        print(f"mempalace: batch refused, nothing queued: {e}", file=sys.stderr)
+        sys.exit(2)
+    palace = canonical_palace_path(args.palace or MempalaceConfig().palace_path)
+    payload["palace_path"] = palace
+    # The same batch sent twice while it waits is queued once.
+    digest = hashlib.sha256(
+        json.dumps({k: payload.get(k) for k in ("wing", "steps")}, sort_keys=True).encode()
+    ).hexdigest()[:24]
+    previous_umask = os.umask(0o077)  # the queue holds verbatim drawer text
+    try:
+        job = QueueStore(queue_path(palace)).enqueue("batch", payload, dedupe_key=f"batch:{digest}")
+    finally:
+        os.umask(previous_umask)
+    running = get_client_if_running(palace, health_timeout=HOOK_PROBE_TIMEOUT) is not None
+    if args.json:
+        print(json.dumps({"job_id": job.id, "state": job.state, "daemon_running": running}))
+        return
+    print(f"queued {job.id}")
+    if not running:
+        print("  the daemon is not running; this is filed when it starts", file=sys.stderr)
+
+
+def cmd_job(args):
+    """Show one queued job: queued, running, succeeded or failed (fork)."""
+    import json
+
+    from .daemon import DaemonError, QueueStore, canonical_palace_path, job_to_dict, queue_path
+
+    palace = canonical_palace_path(args.palace or MempalaceConfig().palace_path)
+    qpath = queue_path(palace)
+    try:
+        if not qpath.exists():
+            raise DaemonError(f"unknown job id: {args.job_id}")
+        job = QueueStore(qpath).get(args.job_id)
+    except DaemonError as e:
+        print(f"mempalace: {e}", file=sys.stderr)
+        sys.exit(1)
+    if args.json:
+        print(json.dumps(job_to_dict(job, include_payload=False), indent=2))
+        return
+    result = job.result or {}
+    print(f"{job.id}  {job.kind}  {job.state}")
+    if job.state == "queued" and (job.error or {}).get("error_class"):
+        print("  waiting: the palace was busy; it is retried shortly")
+    if result.get("done") is not None:
+        print(f"  written: {len(result['done'])} step(s)")
+    for p in result.get("parked") or []:
+        print(f"  parked: step {p['step']} conflicted; follow-up {p.get('parked_as')}")
+    if job.state == "failed":
+        print(f"  error: {(job.error or {}).get('message') or result.get('error')}")
+
+
 def cmd_daemon(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     backend = _backend_arg(args)
@@ -3185,6 +3269,16 @@ def main():
     )
 
     # daemon
+    p_submit = sub.add_parser(
+        "submit",
+        help="Queue a batch of palace writes and return at once (prints the job id)",
+    )
+    p_submit.add_argument("file", help="Batch JSON file, or - for stdin")
+    p_submit.add_argument("--json", action="store_true", help="Print the reply as JSON")
+    p_job = sub.add_parser("job", help="Show a queued job's state")
+    p_job.add_argument("job_id", help="Job id printed by `submit`")
+    p_job.add_argument("--json", action="store_true", help="Print the job as JSON")
+
     p_daemon = sub.add_parser("daemon", help="Manage the opt-in long-lived daemon")
     daemon_sub = p_daemon.add_subparsers(dest="daemon_action")
     p_daemon_start = daemon_sub.add_parser("start", help="Start the daemon")
@@ -3608,6 +3702,8 @@ def main():
         "hallways": cmd_hallways,
         "wings": cmd_wings,
         "status": cmd_status,
+        "submit": cmd_submit,
+        "job": cmd_job,
     }
     dispatch[args.command](args)
 

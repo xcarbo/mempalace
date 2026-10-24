@@ -11,7 +11,9 @@ from __future__ import annotations
 import contextlib
 import io
 import functools
+import json
 import os
+import re
 import sys
 from typing import Any
 
@@ -144,6 +146,8 @@ def execute_job(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
             return run_diary_write(payload)
         if kind == "mcp_tool":
             return run_mcp_tool(payload)
+        if kind == "batch":
+            return run_batch(payload)
         return {"success": False, "error": f"unknown daemon job kind: {kind}", "exit_code": 2}
 
     # Per-job env isolation: snapshot the backend/palace env vars and restore
@@ -493,3 +497,171 @@ def print_job_result(result: dict[str, Any]) -> int:
     if not result.get("success", True) and result.get("error") and not stderr:
         print(f"mempalace: {result['error']}", file=sys.stderr)
     return int(result.get("exit_code", 0 if result.get("success", True) else 1) or 0)
+
+
+# ── batch: one job, several writes (fork) ─────────────────────────────────
+#
+# A save such as /preclean is several writes in order: drawers, a KG triple
+# for each new drawer id, then a check-and-set roadmap update. A batch carries
+# them as one job so the agent submits once and moves on. Deletes are not
+# batchable: a fire-and-forget queue is the wrong place for them.
+
+BATCH_TOOLS = frozenset(
+    {
+        "mempalace_add_drawer",
+        "mempalace_update_drawer",
+        "mempalace_kg_add",
+        "mempalace_kg_invalidate",
+        "mempalace_diary_write",
+        "mempalace_checkpoint",
+    }
+)
+
+_STEP_REF = re.compile(r"\$\{([A-Za-z0-9_-]+)\.([A-Za-z0-9_]+)\}")
+
+
+def batch_tool_name(name: str) -> str:
+    """``add-drawer`` / ``add_drawer`` / ``mempalace_add_drawer`` -> the MCP name."""
+    name = str(name or "").strip().replace("-", "_")
+    return name if name.startswith("mempalace_") else f"mempalace_{name}"
+
+
+def validate_batch(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Check a batch before it is queued; return its normalised steps.
+
+    Raises ValueError naming the first bad step, so ``memp submit`` refuses a
+    malformed batch at once instead of the daemon failing it later.
+    """
+    steps = payload.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("a batch needs a non-empty 'steps' list")
+    wing = payload.get("wing")
+    if wing is not None and (not isinstance(wing, str) or not wing.strip()):
+        raise ValueError("'wing' must be a non-empty string")
+    seen: set[str] = set()
+    out = []
+    for i, step in enumerate(steps, 1):
+        if not isinstance(step, dict):
+            raise ValueError(f"step {i} is not an object")
+        tool = batch_tool_name(step.get("tool"))
+        if tool not in BATCH_TOOLS:
+            allowed = ", ".join(sorted(t.removeprefix("mempalace_") for t in BATCH_TOOLS))
+            raise ValueError(f"step {i}: tool {step.get('tool')!r} is not batchable ({allowed})")
+        args = step.get("args") or {}
+        if not isinstance(args, dict):
+            raise ValueError(f"step {i}: 'args' must be an object")
+        step_id = step.get("id")
+        if step_id is not None:
+            if not isinstance(step_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", step_id):
+                raise ValueError(f"step {i}: 'id' must be letters, digits, '-' or '_'")
+            if step_id in seen:
+                raise ValueError(f"step {i}: id {step_id!r} is used twice")
+        for ref, _field in _STEP_REF.findall(json.dumps(args)):
+            if ref not in seen:
+                raise ValueError(f"step {i}: ${{{ref}.…}} names no earlier step")
+        on_conflict = step.get("on_conflict", "fail")
+        if on_conflict not in ("fail", "park"):
+            raise ValueError(f"step {i}: on_conflict must be 'fail' or 'park'")
+        if on_conflict == "park" and not wing:
+            raise ValueError(f"step {i}: on_conflict 'park' needs the batch 'wing'")
+        if step_id:
+            seen.add(step_id)
+        out.append({"id": step_id, "tool": tool, "args": args, "on_conflict": on_conflict})
+    return out
+
+
+def _resolve_refs(value: Any, results: dict[str, dict[str, Any]]) -> Any:
+    if isinstance(value, str):
+        return _STEP_REF.sub(lambda m: str(results[m.group(1)][m.group(2)]), value)
+    if isinstance(value, dict):
+        return {k: _resolve_refs(v, results) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_resolve_refs(v, results) for v in value]
+    return value
+
+
+def _park_conflict(tools: dict, wing: str, step: dict, args: dict, result: dict) -> dict:
+    """File a refused check-and-set write as an open follow-up, verbatim."""
+    from datetime import date
+
+    drawer_id = args.get("drawer_id") or result.get("drawer_id")
+    note = (
+        "# Action: Merge a parked update (it conflicted)\n"
+        "Status: open\n"
+        f"Added: {date.today().isoformat()}\n"
+        f"Project: {wing}\n\n"
+        f"A queued update to drawer {drawer_id} was not written: the drawer changed "
+        f"after it was read (expected {str(result.get('expected_sha256'))[:12]}, "
+        f"found {str(result.get('actual_sha256'))[:12]}). The proposed content is "
+        "below, verbatim. Re-read the drawer, merge, and write it with "
+        "`memp update-drawer --if-unchanged`.\n\n---\n\n"
+        f"{args.get('content') or ''}"
+    )
+    parked = tools["mempalace_add_drawer"]["handler"](
+        wing=wing, room="follow-ups", content=note, added_by="batch-park"
+    )
+    if parked.get("success") and parked.get("drawer_id"):
+        tools["mempalace_kg_add"]["handler"](
+            subject=f"action:{parked['drawer_id']}", predicate="belongs_to", object=f"wing_{wing}"
+        )
+    return parked
+
+
+@_restores_palace_env
+def run_batch(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run a batch's steps in order under one palace lock.
+
+    The lock is taken once, non-blocking, before the first step: a busy palace
+    is a refusal with nothing written, so the daemon re-queues the whole batch
+    unspent. Holding it throughout means a batch never lands half-filed
+    because another writer cut in. A step that fails stops the batch; the
+    result lists what was written. A check-and-set conflict on a step marked
+    ``on_conflict: park`` files the proposed content as an open follow-up in
+    the batch's wing and carries on.
+    """
+    from .mcp_server import TOOLS
+    from .palace import MineAlreadyRunning, mine_palace_lock
+
+    try:
+        steps = validate_batch(payload)
+    except ValueError as exc:
+        return {"success": False, "error": str(exc), "exit_code": 2}
+    palace_path = os.path.abspath(
+        os.path.expanduser(payload.get("palace_path") or MempalaceConfig().palace_path)
+    )
+    os.environ["MEMPALACE_PALACE_PATH"] = palace_path
+    _apply_backend(payload.get("backend"))
+    wing = payload.get("wing")
+    done: list[dict[str, Any]] = []
+    parked: list[dict[str, Any]] = []
+    results: dict[str, dict[str, Any]] = {}
+    try:
+        with mine_palace_lock(palace_path):
+            for n, step in enumerate(steps, 1):
+                args = _resolve_refs(step["args"], results)
+                result = TOOLS[step["tool"]]["handler"](**args)
+                if not isinstance(result, dict):
+                    result = {"success": True, "value": result}
+                ok = result.get("success", "error" not in result)
+                summary = {"step": n, "id": step["id"], "tool": step["tool"]}
+                if not ok and result.get("conflict") and step["on_conflict"] == "park":
+                    park = _park_conflict(TOOLS, wing, step, args, result)
+                    parked.append({**summary, "parked_as": park.get("drawer_id")})
+                    continue
+                if not ok:
+                    return {
+                        "success": False,
+                        "error": f"step {n} ({step['tool']}) failed: {result.get('error')}",
+                        "done": done,
+                        "parked": parked,
+                        "exit_code": 1,
+                    }
+                if step["id"]:
+                    results[step["id"]] = result
+                done.append({**summary, "drawer_id": result.get("drawer_id")})
+    except MineAlreadyRunning as exc:
+        if done:
+            # Raised after a write (a nested open): report it, never re-queue it.
+            return {"success": False, "error": str(exc), "done": done, "exit_code": 1}
+        return _lock_refusal_result(exc)
+    return {"success": True, "done": done, "parked": parked, "exit_code": 0}
