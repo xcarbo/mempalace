@@ -173,6 +173,174 @@ def test_busy_palace_refuses_the_whole_batch_with_nothing_written(batch_palace, 
     assert mcp_server.tool_list_drawers(wing="proj").get("drawers") in ([], None)
 
 
+# ── batch robustness ─────────────────────────────────────────────────────
+
+
+def _step(content="We chose the shared queue.", **kw):
+    return {
+        "tool": "add-drawer",
+        "args": {"wing": "proj", "room": "decisions", "content": content},
+        **kw,
+    }
+
+
+@pytest.mark.parametrize(
+    "steps, message",
+    [
+        (
+            [_step(id="d1"), {"tool": "kg-add", "args": {"subject": "${d1.drawerid}"}}],
+            "no field 'drawerid'",
+        ),
+        (
+            [
+                {
+                    "tool": "update-drawer",
+                    "id": "r",
+                    "args": {"drawer_id": "x", "content": "y", "if_unchanged": "0" * 64},
+                    "on_conflict": "park",
+                },
+                {"tool": "kg-add", "args": {"subject": "${r.drawer_id}"}},
+            ],
+            "may be parked",
+        ),
+    ],
+)
+def test_validate_batch_refuses_references_it_can_prove_bad(steps, message):
+    with pytest.raises(ValueError, match=message):
+        service.validate_batch({"wing": "proj", "steps": steps})
+
+
+def test_a_bad_reference_at_run_time_fails_with_the_done_list(batch_palace, monkeypatch):
+    # Field checks are static and cover the known tools; anything they miss
+    # must still fail cleanly at run time.
+    monkeypatch.setattr(service, "_BATCH_REF_FIELDS", {})
+    result = service.run_batch(
+        {
+            "palace_path": batch_palace,
+            "steps": [_step(id="d1"), {"tool": "kg-add", "args": {"subject": "${d1.nope}"}}],
+        }
+    )
+    assert result["success"] is False
+    assert result["failed_step"] == 2
+    assert "${d1.nope}" in result["error"]
+    assert len(result["done"]) == 1 and result["done"][0]["drawer_id"]
+
+
+def test_a_handler_exception_mid_batch_records_what_was_written(batch_palace, monkeypatch):
+    def boom(**kwargs):
+        raise RuntimeError("kg is gone")
+
+    monkeypatch.setitem(mcp_server.TOOLS["mempalace_kg_add"], "handler", boom)
+    result = service.run_batch(
+        {
+            "palace_path": batch_palace,
+            "steps": [
+                _step(id="d1"),
+                {"tool": "kg-add", "args": {"subject": "action:${d1.drawer_id}"}},
+                _step(content="never reached"),
+            ],
+        }
+    )
+    assert result["success"] is False
+    assert result["failed_step"] == 2
+    assert "RuntimeError" in result["error"] and "kg is gone" in result["error"]
+    assert [d["step"] for d in result["done"]] == [1]
+    assert result["done"][0]["drawer_id"]
+
+
+def _conflicting_update(roadmap_id, content):
+    return {
+        "tool": "update-drawer",
+        "args": {"drawer_id": roadmap_id, "content": content, "if_unchanged": "0" * 64},
+        "on_conflict": "park",
+    }
+
+
+def test_a_park_whose_kg_link_fails_still_counts_as_parked(batch_palace, monkeypatch):
+    added = service.run_batch({"palace_path": batch_palace, "steps": [_step()]})
+    roadmap_id = added["done"][0]["drawer_id"]
+
+    def boom(**kwargs):
+        raise RuntimeError("kg is locked")
+
+    monkeypatch.setitem(mcp_server.TOOLS["mempalace_kg_add"], "handler", boom)
+    result = service.run_batch(
+        {
+            "palace_path": batch_palace,
+            "wing": "proj",
+            "steps": [_conflicting_update(roadmap_id, "new plan"), _step(content="still runs")],
+        }
+    )
+    assert result["success"] is True, result
+    assert result["parked"][0]["parked_as"]
+    assert len(result["done"]) == 1
+
+
+def test_a_lock_refusal_after_a_park_is_not_requeued(batch_palace, monkeypatch):
+    from mempalace.palace import MineAlreadyRunning
+
+    added = service.run_batch({"palace_path": batch_palace, "steps": [_step()]})
+    roadmap_id = added["done"][0]["drawer_id"]
+    real_add = mcp_server.TOOLS["mempalace_add_drawer"]["handler"]
+
+    def add_then_refuse(**kwargs):
+        if kwargs.get("room") == "decisions":
+            raise MineAlreadyRunning("nested open refused")
+        return real_add(**kwargs)
+
+    monkeypatch.setitem(mcp_server.TOOLS["mempalace_add_drawer"], "handler", add_then_refuse)
+    result = service.run_batch(
+        {
+            "palace_path": batch_palace,
+            "wing": "proj",
+            "steps": [_conflicting_update(roadmap_id, "new plan"), _step()],
+        }
+    )
+    assert result["success"] is False
+    assert result.get("error_class") != daemon.LOCK_REFUSAL_ERROR_CLASS, "would re-run the park"
+
+
+def test_a_park_that_cannot_be_filed_fails_the_batch_and_keeps_the_text(batch_palace, monkeypatch):
+    added = service.run_batch({"palace_path": batch_palace, "steps": [_step()]})
+    roadmap_id = added["done"][0]["drawer_id"]
+    proposed = "# Roadmap\n\nThe new plan, exactly as written."
+
+    real_add = mcp_server.TOOLS["mempalace_add_drawer"]["handler"]
+
+    def add_refusing_follow_ups(**kwargs):
+        if kwargs.get("room") == "follow-ups":
+            return {"success": False, "error": "palace busy, write not filed"}
+        return real_add(**kwargs)
+
+    monkeypatch.setitem(
+        mcp_server.TOOLS["mempalace_add_drawer"], "handler", add_refusing_follow_ups
+    )
+    result = service.run_batch(
+        {
+            "palace_path": batch_palace,
+            "wing": "proj",
+            "steps": [
+                {
+                    "tool": "update-drawer",
+                    "args": {
+                        "drawer_id": roadmap_id,
+                        "content": proposed,
+                        "if_unchanged": "0" * 64,
+                    },
+                    "on_conflict": "park",
+                },
+                _step(content="never reached"),
+            ],
+        }
+    )
+    assert result["success"] is False
+    assert result["failed_step"] == 1
+    assert "park" in result["error"]
+    assert result["parked"] == []
+    assert result["unfiled_content"] == proposed
+    assert result["done"] == []
+
+
 # ── memp submit / memp job ───────────────────────────────────────────────
 
 

@@ -519,6 +519,17 @@ BATCH_TOOLS = frozenset(
 
 _STEP_REF = re.compile(r"\$\{([A-Za-z0-9_-]+)\.([A-Za-z0-9_]+)\}")
 
+# Fields a later step may read from an earlier one's result, per tool: the keys
+# its success result carries. A ``${id.field}`` outside this set is refused at
+# submit time; tools not listed are checked only when the batch runs.
+_BATCH_REF_FIELDS = {
+    "mempalace_add_drawer": {"drawer_id", "wing", "room", "chunks", "chunk_ids", "reason"},
+    "mempalace_update_drawer": {"drawer_id", "wing", "room", "chunks", "chunk_ids", "noop"},
+    "mempalace_kg_add": {"triple_id", "fact"},
+    "mempalace_kg_invalidate": {"fact", "ended"},
+    "mempalace_diary_write": {"entry_id", "agent", "topic", "timestamp", "chunks", "chunk_ids"},
+}
+
 
 def batch_tool_name(name: str) -> str:
     """``add-drawer`` / ``add_drawer`` / ``mempalace_add_drawer`` -> the MCP name."""
@@ -538,7 +549,7 @@ def validate_batch(payload: dict[str, Any]) -> list[dict[str, Any]]:
     wing = payload.get("wing")
     if wing is not None and (not isinstance(wing, str) or not wing.strip()):
         raise ValueError("'wing' must be a non-empty string")
-    seen: set[str] = set()
+    seen: dict[str, dict[str, str]] = {}
     out = []
     for i, step in enumerate(steps, 1):
         if not isinstance(step, dict):
@@ -556,23 +567,49 @@ def validate_batch(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 raise ValueError(f"step {i}: 'id' must be letters, digits, '-' or '_'")
             if step_id in seen:
                 raise ValueError(f"step {i}: id {step_id!r} is used twice")
-        for ref, _field in _STEP_REF.findall(json.dumps(args)):
+        for ref, field in _STEP_REF.findall(json.dumps(args)):
             if ref not in seen:
                 raise ValueError(f"step {i}: ${{{ref}.…}} names no earlier step")
+            if seen[ref]["on_conflict"] == "park":
+                # A parked step files a follow-up instead and has no result.
+                raise ValueError(
+                    f"step {i}: ${{{ref}.{field}}} reads a step that may be parked "
+                    "(on_conflict 'park'), which leaves no result to read"
+                )
+            fields = _BATCH_REF_FIELDS.get(seen[ref]["tool"])
+            if fields is not None and field not in fields:
+                raise ValueError(
+                    f"step {i}: ${{{ref}.{field}}}: step {ref!r} "
+                    f"({seen[ref]['tool'].removeprefix('mempalace_')}) has no field {field!r} "
+                    f"({', '.join(sorted(fields))})"
+                )
         on_conflict = step.get("on_conflict", "fail")
         if on_conflict not in ("fail", "park"):
             raise ValueError(f"step {i}: on_conflict must be 'fail' or 'park'")
         if on_conflict == "park" and not wing:
             raise ValueError(f"step {i}: on_conflict 'park' needs the batch 'wing'")
         if step_id:
-            seen.add(step_id)
+            seen[step_id] = {"tool": tool, "on_conflict": on_conflict}
         out.append({"id": step_id, "tool": tool, "args": args, "on_conflict": on_conflict})
     return out
 
 
+class _BatchRefError(ValueError):
+    """A ``${id.field}`` with no value when its step runs."""
+
+
+def _ref_value(match: re.Match, results: dict[str, dict[str, Any]]) -> str:
+    step_id, field = match.groups()
+    if step_id not in results:
+        raise _BatchRefError(f"{match.group(0)}: step {step_id!r} has no result")
+    if field not in results[step_id]:
+        raise _BatchRefError(f"{match.group(0)}: step {step_id!r} returned no {field!r}")
+    return str(results[step_id][field])
+
+
 def _resolve_refs(value: Any, results: dict[str, dict[str, Any]]) -> Any:
     if isinstance(value, str):
-        return _STEP_REF.sub(lambda m: str(results[m.group(1)][m.group(2)]), value)
+        return _STEP_REF.sub(lambda m: _ref_value(m, results), value)
     if isinstance(value, dict):
         return {k: _resolve_refs(v, results) for k, v in value.items()}
     if isinstance(value, list):
@@ -601,9 +638,14 @@ def _park_conflict(tools: dict, wing: str, step: dict, args: dict, result: dict)
         wing=wing, room="follow-ups", content=note, added_by="batch-park"
     )
     if parked.get("success") and parked.get("drawer_id"):
-        tools["mempalace_kg_add"]["handler"](
-            subject=f"action:{parked['drawer_id']}", predicate="belongs_to", object=f"wing_{wing}"
-        )
+        try:
+            tools["mempalace_kg_add"]["handler"](
+                subject=f"action:{parked['drawer_id']}",
+                predicate="belongs_to",
+                object=f"wing_{wing}",
+            )
+        except Exception:  # noqa: BLE001 - the follow-up is filed; the link is optional
+            pass
     return parked
 
 
@@ -615,9 +657,12 @@ def run_batch(payload: dict[str, Any]) -> dict[str, Any]:
     is a refusal with nothing written, so the daemon re-queues the whole batch
     unspent. Holding it throughout means a batch never lands half-filed
     because another writer cut in. A step that fails stops the batch; the
-    result lists what was written. A check-and-set conflict on a step marked
-    ``on_conflict: park`` files the proposed content as an open follow-up in
-    the batch's wing and carries on.
+    result lists what was written and names the failing step, including when
+    the step raised or a ``${id.field}`` had no value. A check-and-set
+    conflict on a step marked ``on_conflict: park`` files the proposed content
+    as an open follow-up in the batch's wing and carries on; if that follow-up
+    cannot be filed the batch fails, with the proposed text in
+    ``unfiled_content`` (the failed job is kept until acknowledged).
     """
     from .mcp_server import TOOLS
     from .palace import MineAlreadyRunning, mine_palace_lock
@@ -635,32 +680,56 @@ def run_batch(payload: dict[str, Any]) -> dict[str, Any]:
     done: list[dict[str, Any]] = []
     parked: list[dict[str, Any]] = []
     results: dict[str, dict[str, Any]] = {}
+
+    def failed(n: int, step: dict[str, Any], why: Any, **extra: Any) -> dict[str, Any]:
+        return {
+            "success": False,
+            "error": f"step {n} ({step['tool']}) failed: {why}",
+            "failed_step": n,
+            "done": done,
+            "parked": parked,
+            "exit_code": 1,
+            **extra,
+        }
+
     try:
         with mine_palace_lock(palace_path):
             for n, step in enumerate(steps, 1):
-                args = _resolve_refs(step["args"], results)
-                result = TOOLS[step["tool"]]["handler"](**args)
-                if not isinstance(result, dict):
-                    result = {"success": True, "value": result}
-                ok = result.get("success", "error" not in result)
                 summary = {"step": n, "id": step["id"], "tool": step["tool"]}
-                if not ok and result.get("conflict") and step["on_conflict"] == "park":
-                    park = _park_conflict(TOOLS, wing, step, args, result)
-                    parked.append({**summary, "parked_as": park.get("drawer_id")})
-                    continue
+                try:
+                    args = _resolve_refs(step["args"], results)
+                    result = TOOLS[step["tool"]]["handler"](**args)
+                    if not isinstance(result, dict):
+                        result = {"success": True, "value": result}
+                    ok = result.get("success", "error" not in result)
+                    if not ok and result.get("conflict") and step["on_conflict"] == "park":
+                        try:
+                            park = _park_conflict(TOOLS, wing, step, args, result)
+                        except Exception as exc:  # noqa: BLE001 - keep the text, fail the batch
+                            park = {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+                        if not (park.get("success") and park.get("drawer_id")):
+                            return failed(
+                                n,
+                                step,
+                                "its update conflicted and could not be parked: "
+                                f"{park.get('error')}",
+                                unfiled_content=args.get("content"),
+                            )
+                        parked.append({**summary, "parked_as": park["drawer_id"]})
+                        continue
+                except MineAlreadyRunning:
+                    raise
+                except _BatchRefError as exc:
+                    return failed(n, step, exc)
+                except Exception as exc:  # noqa: BLE001 - a step must not lose the done list
+                    return failed(n, step, f"{type(exc).__name__}: {exc}")
                 if not ok:
-                    return {
-                        "success": False,
-                        "error": f"step {n} ({step['tool']}) failed: {result.get('error')}",
-                        "done": done,
-                        "parked": parked,
-                        "exit_code": 1,
-                    }
+                    return failed(n, step, result.get("error"))
                 if step["id"]:
                     results[step["id"]] = result
                 done.append({**summary, "drawer_id": result.get("drawer_id")})
     except MineAlreadyRunning as exc:
-        if done:
+        if done or parked:
             # Raised after a write (a nested open): report it, never re-queue it.
             return {"success": False, "error": str(exc), "done": done, "exit_code": 1}
         return _lock_refusal_result(exc)
