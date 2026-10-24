@@ -111,6 +111,14 @@ def _mempalace_python() -> str:
 
 _RECENT_MSG_COUNT = 30  # how many recent user messages to summarize
 
+# How long a hook waits for its daemon job before handing it off (fork). A
+# diary job runs in 0.02-0.36 s on an idle queue, so 3 s covers it with room to
+# spare. The daemon has one worker: a job queued behind a running mine waits
+# for that mine, and waiting longer only stalls the agent, since the job is
+# durable in the queue either way. The harness kills these hooks at 30 s.
+_DIARY_HANDOFF_WAIT_SECONDS = 3.0
+_SYNC_MINE_HANDOFF_WAIT_SECONDS = 3.0
+
 STOP_BLOCK_REASON = (
     "MemPalace auto-save checkpoint. "
     "Use mempalace_diary_write (session summary) and mempalace_add_drawer "
@@ -731,6 +739,7 @@ def _submit_daemon_job(
     priority: int = 0,
     wait: bool = False,
     timeout: float = 60.0,
+    return_on_timeout: bool = False,
 ):
     """Submit to an already-running daemon. Never auto-starts (see _daemon_available).
 
@@ -752,6 +761,7 @@ def _submit_daemon_job(
         wait=wait,
         auto_start=False,
         timeout=timeout,
+        return_on_timeout=return_on_timeout,
         # A job refused the palace lock is deferred, not failed (#2014), so it
         # is never terminal while the holder lives. The waiting callers below
         # wait on purpose, but a parked job cannot reach the state they wait
@@ -771,6 +781,13 @@ def _job_deferred_by_lock(job: dict) -> bool:
     from .daemon import job_deferred_by_lock
 
     return job_deferred_by_lock(job)
+
+
+def _job_pending(job: dict) -> bool:
+    """True when the daemon still holds the job (queued or running): handed off."""
+    from .daemon import job_pending
+
+    return job_pending(job)
 
 
 def _lock_deferral_reason(job: dict) -> str:
@@ -852,7 +869,8 @@ def _mine_sync():
                         {"source": mine_dir, "mode": mode, "agent": "mempalace"},
                         dedupe_key=_daemon_mine_dedupe_key(mine_dir, mode),
                         wait=True,
-                        timeout=60,
+                        timeout=_SYNC_MINE_HANDOFF_WAIT_SECONDS,
+                        return_on_timeout=True,
                     )
                     result = job.get("result") or {}
                     if _job_deferred_by_lock(job):
@@ -860,6 +878,10 @@ def _mine_sync():
                         # runs it once the holder exits. Saying "failed" here
                         # would be the false report #2014 is about.
                         _log(f"Daemon sync mine deferred: {_lock_deferral_reason(job)}")
+                    elif _job_pending(job):
+                        # Still queued or running when the short wait ended: the
+                        # daemon holds it and finishes it after this hook exits.
+                        _log(f"Daemon sync mine queued: {job.get('id')}")
                     elif job.get("state") != "succeeded" or not result.get("success", True):
                         _log(f"Daemon sync mine failed: {result.get('error', job.get('error'))}")
                 except Exception as exc:
@@ -1047,7 +1069,9 @@ def _save_diary_direct(
     the agent wrote to, so project-derived wings stay discoverable.
 
     Returns (success):  {"drawers_filed": 1, "messages_folded": N, "themes": [...]}
-    Returns (failure / no messages / routing blocked / daemon deferral):
+    Returns (handed off: the daemon job is still queued, running or parked):
+        {"drawers_filed": 0, "messages_folded": N, "handed_off": "<job id>"}
+    Returns (failure / no messages / routing blocked):
         {"drawers_filed": 0, "messages_folded": 0}
         (+ "routing_blocked" / "routing_message" when blocked).
 
@@ -1096,7 +1120,8 @@ def _save_diary_direct(
                     },
                     priority=10,
                     wait=True,
-                    timeout=30,
+                    timeout=_DIARY_HANDOFF_WAIT_SECONDS,
+                    return_on_timeout=True,
                 )
             except Exception as exc:
                 # Daemon accepted context — don't fall back (would double-write).
@@ -1116,12 +1141,19 @@ def _save_diary_direct(
                 if toast:
                     _desktop_toast(f"Checkpoint saved - {len(messages)} messages archived")
                 return {"drawers_filed": 1, "messages_folded": len(messages), "themes": themes}
-            if _job_deferred_by_lock(job):
-                # Queued behind the palace lock: the entry is held and the daemon
-                # files it once the holder exits. Not a failure, and not a reason
-                # to re-file it here -- that would duplicate verbatim content.
-                _log(f"Daemon diary checkpoint deferred: {_lock_deferral_reason(job)}")
-                return {"drawers_filed": 0, "messages_folded": 0}
+            if _job_pending(job):
+                # Still queued or running when the short wait ended, or parked
+                # behind the palace lock: the daemon holds the entry and files it
+                # later. Handed off, not failed. Re-filing it here, or letting the
+                # next Stop file it again, would duplicate verbatim content.
+                if _job_deferred_by_lock(job):
+                    _log(f"Daemon diary checkpoint deferred: {_lock_deferral_reason(job)}")
+                _log(f"Diary checkpoint queued: {job.get('id')}")
+                return {
+                    "drawers_filed": 0,
+                    "messages_folded": len(messages),
+                    "handed_off": job.get("id"),
+                }
             _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
             return {"drawers_filed": 0, "messages_folded": 0}
 
@@ -1715,7 +1747,22 @@ def hook_stop(data: dict, harness: str):
                 # (#2303): the legacy "count" was the compressed-message count and
                 # was misread as a storage count. Report each unit truthfully.
                 drawers_filed = result.get("drawers_filed", 0)
-                if drawers_filed > 0:
+                if result.get("handed_off"):
+                    # The daemon holds the checkpoint and files it after this
+                    # hook exits. Advance the marker anyway, or the next Stop
+                    # files a second diary for the same messages.
+                    try:
+                        last_save_file.write_text(str(exchange_count), encoding="utf-8")
+                    except OSError:
+                        pass
+                    _output(
+                        {
+                            "systemMessage": _with_failures_notice(
+                                f"\u2726 checkpoint queued \u2014 {result.get('messages_folded', 0)} messages handed to the palace write queue"
+                            ),
+                        }
+                    )
+                elif drawers_filed > 0:
                     try:
                         last_save_file.write_text(str(exchange_count), encoding="utf-8")
                     except OSError:
@@ -1728,7 +1775,9 @@ def hook_stop(data: dict, harness: str):
                         tag = ""
                     _output(
                         {
-                            "systemMessage": f"\u2726 {drawers_filed} checkpoint saved \u2014 {messages_folded} messages woven into the palace{tag}",
+                            "systemMessage": _with_failures_notice(
+                                f"\u2726 {drawers_filed} checkpoint saved \u2014 {messages_folded} messages woven into the palace{tag}"
+                            ),
                         }
                     )
                 else:
@@ -1771,8 +1820,45 @@ def hook_session_start(data: dict, harness: str):
             _output(_blocked_hook_output(routing))
             return
 
+    # A failed write-queue job has nobody waiting on it (hooks and /preclean
+    # hand their writes off), so say so here until someone acknowledges it.
+    failed = _unacknowledged_daemon_failures()
+    if failed:
+        _output({"systemMessage": _daemon_failures_notice(failed)})
+        return
+
     # Pass through — no blocking on session start
     _output({})
+
+
+def _unacknowledged_daemon_failures() -> int:
+    try:
+        from .daemon import unacknowledged_failures
+
+        return unacknowledged_failures(MempalaceConfig().palace_path)
+    except Exception as exc:
+        _log(f"WARNING: could not count failed daemon jobs: {exc}")
+        return 0
+
+
+def _with_failures_notice(message: str) -> str:
+    """Append the failed-jobs notice to a checkpoint line while any exist.
+
+    SessionStart on most harnesses runs a separate script, so the Stop hook's
+    checkpoint line is the one place every harness shows the user.
+    """
+    failed = _unacknowledged_daemon_failures()
+    if not failed:
+        return message
+    return f"{message}\n\u26a0 {_daemon_failures_notice(failed)}"
+
+
+def _daemon_failures_notice(failed: int) -> str:
+    jobs = "job" if failed == 1 else "jobs"
+    return (
+        f"MemPalace: {failed} failed write-queue {jobs} not yet acknowledged. "
+        "See `memp daemon jobs --failed`; run `memp daemon ack` once handled."
+    )
 
 
 def _clear_session_last_save(session_id: str) -> None:

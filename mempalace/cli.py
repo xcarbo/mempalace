@@ -1358,6 +1358,10 @@ def cmd_job(args):
         print(f"  parked: step {p['step']} conflicted; follow-up {p.get('parked_as')}")
     if job.state == "failed":
         print(f"  error: {(job.error or {}).get('message') or result.get('error')}")
+        if result.get("unfiled_content"):
+            print(
+                f"  unfiled: the update's text is in result.unfiled_content (memp job {job.id} --json)"
+            )
 
 
 def cmd_daemon(args):
@@ -1367,12 +1371,24 @@ def cmd_daemon(args):
         TERMINAL_STATES,
         DaemonError,
         QueueStore,
+        acknowledge_failures,
+        canonical_palace_path,
         get_client_if_running,
         job_to_dict,
         queue_path,
         start_daemon,
         stop_daemon,
+        unacknowledged_failures,
     )
+
+    def _print_failures() -> None:
+        failed = unacknowledged_failures(palace_path)
+        if failed:
+            jobs = "job" if failed == 1 else "jobs"
+            print(
+                f"  Failed: {failed} failed {jobs} not yet acknowledged "
+                "(memp daemon jobs --failed; memp daemon ack once handled)"
+            )
 
     action = getattr(args, "daemon_action", None)
     try:
@@ -1398,6 +1414,7 @@ def cmd_daemon(args):
             client = get_client_if_running(palace_path)
             if client is None:
                 print("MemPalace daemon is not running")
+                _print_failures()
                 sys.exit(1)
             health = client.health()
             print("MemPalace daemon is running")
@@ -1405,10 +1422,24 @@ def cmd_daemon(args):
             print(f"  PID:    {health.get('pid')}")
             print(f"  Active: {health.get('active_job_id') or '-'}")
             print(f"  Jobs:   {health.get('counts') or {}}")
+            _print_failures()
+            return
+
+        if action == "ack":
+            acked = acknowledge_failures(palace_path)
+            print(f"Acknowledged {acked} failed job{'' if acked == 1 else 's'}")
             return
 
         if action == "jobs":
             client = get_client_if_running(palace_path)
+            if getattr(args, "failed", False):
+                qpath = queue_path(canonical_palace_path(palace_path))
+                failed_jobs = QueueStore(qpath).unacknowledged_failures() if qpath.exists() else []
+                jobs = [job_to_dict(job, include_payload=False) for job in failed_jobs]
+                for job in jobs:
+                    message = (job.get("error") or {}).get("message") or "job failed"
+                    print(f"{job['id']}  {job['kind']:<10}  {job['finished_at']}  {message}")
+                return
             if client is not None:
                 jobs = client.list_jobs(limit=args.limit)
             else:
@@ -3328,8 +3359,14 @@ def main():
     )
     daemon_sub.add_parser("stop", help="Stop the daemon")
     daemon_sub.add_parser("status", help="Show daemon status")
+    daemon_sub.add_parser(
+        "ack", help="Acknowledge failed jobs so status and session start stop reporting them"
+    )
     p_daemon_jobs = daemon_sub.add_parser("jobs", help="List recent daemon jobs")
     p_daemon_jobs.add_argument("--limit", type=int, default=20, help="Max jobs to show")
+    p_daemon_jobs.add_argument(
+        "--failed", action="store_true", help="Only failed jobs not yet acknowledged"
+    )
     p_daemon_wait = daemon_sub.add_parser("wait", help="Wait for a daemon job")
     p_daemon_wait.add_argument("job_id", help="Job id returned by --background")
 

@@ -38,6 +38,12 @@ Register:
 11. ``hooks_cli._wing_from_cwd`` walks up from a subfolder cwd to the nearest
     ``.palace-wing``/``.git`` (stopping at ``~`` and the projects root). Upstream
     names the wing after the cwd leaf, so ``repo/src`` files under ``src``.
+18. Hooks wait ``_DIARY_HANDOFF_WAIT_SECONDS`` / ``_SYNC_MINE_HANDOFF_WAIT_SECONDS``
+    for their daemon job, then hand it off and advance the Stop marker
+    (upstream: 30 s / 60 s, and a timeout re-files on the next Stop).
+19. ``QueueStore.prune_terminal`` keeps failed jobs until ``memp daemon ack``
+    (capped at ``FAILED_RETENTION_DAYS``); upstream prunes them after the
+    retention window, unseen.
 """
 
 from __future__ import annotations
@@ -540,3 +546,48 @@ def test_daemon_is_a_shared_queue_not_the_palace_owner():
 
     src = inspect.getsource(daemon.run_server)
     assert "mine_palace_lock(" not in src, "FORK DELTA REVERTED: the daemon holds the palace lock"
+
+
+def test_hook_hands_its_daemon_jobs_off_after_a_short_wait():
+    """Delta 18: hooks wait a few seconds for their daemon job, then hand it off.
+
+    Upstream waits 30 s for a diary job (the whole hook budget) and 60 s for a
+    precompact mine, and on a timeout reports nothing filed, so the Stop hook
+    keeps its marker and the next Stop files the same messages a second time
+    while the daemon still writes the first. Behaviour is pinned in
+    tests/test_write_handoff.py.
+    """
+    assert hooks_cli._DIARY_HANDOFF_WAIT_SECONDS <= 5
+    assert hooks_cli._SYNC_MINE_HANDOFF_WAIT_SECONDS <= 5
+    diary = inspect.getsource(hooks_cli._save_diary_direct)
+    assert "timeout=_DIARY_HANDOFF_WAIT_SECONDS" in diary and "return_on_timeout=True" in diary
+    sync = inspect.getsource(hooks_cli._mine_sync)
+    assert "timeout=_SYNC_MINE_HANDOFF_WAIT_SECONDS" in sync and "return_on_timeout=True" in sync
+    stop = inspect.getsource(hooks_cli.hook_stop)
+    assert 'result.get("handed_off")' in stop, "FORK DELTA REVERTED: a hand-off re-files"
+
+
+def test_failed_daemon_jobs_survive_retention_until_acknowledged(tmp_path, monkeypatch):
+    """Delta 19: prune_terminal keeps failed jobs nobody has acknowledged.
+
+    Upstream prunes every terminal job after the retention window. A failed
+    batch's payload is the only copy of what it was meant to write (a parked
+    roadmap the follow-up could not hold), so pruning it unseen loses it.
+    """
+    from mempalace import daemon
+
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    store = daemon.QueueStore(daemon.queue_path(str(tmp_path / "palace")))
+    job = store.enqueue("batch", {"steps": []})
+    store.finish(job.id, state="failed", error={"message": "x"})
+    with store._connect() as conn:
+        conn.execute("UPDATE jobs SET finished_at = ?", (_days_ago(10),))
+    assert store.prune_terminal(older_than_days=7) == 0, "FORK DELTA REVERTED"
+    store.acknowledge_failures()
+    assert store.prune_terminal(older_than_days=7) == 1
+
+
+def _days_ago(days):
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()

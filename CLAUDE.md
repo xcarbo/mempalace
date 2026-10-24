@@ -152,6 +152,8 @@ uv run pytest tests/test_fork_deltas.py -v
 | read paths besides `_open_search_collection` (`searcher.search`, the closets open in `search_memories`, `miner.status`) | `read_only=True` via `palace.get_collection_read_only` | writable opens | While any mine runs, plain `memp search` and `memp status` raise `MineAlreadyRunning` and `memp search --json` waits 10 s |
 | daemon writer lease (`daemon.run_server`, `service.run_diary_write` / `run_mcp_tool`) | none: each job takes the lock for its own write; a busy lock is a refusal and the job re-queues unspent | `mine_palace_lock` held for the daemon's lifetime | With the daemon on, every write outside it (`memp add-drawer`, crons, `:4109` write routes) fails with `MineAlreadyRunning` |
 | MCP read tools (`mcp_server._get_collection(read_only=True)`: get-drawer, list-drawers, list-wings, list-rooms, taxonomy, check-duplicate, graph tools, diary-read) | read-only open, not cached | writable open for every non-MCP-server caller | While any mine runs, every `memp get-drawer` / `list-drawers` waits 10 s and fails "palace busy, write not filed" |
+| hook daemon wait (`hooks_cli._save_diary_direct`, `_mine_sync`, `hook_stop`) | 3 s, then the job is handed off and the Stop marker advances | 30 s diary / 60 s precompact wait; a timeout reports nothing filed | A diary queued behind a mine freezes the agent for the whole 30 s hook budget, and the next Stop files the same messages a second time while the daemon still writes the first |
+| failed-job retention (`daemon.QueueStore.prune_terminal`) | failed jobs kept until `memp daemon ack` (at most `FAILED_RETENTION_DAYS`, 30) | pruned after `JOB_RETENTION_DAYS` (7) | A failed batch's payload is the only copy of a parked roadmap it could not file; it is deleted unseen after 7 days |
 
 Two rules:
 
@@ -201,6 +203,12 @@ bun test scripts/fleet.test.ts
   Steps run in order under one palace lock (a busy palace re-queues the whole batch, nothing
   written). `${id.field}` reads an earlier step's result. A refused check-and-set marked `park` is
   filed verbatim as an open follow-up in the batch's wing. Deletes are not batchable.
+- A failed job, batch or diary, writes a `Daemon job failed:` line to `~/.mempalace/hook_state/hook.log`.
+  `memp daemon status`, the Stop hook's checkpoint line and the Python SessionStart hook report
+  "N failed jobs" until `memp daemon ack`; `memp daemon jobs --failed` lists them. Retention keeps
+  those jobs (and their payloads) until then, at most 30 days. A failed batch names
+  `failed_step` and lists `done`; a park that could not be filed fails it with `unfiled_content`.
+- Hooks wait 3 s for their own job, then hand it off (`Diary checkpoint queued: <id>`).
 - Hooks hand their diary saves and transcript ingests to the daemon when it is up with
   `"write_routing": {"hooks": "prefer"}` in `~/.mempalace/config.json`, and write directly when not.
 - State and the deploy log are in `~/opt/.fleet/` on each box.

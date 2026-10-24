@@ -80,6 +80,10 @@ SHUTDOWN_DRAIN_SECONDS = 10.0
 # holds verbatim payloads) doesn't grow without bound across a long-lived
 # daemon. Override via env for operators who want a longer/shorter window.
 JOB_RETENTION_DAYS = int(os.environ.get("MEMPALACE_DAEMON_RETENTION_DAYS", "7") or "7")
+# A failed job nobody has acknowledged (``memp daemon ack``) outlives the normal
+# window, since its payload can be the only copy of what it meant to write, but
+# not forever: the queue DB must stay bounded on a box nobody looks at.
+FAILED_RETENTION_DAYS = int(os.environ.get("MEMPALACE_DAEMON_FAILED_RETENTION_DAYS", "30") or "30")
 try:
     import fcntl as _fcntl  # POSIX only; absent on Windows
 except ImportError:  # pragma: no cover - Windows fallback
@@ -334,18 +338,59 @@ class QueueStore:
         """
         if older_than_days <= 0:
             return 0
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(days=older_than_days)).isoformat()
+        failed_cutoff = (
+            now - timedelta(days=max(older_than_days, FAILED_RETENTION_DAYS))
+        ).isoformat()
         with self._lock, self._connect() as conn:
+            # A failed job nobody has acknowledged is the only copy of what it
+            # was meant to write (a parked roadmap, a diary): keep it until
+            # someone has seen it (``memp daemon ack``), up to the longer
+            # FAILED_RETENTION_DAYS window.
             cur = conn.execute(
                 """
                 DELETE FROM jobs
                 WHERE state IN ('succeeded', 'failed', 'cancelled')
                   AND finished_at IS NOT NULL
                   AND finished_at < ?
+                  AND NOT (state = 'failed' AND finished_at > ? AND finished_at >= ?)
                 """,
-                (cutoff,),
+                (cutoff, self.failures_acknowledged_at(), failed_cutoff),
             )
             return int(cur.rowcount or 0)
+
+    @property
+    def _ack_path(self) -> Path:
+        return self.path.parent / "failures_ack"
+
+    def failures_acknowledged_at(self) -> str:
+        """``finished_at`` up to which failed jobs have been seen ('' = none)."""
+        try:
+            return self._ack_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def unacknowledged_failures(self) -> list[Job]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE state = 'failed' AND finished_at > ? "
+                "ORDER BY finished_at DESC",
+                (self.failures_acknowledged_at(),),
+            ).fetchall()
+            return [self._row_to_job(row) for row in rows]
+
+    def acknowledge_failures(self) -> int:
+        """Mark every failed job so far as seen; return how many were new."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n, MAX(finished_at) AS last FROM jobs "
+                "WHERE state = 'failed' AND finished_at > ?",
+                (self.failures_acknowledged_at(),),
+            ).fetchone()
+        if row["n"]:
+            _write_private(self._ack_path, str(row["last"]))
+        return int(row["n"])
 
     def recover_running(self) -> int:
         """Re-queue jobs left ``running`` by a crashed/killed daemon.
@@ -357,6 +402,10 @@ class QueueStore:
         principle. The last error_json is preserved for diagnostics.
         """
         with self._lock, self._connect() as conn:
+            dead = conn.execute(
+                "SELECT id, kind FROM jobs WHERE state = 'running' AND attempts >= ?",
+                (MAX_ATTEMPTS,),
+            ).fetchall()
             conn.execute(
                 """
                 UPDATE jobs
@@ -381,7 +430,10 @@ class QueueStore:
                 """,
                 (MAX_ATTEMPTS,),
             )
-            return int(cur.rowcount or 0)
+            requeued = int(cur.rowcount or 0)
+        for row in dead:
+            _log_failed_job(row["kind"], row["id"], {"message": "max attempts exceeded"})
+        return requeued
 
     def enqueue(
         self,
@@ -657,6 +709,70 @@ def job_deferred_by_lock(job: dict[str, Any]) -> bool:
     return (job.get("error") or {}).get("error_class") == LOCK_REFUSAL_ERROR_CLASS
 
 
+def job_pending(job: dict[str, Any]) -> bool:
+    """True when the daemon holds the job and will still run it.
+
+    A caller that stopped waiting (its short budget ran out, or the job was
+    parked behind the palace lock) has handed the work off: the job is durable
+    in the queue, so it must neither be re-submitted nor reported as failed.
+    """
+    return job.get("state") in ("queued", "running")
+
+
+def _log_failed_job(kind: str, job_id: str, error: dict[str, Any] | None) -> None:
+    """Append a failed job to hook.log, the log people read after a session.
+
+    A job a caller handed off and stopped waiting on has nobody left to report
+    its failure, so the daemon does. Goes through the hooks' own logger, so it
+    shares its path and never recreates a palace the user removed.
+    """
+    try:
+        from .hooks_cli import _log
+
+        message = (error or {}).get("message") or "job failed"
+        _log(
+            f"Daemon job failed: {kind} {job_id}: {message} "
+            "(memp daemon jobs --failed to see it, memp daemon ack once handled)"
+        )
+    except Exception:  # noqa: BLE001 - reporting must never break the worker
+        pass
+
+
+def unacknowledged_failures(palace_path: str) -> int:
+    """Failed jobs nobody has acknowledged yet. 0 when there is no queue.
+
+    Read-only and DDL-free: this runs on session start and status, so it opens
+    the queue ``mode=ro`` instead of building a QueueStore (schema, chmods).
+    """
+    qpath = queue_path(canonical_palace_path(palace_path))
+    if not qpath.exists():
+        return 0
+    try:
+        acked = (qpath.parent / "failures_ack").read_text(encoding="utf-8").strip()
+    except OSError:
+        acked = ""
+    try:
+        conn = sqlite3.connect(f"{qpath.as_uri()}?mode=ro", uri=True, timeout=5)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE state = 'failed' AND finished_at > ?", (acked,)
+            ).fetchone()
+            return int(row[0])
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        # A WAL database can refuse a read-only open (no -shm yet): count the
+        # slow way rather than report no failures.
+        return len(QueueStore(qpath).unacknowledged_failures())
+
+
+def acknowledge_failures(palace_path: str) -> int:
+    qpath = queue_path(canonical_palace_path(palace_path))
+    if not qpath.exists():
+        return 0
+    return QueueStore(qpath).acknowledge_failures()
+
+
 def job_to_dict(job: Job, *, include_payload: bool = True) -> dict[str, Any]:
     out = {
         "id": job.id,
@@ -708,13 +824,23 @@ class DaemonRuntime:
     def worker_alive(self) -> bool:
         return self.worker_thread is not None and self.worker_thread.is_alive()
 
-    def _safe_finish(self, job_id: str, *, state: str, result: dict, error: dict | None) -> None:
+    def _safe_finish(
+        self, job_id: str, *, state: str, result: dict, error: dict | None
+    ) -> Job | None:
         try:
             # only_if_running: if shutdown already cancelled this job, don't
             # resurrect it. A finish failure must not kill the worker regardless.
-            self.store.finish(job_id, state=state, result=result, error=error, only_if_running=True)
+            return self.store.finish(
+                job_id, state=state, result=result, error=error, only_if_running=True
+            )
         except Exception:  # noqa: BLE001 - a finish failure must not kill the worker
-            pass
+            return None
+
+    def _finish_failed(self, job: Job, *, result: dict, error: dict) -> None:
+        """Record a failure and report it, unless shutdown already cancelled it."""
+        stored = self._safe_finish(job.id, state="failed", result=result, error=error)
+        if stored is not None and stored.state == "failed":
+            _log_failed_job(job.kind, job.id, error)
 
     def _safe_defer(
         self, job_id: str, *, claimed_started_at: str | None = None, error: dict | None = None
@@ -790,9 +916,11 @@ class DaemonRuntime:
                     # its caller waits on: the #2014 hang wearing a different hat.
                     self._deferred_until[job.id] = time.monotonic() + LOCK_DEFER_BACKOFF_SECONDS
                     continue
-                state = "succeeded" if ok else "failed"
-                error = None if ok else {"message": result.get("error", "job failed")}
-                self._safe_finish(job.id, state=state, result=result, error=error)
+                if ok:
+                    self._safe_finish(job.id, state="succeeded", result=result, error=None)
+                else:
+                    error = {"message": result.get("error", "job failed")}
+                    self._finish_failed(job, result=result, error=error)
             except (Exception, SystemExit) as exc:
                 # SystemExit is BaseException, not Exception — catching it here is
                 # deliberate. Without it, a sys.exit() in a dependency would slip
@@ -800,9 +928,8 @@ class DaemonRuntime:
                 # stuck in 'running' forever, and stall every later job while
                 # /health keeps reporting ok. (See mcp_server.py tool_mine for the
                 # same BaseException-slip-past semantics, documented in comments.)
-                self._safe_finish(
-                    job.id,
-                    state="failed",
+                self._finish_failed(
+                    job,
                     result={"success": False, "exit_code": 1},
                     error={"error_class": type(exc).__name__, "message": str(exc)},
                 )
@@ -1193,7 +1320,14 @@ class DaemonClient:
         *,
         timeout: float = DEFAULT_WAIT_TIMEOUT,
         stop_on_lock_deferral: bool = False,
+        return_on_timeout: bool = False,
     ) -> dict[str, Any]:
+        """Poll until the job is terminal.
+
+        ``return_on_timeout`` hands back the still-pending job when the budget
+        runs out instead of raising: a hook that cannot afford to wait treats
+        it as handed off (see ``job_pending``).
+        """
         deadline = time.monotonic() + timeout
         while True:
             job = self.get_job(job_id)
@@ -1206,6 +1340,8 @@ class DaemonClient:
             if stop_on_lock_deferral and job_deferred_by_lock(job):
                 return job
             if time.monotonic() >= deadline:
+                if return_on_timeout:
+                    return job
                 raise DaemonError(f"timed out waiting for job {job_id}")
             time.sleep(0.2)
 
@@ -1385,6 +1521,7 @@ def submit_job(
     auto_start: bool = False,
     timeout: float = DEFAULT_WAIT_TIMEOUT,
     stop_on_lock_deferral: bool = False,
+    return_on_timeout: bool = False,
 ) -> dict[str, Any]:
     # Strictly opt-in: callers that want the daemon auto-started must say so
     # explicitly (the CLI --daemon path passes auto_start=True). The default
@@ -1398,7 +1535,19 @@ def submit_job(
     job = client.submit(kind, payload, dedupe_key=dedupe_key, priority=priority)
     if not wait:
         return job
-    return client.wait(job["id"], timeout=timeout, stop_on_lock_deferral=stop_on_lock_deferral)
+    if not return_on_timeout:
+        return client.wait(job["id"], timeout=timeout, stop_on_lock_deferral=stop_on_lock_deferral)
+    try:
+        return client.wait(
+            job["id"],
+            timeout=timeout,
+            stop_on_lock_deferral=stop_on_lock_deferral,
+            return_on_timeout=True,
+        )
+    except DaemonError:
+        # The daemon accepted the job; only polling it failed. It is durable in
+        # the queue, so report it as submitted rather than as a failure.
+        return job
 
 
 def stop_daemon(palace_path: str) -> bool:
