@@ -509,7 +509,12 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
     assert "hooks" in result["systemMessage"]
     # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "sessions"
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="sessions", toast=False, agent_name="claude"
+        str(transcript),
+        "test",
+        wing="sessions",
+        toast=False,
+        agent_name="claude",
+        dedupe_window=True,
     )
 
 
@@ -530,7 +535,12 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
             state_dir=tmp_path,
         )
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="myproject", toast=False, agent_name="claude"
+        str(transcript),
+        "test",
+        wing="myproject",
+        toast=False,
+        agent_name="claude",
+        dedupe_window=True,
     )
 
 

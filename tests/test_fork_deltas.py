@@ -591,3 +591,29 @@ def _days_ago(days):
     from datetime import datetime, timedelta, timezone
 
     return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def test_a_stop_diary_retry_gets_back_the_job_already_stored(tmp_path, monkeypatch):
+    """Delta 20: each Stop diary window has a dedupe key the daemon honours,
+    even once the first job has succeeded.
+
+    POST /jobs can time out after the daemon stored the diary. The hook keeps
+    its marker, and without the key the next Stop files the same checkpoint a
+    second time. Upstream dedupes only queued/running jobs and passes no key
+    for diaries. Behaviour is pinned in tests/test_write_handoff.py.
+    """
+    from mempalace import daemon
+
+    stop = inspect.getsource(hooks_cli.hook_stop)
+    assert "dedupe_window=True" in stop, "FORK DELTA REVERTED"
+    diary = inspect.getsource(hooks_cli._save_diary_direct)
+    assert "dedupe_key = _diary_window_key(session_id)" in diary, "FORK DELTA REVERTED"
+    assert "reuse_succeeded=dedupe_key is not None" in diary, "FORK DELTA REVERTED"
+    assert "stored_job_for_key(" in diary, "FORK DELTA REVERTED: the direct path re-files"
+
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    store = daemon.QueueStore(daemon.queue_path(str(tmp_path / "palace")))
+    job = store.enqueue("diary_write", {}, dedupe_key="k", reuse_succeeded=True)
+    store.finish(job.id, state="succeeded")
+    again = store.enqueue("diary_write", {}, dedupe_key="k", reuse_succeeded=True)
+    assert again.id == job.id, "FORK DELTA REVERTED: a retried diary is filed twice"

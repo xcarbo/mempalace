@@ -40,6 +40,9 @@ DEFAULT_WAIT_TIMEOUT = 60.0 * 60.0
 # answers /health in single-digit ms, so this rarely false-negatives.
 HOOK_PROBE_TIMEOUT = 0.5
 TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
+# `memp daemon wait --timeout`: the job is still queued or running when the
+# time runs out. Distinct from 1 (failed, or a daemon error) and 2 (bad usage).
+WAIT_TIMEOUT_EXIT = 3
 MAX_ATTEMPTS = 3
 # ``error_class`` marking a job refused the per-palace write lock. The lock
 # wraps the palace write itself, so a refusal means no drawer was filed and
@@ -442,14 +445,26 @@ class QueueStore:
         *,
         dedupe_key: str | None = None,
         priority: int = 0,
+        reuse_succeeded: bool = False,
     ) -> Job:
+        """Queue a job, or hand back the one already queued under ``dedupe_key``.
+
+        ``reuse_succeeded`` also hands back a job that already succeeded under
+        the key (fork). A hook diary uses it: its submit can time out after the
+        daemon stored the job, and the retry on the next Stop must get that job
+        back, not file the same checkpoint again. A failed job never matches,
+        so a real failure is retried.
+        """
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        states = (
+            "('queued', 'running', 'succeeded')" if reuse_succeeded else "('queued', 'running')"
+        )
         with self._lock, self._connect() as conn:
             if dedupe_key:
                 row = conn.execute(
-                    """
+                    f"""
                     SELECT * FROM jobs
-                    WHERE dedupe_key = ? AND state IN ('queued', 'running')
+                    WHERE dedupe_key = ? AND state IN {states}
                     ORDER BY created_at DESC
                     LIMIT 1
                     """,
@@ -764,6 +779,47 @@ def unacknowledged_failures(palace_path: str) -> int:
         # A WAL database can refuse a read-only open (no -shm yet): count the
         # slow way rather than report no failures.
         return len(QueueStore(qpath).unacknowledged_failures())
+
+
+def _read_queue_row(palace_path: str, sql: str, params: tuple) -> dict[str, Any] | None:
+    """One job row as a dict, read ``mode=ro`` with no schema setup (fork).
+
+    None when there is no queue or no such row. A WAL database can refuse a
+    read-only open (no -shm yet); that falls back to a normal QueueStore read.
+    """
+    qpath = queue_path(canonical_palace_path(palace_path))
+    if not qpath.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"{qpath.as_uri()}?mode=ro", uri=True, timeout=5)
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(sql, params).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        with QueueStore(qpath)._connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+    return None if row is None else job_to_dict(QueueStore._row_to_job(row))
+
+
+def read_job(palace_path: str, job_id: str) -> dict[str, Any] | None:
+    """A job straight from the queue file, for when the daemon cannot answer."""
+    return _read_queue_row(palace_path, "SELECT * FROM jobs WHERE id = ?", (job_id,))
+
+
+def stored_job_for_key(palace_path: str, dedupe_key: str) -> dict[str, Any] | None:
+    """The newest queued, running or succeeded job under ``dedupe_key``.
+
+    What ``enqueue(reuse_succeeded=True)`` would hand back, read without the
+    daemon: a hook that falls back to a direct write checks it first.
+    """
+    return _read_queue_row(
+        palace_path,
+        "SELECT * FROM jobs WHERE dedupe_key = ? AND state IN ('queued', 'running', 'succeeded') "
+        "ORDER BY created_at DESC LIMIT 1",
+        (dedupe_key,),
+    )
 
 
 def acknowledge_failures(palace_path: str) -> int:
@@ -1125,6 +1181,7 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
                         body.get("payload") or {},
                         dedupe_key=body.get("dedupe_key"),
                         priority=int(body.get("priority") or 0),
+                        reuse_succeeded=bool(body.get("reuse_succeeded")),
                     )
                     runtime.worker_wake.set()
                 except Exception as exc:  # noqa: BLE001 - client gets structured failure
@@ -1301,12 +1358,12 @@ class DaemonClient:
         *,
         dedupe_key: str | None = None,
         priority: int = 0,
+        reuse_succeeded: bool = False,
     ) -> dict[str, Any]:
-        return self.request(
-            "POST",
-            "/jobs",
-            {"kind": kind, "payload": payload, "dedupe_key": dedupe_key, "priority": priority},
-        )["job"]
+        body = {"kind": kind, "payload": payload, "dedupe_key": dedupe_key, "priority": priority}
+        if reuse_succeeded:
+            body["reuse_succeeded"] = True
+        return self.request("POST", "/jobs", body)["job"]
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         return self.request("GET", f"/jobs/{job_id}")["job"]
@@ -1522,6 +1579,7 @@ def submit_job(
     timeout: float = DEFAULT_WAIT_TIMEOUT,
     stop_on_lock_deferral: bool = False,
     return_on_timeout: bool = False,
+    reuse_succeeded: bool = False,
 ) -> dict[str, Any]:
     # Strictly opt-in: callers that want the daemon auto-started must say so
     # explicitly (the CLI --daemon path passes auto_start=True). The default
@@ -1532,7 +1590,9 @@ def submit_job(
     if backend:
         payload["backend"] = backend
     client = ensure_client(resolved_palace, backend=backend, auto_start=auto_start)
-    job = client.submit(kind, payload, dedupe_key=dedupe_key, priority=priority)
+    job = client.submit(
+        kind, payload, dedupe_key=dedupe_key, priority=priority, reuse_succeeded=reuse_succeeded
+    )
     if not wait:
         return job
     if not return_on_timeout:

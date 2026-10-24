@@ -1364,11 +1364,81 @@ def cmd_job(args):
             )
 
 
+def _non_negative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {value!r}") from None
+    if number < 0 or number != number:
+        raise argparse.ArgumentTypeError(f"must be 0 or more: {value!r}")
+    return number
+
+
+def _daemon_wait(args, palace_path: str) -> None:
+    """`memp daemon wait <id> [--timeout S]`. Raises DaemonError; exits non-zero.
+
+    --timeout (fork): when it runs out, print the job's state and exit
+    WAIT_TIMEOUT_EXIT, so a caller can tell "still queued" from "failed". A
+    poll the daemon fails to answer is read from the queue file instead, and
+    the wait goes on while the daemon is still up.
+    """
+    import time
+
+    from .daemon import (
+        DEFAULT_WAIT_TIMEOUT,
+        HOOK_PROBE_TIMEOUT,
+        TERMINAL_STATES,
+        WAIT_TIMEOUT_EXIT,
+        DaemonError,
+        get_client_if_running,
+        read_job,
+    )
+
+    timeout = getattr(args, "timeout", None)
+    deadline = time.monotonic() + (DEFAULT_WAIT_TIMEOUT if timeout is None else timeout)
+    client = get_client_if_running(palace_path)
+    while True:
+        job = None
+        if client is not None:
+            try:
+                job = client.get_job(args.job_id)
+            except DaemonError:
+                client = get_client_if_running(palace_path, health_timeout=HOOK_PROBE_TIMEOUT)
+        if job is None:
+            job = read_job(palace_path, args.job_id)
+            if job is None:
+                raise DaemonError(
+                    f"unknown job id: {args.job_id}"
+                    if client
+                    else f"daemon is not running; no job {args.job_id} in its queue"
+                )
+        if job.get("state") in TERMINAL_STATES:
+            break
+        if client is None or time.monotonic() >= deadline:
+            if timeout is None:
+                if client is None:
+                    raise DaemonError(f"daemon is not running; job {args.job_id} is {job['state']}")
+                raise DaemonError(f"timed out waiting for job {args.job_id}")
+            why = "the daemon is not running" if client is None else f"after {timeout:g}s"
+            print(f"{job['id']}  {job['kind']}  {job['state']}")
+            print(f"mempalace: job {job['id']} still {job['state']} ({why})", file=sys.stderr)
+            sys.exit(WAIT_TIMEOUT_EXIT)
+        time.sleep(0.2)
+    result = job.get("result") or {}
+    from .service import print_job_result
+
+    exit_code = print_job_result(result)
+    if job.get("state") != "succeeded" and exit_code == 0:
+        print(f"mempalace: daemon job failed: {job.get('error')}", file=sys.stderr)
+        exit_code = 1
+    if exit_code:
+        sys.exit(exit_code)
+
+
 def cmd_daemon(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     backend = _backend_arg(args)
     from .daemon import (
-        TERMINAL_STATES,
         DaemonError,
         QueueStore,
         acknowledge_failures,
@@ -1456,25 +1526,7 @@ def cmd_daemon(args):
             return
 
         if action == "wait":
-            client = get_client_if_running(palace_path)
-            if client is not None:
-                job = client.wait(args.job_id)
-            else:
-                qpath = queue_path(palace_path)
-                if not qpath.exists():
-                    raise DaemonError("daemon is not running")
-                job = job_to_dict(QueueStore(qpath).get(args.job_id))
-                if job.get("state") not in TERMINAL_STATES:
-                    raise DaemonError(f"daemon is not running; job {args.job_id} is {job['state']}")
-            result = job.get("result") or {}
-            from .service import print_job_result
-
-            exit_code = print_job_result(result)
-            if job.get("state") != "succeeded" and exit_code == 0:
-                print(f"mempalace: daemon job failed: {job.get('error')}", file=sys.stderr)
-                exit_code = 1
-            if exit_code:
-                sys.exit(exit_code)
+            _daemon_wait(args, palace_path)
             return
     except DaemonError as exc:
         print(f"mempalace: daemon error: {exc}", file=sys.stderr)
@@ -3367,8 +3419,21 @@ def main():
     p_daemon_jobs.add_argument(
         "--failed", action="store_true", help="Only failed jobs not yet acknowledged"
     )
-    p_daemon_wait = daemon_sub.add_parser("wait", help="Wait for a daemon job")
-    p_daemon_wait.add_argument("job_id", help="Job id returned by --background")
+    p_daemon_wait = daemon_sub.add_parser(
+        "wait",
+        help="Wait for a daemon job",
+        description="Wait for a daemon job to finish. Exit 0 succeeded, 1 failed (or a daemon "
+        "error), exit 3 still queued or running when --timeout ran out (the job's state is "
+        "printed; with the daemon stopped a pending job gives exit 3 at once).",
+    )
+    p_daemon_wait.add_argument("job_id", help="Job id returned by --background or submit")
+    p_daemon_wait.add_argument(
+        "--timeout",
+        type=_non_negative_float,
+        default=None,
+        metavar="SECONDS",
+        help="Stop waiting after SECONDS: print the job's state and exit 3 (default: wait up to 1 h)",
+    )
 
     # mcp
     p_mcp = sub.add_parser(

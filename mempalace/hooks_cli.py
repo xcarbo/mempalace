@@ -16,7 +16,8 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, unquote
@@ -576,6 +577,48 @@ def _daemon_mine_dedupe_key(source: str, mode: str) -> str:
     return f"hook:mine:{mode}:{source_key}"
 
 
+# A window key older than this is not reused: a session killed without a
+# SessionEnd and resumed days later must not match its old diary job.
+_DIARY_WINDOW_KEY_TTL_SECONDS = 3600.0
+
+
+def _read_diary_window_key(session_id: str) -> str:
+    key_file = STATE_DIR / f"{session_id}_diary_key"
+    try:
+        if time.time() - key_file.stat().st_mtime > _DIARY_WINDOW_KEY_TTL_SECONDS:
+            return ""
+        return key_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _diary_window_key(session_id: str) -> str:
+    """The dedupe key for this session's current, unconfirmed diary window (fork).
+
+    A Stop diary submit can time out after the daemon stored the job. The hook
+    then keeps its marker, and the next Stop retries the same window with the
+    same key, so the daemon hands back the stored job instead of filing a
+    second diary. The key lives in ``{session_id}_diary_key`` until the marker
+    advances; a fresh one per window keeps later windows from matching an old
+    job.
+    """
+    key = _read_diary_window_key(session_id)
+    if not key:
+        key = f"diary:{session_id}:{uuid.uuid4().hex}"
+        try:
+            (STATE_DIR / f"{session_id}_diary_key").write_text(key, encoding="utf-8")
+        except OSError as exc:
+            _log(f"WARNING: diary window key not saved ({exc}); a retried submit may file twice")
+    return key
+
+
+def _close_diary_window(session_id: str) -> None:
+    try:
+        (STATE_DIR / f"{session_id}_diary_key").unlink()
+    except OSError:
+        pass
+
+
 def _daemon_available() -> bool:
     """True iff a daemon is already running for the configured palace.
 
@@ -740,6 +783,7 @@ def _submit_daemon_job(
     wait: bool = False,
     timeout: float = 60.0,
     return_on_timeout: bool = False,
+    reuse_succeeded: bool = False,
 ):
     """Submit to an already-running daemon. Never auto-starts (see _daemon_available).
 
@@ -762,6 +806,7 @@ def _submit_daemon_job(
         auto_start=False,
         timeout=timeout,
         return_on_timeout=return_on_timeout,
+        reuse_succeeded=reuse_succeeded,
         # A job refused the palace lock is deferred, not failed (#2014), so it
         # is never terminal while the holder lives. The waiting callers below
         # wait on purpose, but a parked job cannot reach the state they wait
@@ -1059,6 +1104,7 @@ def _save_diary_direct(
     toast: bool = False,
     *,
     agent_name: str,
+    dedupe_window: bool = False,
 ) -> dict:
     """Write a diary checkpoint by calling the tool function directly (no MCP roundtrip).
 
@@ -1081,6 +1127,11 @@ def _save_diary_direct(
     (drawers) with the transcript-message count compressed into that single
     drawer, which is now reported separately as messages_folded. The render path
     must label each unit correctly.
+
+    ``dedupe_window`` (Stop only) keys the job to the session's unconfirmed
+    save window, so a retry gets back the job the daemon already stored, even
+    one that has since succeeded. Then nothing new is filed and the result is
+    ``{"drawers_filed": 0, "messages_folded": 0, "already_filed": "<job id>"}``.
     """
     messages = _extract_recent_messages(transcript_path)
     if not messages:
@@ -1109,6 +1160,8 @@ def _save_diary_direct(
 
     try:
         if routing.use_daemon:
+            dedupe_key = _diary_window_key(session_id) if dedupe_window else None
+            submitted_at = datetime.now(timezone.utc).isoformat()
             try:
                 job = _submit_daemon_job(
                     "diary_write",
@@ -1122,12 +1175,17 @@ def _save_diary_direct(
                     wait=True,
                     timeout=_DIARY_HANDOFF_WAIT_SECONDS,
                     return_on_timeout=True,
+                    dedupe_key=dedupe_key,
+                    reuse_succeeded=dedupe_key is not None,
                 )
             except Exception as exc:
                 # Daemon accepted context — don't fall back (would double-write).
                 _log(f"Daemon diary checkpoint failed: {exc}")
                 return {"drawers_filed": 0, "messages_folded": 0}
             result = job.get("result") or {}
+            reused = job.get("created_at", submitted_at) < submitted_at
+            if dedupe_key and reused and job.get("state") == "succeeded":
+                return _already_filed(job)
             if job.get("state") == "succeeded" and result.get("success"):
                 _log(f"Diary checkpoint saved: {result.get('entry_id', '?')}")
                 try:
@@ -1156,6 +1214,28 @@ def _save_diary_direct(
                 }
             _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
             return {"drawers_filed": 0, "messages_folded": 0}
+
+        if dedupe_window:
+            # The daemon may hold this window's diary from an earlier try whose
+            # submit timed out; it files it once it answers again.
+            window_key = _read_diary_window_key(session_id)
+            if window_key:
+                from .daemon import stored_job_for_key
+
+                try:
+                    job = stored_job_for_key(MempalaceConfig().palace_path, window_key)
+                except Exception as exc:  # noqa: BLE001 - never block the direct write
+                    _log(f"WARNING: could not check the write queue for this window: {exc}")
+                    job = None
+                if job and job.get("state") == "succeeded":
+                    return _already_filed(job)
+                if job:
+                    _log(f"Diary checkpoint from an earlier try is still queued: {job.get('id')}")
+                    return {
+                        "drawers_filed": 0,
+                        "messages_folded": len(messages),
+                        "handed_off": job.get("id"),
+                    }
 
         from .mcp_server import tool_diary_write
 
@@ -1188,6 +1268,13 @@ def _save_diary_direct(
     except Exception as e:
         _log(f"Diary checkpoint error: {e}")
     return {"drawers_filed": 0, "messages_folded": 0}
+
+
+def _already_filed(job: dict) -> dict:
+    """Result for a window whose diary an earlier try already filed (fork)."""
+    entry = (job.get("result") or {}).get("entry_id", "?")
+    _log(f"Diary checkpoint already filed by an earlier try: {entry} (job {job.get('id')})")
+    return {"drawers_filed": 0, "messages_folded": 0, "already_filed": job.get("id")}
 
 
 def _ingest_transcript(transcript_path: str):
@@ -1740,6 +1827,7 @@ def hook_stop(data: dict, harness: str):
                         wing=project_wing,
                         toast=toast,
                         agent_name=_diary_agent_for_harness(harness),
+                        dedupe_window=True,
                     )
                     _ingest_transcript(transcript_path)
                 _maybe_auto_ingest()
@@ -1747,7 +1835,22 @@ def hook_stop(data: dict, harness: str):
                 # (#2303): the legacy "count" was the compressed-message count and
                 # was misread as a storage count. Report each unit truthfully.
                 drawers_filed = result.get("drawers_filed", 0)
-                if result.get("handed_off"):
+                if result.get("already_filed"):
+                    # An earlier try's submit timed out after the daemon stored
+                    # the diary; that one stands for this window.
+                    try:
+                        last_save_file.write_text(str(exchange_count), encoding="utf-8")
+                    except OSError:
+                        pass
+                    _close_diary_window(session_id)
+                    _output(
+                        {
+                            "systemMessage": _with_failures_notice(
+                                "\u2726 checkpoint already in the palace \u2014 filed by the previous try"
+                            ),
+                        }
+                    )
+                elif result.get("handed_off"):
                     # The daemon holds the checkpoint and files it after this
                     # hook exits. Advance the marker anyway, or the next Stop
                     # files a second diary for the same messages.
@@ -1755,6 +1858,7 @@ def hook_stop(data: dict, harness: str):
                         last_save_file.write_text(str(exchange_count), encoding="utf-8")
                     except OSError:
                         pass
+                    _close_diary_window(session_id)
                     _output(
                         {
                             "systemMessage": _with_failures_notice(
@@ -1767,6 +1871,7 @@ def hook_stop(data: dict, harness: str):
                         last_save_file.write_text(str(exchange_count), encoding="utf-8")
                     except OSError:
                         pass
+                    _close_diary_window(session_id)
                     messages_folded = result.get("messages_folded", 0)
                     themes = result.get("themes", [])
                     if themes:
@@ -1875,6 +1980,7 @@ def _clear_session_last_save(session_id: str) -> None:
         (STATE_DIR / f"{session_id}_last_save").unlink()
     except OSError:
         pass
+    _close_diary_window(session_id)
 
 
 def hook_session_end(data: dict, harness: str):

@@ -439,3 +439,280 @@ def test_jobs_failed_lists_only_unacknowledged_failures(tmp_path, monkeypatch, c
     out = capsys.readouterr().out
     assert new.id in out and "step 2 failed" in out
     assert old.id not in out and ok.id not in out
+
+
+# ── a submit that timed out after the daemon stored the job ──────────────
+#
+# POST /jobs has a 5 s client timeout. If the daemon stores the diary and
+# the reply is lost, the hook sees an error, keeps its marker, and the next
+# Stop used to queue a second diary for the same messages. Each unconfirmed
+# save window now carries one dedupe key, and the daemon hands back the job
+# already stored under it (queued, running or succeeded) instead of a new one.
+
+
+def test_a_window_key_reuses_a_succeeded_job_but_not_a_failed_one(tmp_path, monkeypatch):
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    store = daemon.QueueStore(daemon.queue_path(str(tmp_path / "palace")))
+
+    first = store.enqueue("diary_write", {"entry": "a"}, dedupe_key="k", reuse_succeeded=True)
+    store.finish(first.id, state="succeeded", result={"success": True})
+    again = store.enqueue("diary_write", {"entry": "b"}, dedupe_key="k", reuse_succeeded=True)
+    assert again.id == first.id and again.state == "succeeded"
+
+    # Without the flag a finished job drops out (mines re-run on purpose).
+    assert store.enqueue("diary_write", {"entry": "c"}, dedupe_key="k").id != first.id
+
+    store2 = daemon.QueueStore(daemon.queue_path(str(tmp_path / "palace2")))
+    failed = store2.enqueue("diary_write", {"entry": "a"}, dedupe_key="k", reuse_succeeded=True)
+    store2.finish(failed.id, state="failed", error={"message": "x"})
+    retry = store2.enqueue("diary_write", {"entry": "b"}, dedupe_key="k", reuse_succeeded=True)
+    assert retry.id != failed.id and retry.state == "queued"
+
+
+def _start_daemon(palace):
+    server = threading.Thread(
+        target=daemon.run_server, kwargs={"palace_path": palace, "port": 0}, daemon=True
+    )
+    server.start()
+    for _ in range(600):
+        client = daemon.get_client_if_running(palace)
+        if client is not None:
+            return server, client
+        time.sleep(0.05)
+    raise AssertionError("daemon never came up")
+
+
+def test_a_submit_that_timed_out_after_the_job_was_stored_files_one_diary(
+    live_palace, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MEMPALACE_HOOKS_DAEMON", "yes")
+    server, client = _start_daemon(live_palace)
+    real_submit = daemon.DaemonClient.submit
+
+    def stored_then_timed_out(self, *args, **kwargs):
+        real_submit(self, *args, **kwargs)
+        raise daemon.DaemonError("timed out")
+
+    try:
+        transcript = tmp_path / "t.jsonl"
+        _write_transcript(transcript, SAVE_INTERVAL)
+        data = {"session_id": "s1", "stop_hook_active": False, "transcript_path": str(transcript)}
+        state = tmp_path / "hook_state"
+        state.mkdir()
+
+        with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+            with patch.object(daemon.DaemonClient, "submit", stored_then_timed_out):
+                assert _run_hook(hook_stop, data, state) == {}
+            assert not (state / "s1_last_save").exists()
+
+            first = [j for j in client.list_jobs(limit=50) if j["kind"] == "diary_write"]
+            assert len(first) == 1
+            assert client.wait(first[0]["id"], timeout=20)["state"] == "succeeded"
+
+            # One more message, then the next Stop.
+            _write_transcript(transcript, SAVE_INTERVAL + 1)
+            second = _run_hook(hook_stop, data, state)
+
+        assert "already in the palace" in second["systemMessage"]
+        assert (state / "s1_last_save").read_text() == str(SAVE_INTERVAL + 1)
+        assert not (state / "s1_diary_key").exists()
+        diaries = [j for j in client.list_jobs(limit=50) if j["kind"] == "diary_write"]
+        assert len(diaries) == 1, diaries
+        assert mcp_server.tool_diary_read(agent_name="claude")["total"] == 1
+    finally:
+        client.shutdown()
+        server.join(timeout=10)
+
+
+def test_a_retry_with_the_daemon_gone_does_not_file_directly(live_palace, tmp_path, monkeypatch):
+    # Stop 1's submit timed out after the daemon stored the diary; by Stop 2
+    # the daemon no longer answers, so the hook routes direct. It must find
+    # the stored job and not write a second diary itself.
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    state = tmp_path / "hook_state"
+    state.mkdir()
+    monkeypatch.setattr(hooks_cli, "STATE_DIR", state)
+    key = hooks_cli._diary_window_key("s1")
+    store = daemon.QueueStore(daemon.queue_path(daemon.canonical_palace_path(live_palace)))
+    job = store.enqueue("diary_write", {"entry": "x"}, dedupe_key=key, reuse_succeeded=True)
+
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, SAVE_INTERVAL)
+    data = {"session_id": "s1", "stop_hook_active": False, "transcript_path": str(transcript)}
+    with patch("mempalace.hooks_cli._daemon_available", return_value=False):
+        out = _run_hook(hook_stop, data, state)
+        assert "queued" in out["systemMessage"]
+        assert mcp_server.tool_diary_read(agent_name="claude").get("total", 0) == 0
+
+        store.finish(job.id, state="succeeded", result={"success": True, "entry_id": "e1"})
+        _write_transcript(transcript, 2 * SAVE_INTERVAL)
+        (state / "s1_diary_key").write_text(key)  # the same window, retried
+        out = _run_hook(hook_stop, data, state)
+        assert "already in the palace" in out["systemMessage"]
+        assert mcp_server.tool_diary_read(agent_name="claude").get("total", 0) == 0
+    assert not (state / "s1_diary_key").exists()
+
+
+def test_an_old_window_key_is_not_reused(tmp_path):
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        key = hooks_cli._diary_window_key("s1")
+        assert hooks_cli._diary_window_key("s1") == key
+        old = time.time() - hooks_cli._DIARY_WINDOW_KEY_TTL_SECONDS - 60
+        os.utime(tmp_path / "s1_diary_key", (old, old))
+        assert hooks_cli._diary_window_key("s1") != key
+
+
+def test_a_window_key_that_cannot_be_saved_is_logged(tmp_path):
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path / "missing"),
+        patch("mempalace.hooks_cli._log") as log,
+    ):
+        assert hooks_cli._diary_window_key("s1").startswith("diary:s1:")
+    assert "may file twice" in log.call_args.args[0]
+
+
+def test_the_direct_path_writes_no_window_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_HOOKS_DAEMON", "no")
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, 3)
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.hooks_cli._daemon_available", return_value=False),
+        patch("mempalace.mcp_server.tool_diary_write", return_value={"success": True}),
+    ):
+        result = hooks_cli._save_diary_direct(
+            str(transcript), "s1", agent_name="claude", dedupe_window=True
+        )
+    assert result["drawers_filed"] == 1
+    assert not (tmp_path / "s1_diary_key").exists()
+
+
+def test_each_save_window_gets_its_own_key(daemon_routing, tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, SAVE_INTERVAL)
+    keys = []
+
+    def submit(kind, payload, **kwargs):
+        keys.append(kwargs.get("dedupe_key"))
+        assert kwargs.get("reuse_succeeded") is True
+        if len(keys) == 1:
+            raise daemon.DaemonError("timed out")
+        return {"id": f"job-{len(keys)}", "state": "succeeded", "result": {"success": True}}
+
+    data = {"session_id": "s1", "stop_hook_active": False, "transcript_path": str(transcript)}
+    with patch("mempalace.daemon.submit_job", side_effect=submit):
+        _run_hook(hook_stop, data, tmp_path)  # timed out: same window
+        _run_hook(hook_stop, data, tmp_path)  # filed: window closes
+        _write_transcript(transcript, 2 * SAVE_INTERVAL)
+        _run_hook(hook_stop, data, tmp_path)  # a new window
+    assert keys[0] == keys[1] and keys[0].startswith("diary:s1:")
+    assert keys[2] != keys[1]
+
+
+def test_session_end_drops_the_window_key(tmp_path):
+    (tmp_path / "s1_last_save").write_text("15")
+    (tmp_path / "s1_diary_key").write_text("diary:s1:x")
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        hooks_cli._clear_session_last_save("s1")
+    assert not (tmp_path / "s1_diary_key").exists()
+    assert not (tmp_path / "s1_last_save").exists()
+
+
+# ── memp daemon wait --timeout ───────────────────────────────────────────
+
+
+def _wait_args(palace, job_id, timeout):
+    import argparse
+
+    return argparse.Namespace(
+        palace=str(palace), daemon_action="wait", backend=None, job_id=job_id, timeout=timeout
+    )
+
+
+@pytest.fixture
+def queue(tmp_path, monkeypatch):
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    store = daemon.QueueStore(daemon.queue_path(daemon.canonical_palace_path(str(palace))))
+    return palace, store
+
+
+def test_daemon_wait_timeout_prints_the_state_and_exits_3(queue, capsys):
+    from mempalace import cli
+
+    palace, store = queue
+    job = store.enqueue("batch", {"steps": []})
+    client = daemon.DaemonClient.__new__(daemon.DaemonClient)
+    with (
+        patch("mempalace.daemon.get_client_if_running", return_value=client),
+        patch.object(client, "get_job", return_value=daemon.job_to_dict(job)),
+        pytest.raises(SystemExit) as exc,
+    ):
+        cli.cmd_daemon(_wait_args(palace, job.id, 0.1))
+    assert exc.value.code == daemon.WAIT_TIMEOUT_EXIT == 3
+    captured = capsys.readouterr()
+    assert f"{job.id}  batch  queued" in captured.out
+    assert "still queued" in captured.err
+
+
+def test_daemon_wait_timeout_with_the_daemon_stopped_exits_3(queue, capsys):
+    from mempalace import cli
+
+    palace, store = queue
+    job = store.enqueue("batch", {"steps": []})
+    with (
+        patch("mempalace.daemon.get_client_if_running", return_value=None),
+        pytest.raises(SystemExit) as exc,
+    ):
+        cli.cmd_daemon(_wait_args(palace, job.id, 30))
+    assert exc.value.code == 3
+    assert "daemon is not running" in capsys.readouterr().err
+
+
+def test_daemon_wait_timeout_still_reports_succeeded_and_failed(queue, capsys):
+    from mempalace import cli
+
+    palace, store = queue
+    ok = store.enqueue("batch", {"steps": [1]})
+    store.finish(ok.id, state="succeeded", result={"success": True})
+    bad = store.enqueue("batch", {"steps": [2]})
+    store.finish(bad.id, state="failed", result={"success": False, "error": "boom"})
+    with patch("mempalace.daemon.get_client_if_running", return_value=None):
+        cli.cmd_daemon(_wait_args(palace, ok.id, 30))  # exit 0: no SystemExit
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_daemon(_wait_args(palace, bad.id, 30))
+    assert exc.value.code == 1
+    assert "boom" in capsys.readouterr().err
+
+
+def test_daemon_wait_keeps_waiting_through_a_failed_poll(queue, capsys):
+    from mempalace import cli
+
+    palace, store = queue
+    job = store.enqueue("batch", {"steps": []})
+    done = dict(daemon.job_to_dict(job), state="succeeded", result={"success": True})
+    client = daemon.DaemonClient.__new__(daemon.DaemonClient)
+    polls = [daemon.DaemonError("connection reset"), daemon.job_to_dict(job), done]
+
+    def get_job(_job_id):
+        item = polls.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    with (
+        patch("mempalace.daemon.get_client_if_running", return_value=client),
+        patch.object(client, "get_job", side_effect=get_job),
+    ):
+        cli.cmd_daemon(_wait_args(palace, job.id, 30))  # exit 0: no SystemExit
+    assert polls == []
+
+
+def test_daemon_wait_help_documents_the_timeout_exit(capsys):
+    from mempalace import cli
+
+    with patch("sys.argv", ["mempalace", "daemon", "wait", "--help"]), pytest.raises(SystemExit):
+        cli.main()
+    out = capsys.readouterr().out
+    assert "--timeout" in out and "exit 3" in out

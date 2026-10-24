@@ -154,6 +154,7 @@ uv run pytest tests/test_fork_deltas.py -v
 | MCP read tools (`mcp_server._get_collection(read_only=True)`: get-drawer, list-drawers, list-wings, list-rooms, taxonomy, check-duplicate, graph tools, diary-read) | read-only open, not cached | writable open for every non-MCP-server caller | While any mine runs, every `memp get-drawer` / `list-drawers` waits 10 s and fails "palace busy, write not filed" |
 | hook daemon wait (`hooks_cli._save_diary_direct`, `_mine_sync`, `hook_stop`) | 3 s, then the job is handed off and the Stop marker advances | 30 s diary / 60 s precompact wait; a timeout reports nothing filed | A diary queued behind a mine freezes the agent for the whole 30 s hook budget, and the next Stop files the same messages a second time while the daemon still writes the first |
 | failed-job retention (`daemon.QueueStore.prune_terminal`) | failed jobs kept until `memp daemon ack` (at most `FAILED_RETENTION_DAYS`, 30) | pruned after `JOB_RETENTION_DAYS` (7) | A failed batch's payload is the only copy of a parked roadmap it could not file; it is deleted unseen after 7 days |
+| Stop diary window key (`hooks_cli._diary_window_key`, `QueueStore.enqueue(reuse_succeeded=)`, `daemon.stored_job_for_key`) | one dedupe key per unconfirmed save window (1 h at most); the daemon hands back a queued, running or succeeded job under it, and a direct-routed retry checks the queue for it first | no key for diaries; dedupe matches queued/running only | A diary submit that times out after the daemon stored the job leaves the marker, and the next Stop files the same checkpoint again |
 
 Two rules:
 
@@ -197,6 +198,8 @@ bun test scripts/fleet.test.ts
   `launchctl kickstart -k gui/$(id -u)/com.mempalace.daemon`.
 - `memp submit <batch.json|->` puts a batch in the on-disk queue and prints `queued <job-id>` at
   once, daemon up or not; `memp job <id>` shows queued / running / succeeded / failed.
+  `memp daemon wait <id> --timeout <s>` waits for it: exit 0 succeeded, 1 failed, 3 still
+  queued or running when the time ran out (it prints the state).
 - A batch: `{"wing": "<w>", "steps": [{"id": "f1", "tool": "add-drawer", "args": {...}},
   {"tool": "kg-add", "args": {"subject": "action:${f1.drawer_id}", ...}},
   {"tool": "update-drawer", "args": {..., "if_unchanged": "<sha>"}, "on_conflict": "park"}]}`.
