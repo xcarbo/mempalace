@@ -399,6 +399,23 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     return {"success": True, "report": report, "exit_code": 0}
 
 
+def _lock_refusal_result(exc: Exception) -> dict[str, Any]:
+    """A write refused the palace lock: the daemon re-queues it unspent.
+
+    Fork delta 16: the daemon no longer owns the lock for its lifetime, so a
+    diary or tool write can meet another writer mid-call. ``mine_palace_lock``
+    wraps the write itself, so nothing was filed and a retry is safe.
+    """
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
+
+    return {
+        "success": False,
+        "error": f"palace busy, write deferred: {exc}",
+        "error_class": LOCK_REFUSAL_ERROR_CLASS,
+        "exit_code": 1,
+    }
+
+
 @_restores_palace_env
 def run_diary_write(payload: dict[str, Any]) -> dict[str, Any]:
     palace_path = payload.get("palace_path")
@@ -407,13 +424,17 @@ def run_diary_write(payload: dict[str, Any]) -> dict[str, Any]:
     _apply_backend(payload.get("backend"))
 
     from .mcp_server import tool_diary_write
+    from .palace import MineAlreadyRunning
 
-    result = tool_diary_write(
-        agent_name=payload.get("agent_name") or "mempalace",
-        entry=payload.get("entry") or "",
-        topic=payload.get("topic") or "general",
-        wing=payload.get("wing") or "",
-    )
+    try:
+        result = tool_diary_write(
+            agent_name=payload.get("agent_name") or "mempalace",
+            entry=payload.get("entry") or "",
+            topic=payload.get("topic") or "general",
+            wing=payload.get("wing") or "",
+        )
+    except MineAlreadyRunning as exc:
+        return _lock_refusal_result(exc)
     result.setdefault("exit_code", 0 if result.get("success") else 1)
     return result
 
@@ -441,10 +462,14 @@ def run_mcp_tool(payload: dict[str, Any]) -> dict[str, Any]:
             "exit_code": 2,
         }
     from .mcp_server import TOOLS
+    from .palace import MineAlreadyRunning
 
     if name not in TOOLS:
         return {"success": False, "error": f"unknown MCP tool: {name}", "exit_code": 2}
-    result = TOOLS[name]["handler"](**arguments)
+    try:
+        result = TOOLS[name]["handler"](**arguments)
+    except MineAlreadyRunning as exc:
+        return _lock_refusal_result(exc)
     if isinstance(result, dict):
         # Several write tools signal failure with a bare {"error": ...} and no
         # explicit success flag (e.g. tool_create_tunnel / tool_delete_tunnel

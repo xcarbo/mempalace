@@ -29,12 +29,7 @@ from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlparse
 
 from .config import MempalaceConfig
-from .palace import (
-    MineAlreadyRunning,
-    backend_requires_single_writer,
-    mine_palace_lock,
-    resolve_backend_name,
-)
+from .palace import resolve_backend_name
 
 HOST = "127.0.0.1"
 STATE_ROOT_ENV = "MEMPALACE_DAEMON_STATE_ROOT"
@@ -890,17 +885,14 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
     runtime = None
     writer_lease = contextlib.ExitStack()
     try:
-        resolved_backend = resolve_backend_name(palace_path, explicit=backend)
-        if backend_requires_single_writer(resolved_backend):
-            try:
-                writer_lease.enter_context(mine_palace_lock(palace_path))
-            except MineAlreadyRunning as exc:
-                raise DaemonError(
-                    "writable daemon startup refused: another writer owns "
-                    f"local backend {resolved_backend!r} for {palace_path!r}; "
-                    "stop the existing writable MCP/direct/daemon owner, or "
-                    "route all writes through that owner"
-                ) from exc
+        # Fork delta: a shared queue, not the palace's owner. Upstream holds
+        # mine_palace_lock for the daemon's whole life, so once it runs every
+        # write that does not go through it (memp add-drawer, cron jobs, the
+        # :4109 write routes, a second harness) fails with MineAlreadyRunning.
+        # Here each job takes the lock for its own write, like every other
+        # writer, and a refusal is a deferral (#2014): the job goes back to the
+        # queue unspent. ``writer_lease`` stays empty; its cleanup is harmless.
+        resolve_backend_name(palace_path, explicit=backend)
 
         token = ensure_token(palace_path)
         # Backend resolution above is only the ownership decision. Preserve

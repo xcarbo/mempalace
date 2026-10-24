@@ -150,6 +150,7 @@ uv run pytest tests/test_fork_deltas.py -v
 | `get(limit, offset)` paging (`backends/sqlite_exact.py` `_rows`) | rowid seek via an index-only anchor; metadata-only reads skip `document` | SQL `OFFSET` on the full-row read | Same rows either way, so nothing fails: a one-file hook mine goes back to 30 minutes on the Mini palace, holding the lock and dropping other sessions' diary saves |
 | convo mine lock (`convo_miner.mine_convos`) | taken after the read-only prefetch | wraps the whole mine | Same drawers filed, so nothing fails: the full-palace prefetch runs under the lock again and hook diary saves time out behind it |
 | read paths besides `_open_search_collection` (`searcher.search`, the closets open in `search_memories`, `miner.status`) | `read_only=True` via `palace.get_collection_read_only` | writable opens | While any mine runs, plain `memp search` and `memp status` raise `MineAlreadyRunning` and `memp search --json` waits 10 s |
+| daemon writer lease (`daemon.run_server`, `service.run_diary_write` / `run_mcp_tool`) | none: each job takes the lock for its own write; a busy lock is a refusal and the job re-queues unspent | `mine_palace_lock` held for the daemon's lifetime | With the daemon on, every write outside it (`memp add-drawer`, crons, `:4109` write routes) fails with `MineAlreadyRunning` |
 
 Two rules:
 

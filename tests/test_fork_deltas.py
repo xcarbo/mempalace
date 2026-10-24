@@ -465,3 +465,18 @@ def test_reads_work_while_another_process_holds_the_write_lock(tmp_path, monkeyp
         holder.join(timeout=10)
         if holder.is_alive():
             holder.terminate()
+
+
+def test_daemon_is_a_shared_queue_not_the_palace_owner():
+    """Delta 16: run_server takes no lifetime mine_palace_lock.
+
+    Upstream's daemon owns the palace while it runs, so every write outside it
+    fails with MineAlreadyRunning: every memp add-drawer, cron job and :4109
+    write route on a box with the daemon on. The behaviour is pinned in
+    tests/test_daemon.py (test_daemon_does_not_hold_the_writer_lease); this
+    catches a merge that brings the lease back before that test is even read.
+    """
+    from mempalace import daemon
+
+    src = inspect.getsource(daemon.run_server)
+    assert "mine_palace_lock(" not in src, "FORK DELTA REVERTED: the daemon holds the palace lock"

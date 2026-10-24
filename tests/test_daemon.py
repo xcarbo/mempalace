@@ -11,6 +11,7 @@ from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace import daemon
 from mempalace import service
+from mempalace.palace import mine_palace_lock
 
 _LOCK_CONTENDER = """
 from mempalace.palace import MineAlreadyRunning, mine_palace_lock
@@ -144,7 +145,13 @@ def test_daemon_http_lifecycle_executes_job(tmp_path, monkeypatch):
     _stop_server(client, thread, holders)
 
 
-def test_daemon_holds_local_backend_writer_lease_for_lifetime(tmp_path, monkeypatch):
+def test_daemon_does_not_hold_the_writer_lease(tmp_path, monkeypatch):
+    """Fork delta 16: a running daemon leaves the palace lock free.
+
+    Upstream holds mine_palace_lock for the daemon's lifetime, which makes every
+    write outside it (memp add-drawer, cron jobs, the :4109 write routes) fail
+    with MineAlreadyRunning. Here each job takes the lock for its own write.
+    """
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     client, thread, palace, holders = _start_server(
         tmp_path, monkeypatch, lambda kind, payload: {"success": True, "exit_code": 0}
@@ -156,17 +163,9 @@ def test_daemon_holds_local_backend_writer_lease_for_lifetime(tmp_path, monkeypa
             env=os.environ.copy(),
             timeout=10,
         )
-        assert result.returncode == 23
+        assert result.returncode == 0, "FORK DELTA REVERTED: the daemon holds the palace lock"
     finally:
         _stop_server(client, thread, holders)
-
-    released = subprocess.run(
-        [sys.executable, "-c", _LOCK_CONTENDER, str(palace)],
-        check=False,
-        env=os.environ.copy(),
-        timeout=10,
-    )
-    assert released.returncode == 0
 
 
 def test_submit_job_uses_client_and_waits(monkeypatch, tmp_path):
@@ -353,8 +352,10 @@ def test_shutdown_cancels_active_job(tmp_path, monkeypatch):
     block = threading.Event()
 
     def fake_execute(kind, payload):
-        # Simulate a long-running job that never finishes on its own.
-        block.wait(30)
+        # Simulate a long-running write that never finishes on its own. Like a
+        # real job (fork delta 16), it holds the palace lock while it writes.
+        with mine_palace_lock(payload["palace_path"]):
+            block.wait(30)
         return {"success": True, "exit_code": 0}
 
     monkeypatch.setattr(daemon, "SHUTDOWN_DRAIN_SECONDS", 0.2)
@@ -366,7 +367,7 @@ def test_shutdown_cancels_active_job(tmp_path, monkeypatch):
         if client.get_job(job["id"])["state"] == "running":
             break
         time.sleep(0.02)
-    assert client.get_job(job["id"])["state"] == "running"
+    assert client.get_job(job["id"])["state"] == "running", client.get_job(job["id"])
 
     _stop_server(client, thread, holders)
 
@@ -377,8 +378,8 @@ def test_shutdown_cancels_active_job(tmp_path, monkeypatch):
     # And recover_running must not re-queue a cancelled job.
     assert store.recover_running() == 0
 
-    # The server thread is gone, but its timed-out worker is still executing.
-    # Writer ownership must stay with that worker until it truly exits.
+    # The server thread is gone, but its timed-out worker is still executing,
+    # and its write still holds the lock until it truly exits.
     contender = subprocess.run(
         [sys.executable, "-c", _LOCK_CONTENDER, str(palace)],
         check=False,
@@ -1530,3 +1531,23 @@ def test_detached_kwargs_windows(tmp_path, monkeypatch):
         assert "start_new_session" not in kwargs
     finally:
         fh.close()
+
+
+@pytest.mark.parametrize("kind", ["diary_write", "mcp_tool"])
+def test_write_job_meeting_a_held_lock_is_a_refusal(monkeypatch, kind):
+    """Fork delta 16: with no lifetime lease, a diary or tool write can meet
+    another writer mid-call. That must defer (nothing was filed), never fail."""
+    from mempalace import mcp_server
+    from mempalace.palace import MineAlreadyRunning
+
+    def busy(**_kwargs):
+        raise MineAlreadyRunning("palace is held by PID 999")
+
+    monkeypatch.setattr(mcp_server, "tool_diary_write", busy)
+    monkeypatch.setitem(mcp_server.TOOLS["mempalace_add_drawer"], "handler", busy)
+    if kind == "diary_write":
+        result = service.run_diary_write({"entry": "x"})
+    else:
+        result = service.run_mcp_tool({"name": "mempalace_add_drawer", "arguments": {}})
+    assert result["success"] is False
+    assert result["error_class"] == daemon.LOCK_REFUSAL_ERROR_CLASS
