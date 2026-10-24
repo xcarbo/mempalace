@@ -151,6 +151,7 @@ uv run pytest tests/test_fork_deltas.py -v
 | convo mine lock (`convo_miner.mine_convos`) | taken after the read-only prefetch | wraps the whole mine | Same drawers filed, so nothing fails: the full-palace prefetch runs under the lock again and hook diary saves time out behind it |
 | read paths besides `_open_search_collection` (`searcher.search`, the closets open in `search_memories`, `miner.status`) | `read_only=True` via `palace.get_collection_read_only` | writable opens | While any mine runs, plain `memp search` and `memp status` raise `MineAlreadyRunning` and `memp search --json` waits 10 s |
 | daemon writer lease (`daemon.run_server`, `service.run_diary_write` / `run_mcp_tool`) | none: each job takes the lock for its own write; a busy lock is a refusal and the job re-queues unspent | `mine_palace_lock` held for the daemon's lifetime | With the daemon on, every write outside it (`memp add-drawer`, crons, `:4109` write routes) fails with `MineAlreadyRunning` |
+| MCP read tools (`mcp_server._get_collection(read_only=True)`: get-drawer, list-drawers, list-wings, list-rooms, taxonomy, check-duplicate, graph tools, diary-read) | read-only open, not cached | writable open for every non-MCP-server caller | While any mine runs, every `memp get-drawer` / `list-drawers` waits 10 s and fails "palace busy, write not filed" |
 
 Two rules:
 

@@ -908,7 +908,7 @@ class TestReadTools:
         monkeypatch.setattr(mcp_server, "_collection_cache", None)
         monkeypatch.setattr(mcp_server, "_metadata_cache", None)
         monkeypatch.setattr(
-            mcp_server, "_get_collection", lambda create=False: _FakeQdrantCollection()
+            mcp_server, "_get_collection", lambda create=False, **_kw: _FakeQdrantCollection()
         )
 
         result = mcp_server.tool_status()
@@ -1110,7 +1110,7 @@ class TestMetadataFacets:
             {"wing_a": 2, "wing_b": 3},
             {"room_x": 4, "room_y": 1},
         ]
-        monkeypatch.setattr(mcp, "_get_collection", lambda create=False: col)
+        monkeypatch.setattr(mcp, "_get_collection", lambda create=False, **_kw: col)
         result = mcp.tool_status()
 
         assert result["wings"] == {
@@ -1136,7 +1136,7 @@ class TestMetadataFacets:
             "wing_a": 5,
             "wing_b": 2,
         }
-        monkeypatch.setattr(mcp, "_get_collection", lambda: col)
+        monkeypatch.setattr(mcp, "_get_collection", lambda **_kw: col)
         result = mcp.tool_list_wings()
 
         assert result == {
@@ -1162,7 +1162,7 @@ class TestMetadataFacets:
             "room2": 3,
         }
 
-        monkeypatch.setattr(mcp, "_get_collection", lambda: col)
+        monkeypatch.setattr(mcp, "_get_collection", lambda **_kw: col)
 
         result = mcp.tool_list_rooms("engineering")
 
@@ -1198,7 +1198,7 @@ class TestMetadataFacets:
 
         col.facet_counts.side_effect = facet_counts_mock
 
-        monkeypatch.setattr(mcp, "_get_collection", lambda: col)
+        monkeypatch.setattr(mcp, "_get_collection", lambda **_kw: col)
 
         result = mcp.tool_get_taxonomy()
         assert col.facet_counts.call_args_list[0] == call("wing")
@@ -1263,7 +1263,7 @@ class TestNoneMetadataSafety:
             "documents": ["verbatim body"],
             "metadatas": [None],
         }
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, **_kw: stub_col)
 
         result = mcp_server.tool_get_drawer("drawer_none_meta")
         assert "error" not in result
@@ -1286,7 +1286,7 @@ class TestNoneMetadataSafety:
             "metadatas": [None, {"wing": "ok", "room": "fine"}],
         }
         stub_col.count.return_value = 2
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, **_kw: stub_col)
 
         result = mcp_server.tool_list_drawers()
         assert result["count"] == 2
@@ -1307,7 +1307,7 @@ class TestNoneMetadataSafety:
             "documents": ["old body"],
             "metadatas": [None],
         }
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, **_kw: stub_col)
 
         result = mcp_server.tool_update_drawer("drawer_none_meta", wing="recovered")
         # Should succeed: old_meta is coerced to {}, new wing slots in cleanly.
@@ -1332,7 +1332,7 @@ class TestNoneMetadataSafety:
             "documents": ["doomed body"],
             "metadatas": [None],
         }
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, **_kw: stub_col)
 
         # Should reach the delete call without AttributeError on the audit-log path.
         result = mcp_server.tool_delete_drawer("drawer_none_meta")
@@ -1474,7 +1474,7 @@ class TestSearchTool:
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
 
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda: pytest.fail())
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda **_kw: pytest.fail())
 
         result = mcp_server.tool_list_rooms(wing="../etc/passwd")
         assert "error" in result
@@ -1622,7 +1622,7 @@ class TestSearchTool:
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
 
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda: pytest.fail())
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda **_kw: pytest.fail())
 
         result = mcp_server.tool_list_drawers(wing="../notes")
         assert "error" in result
@@ -1631,7 +1631,7 @@ class TestSearchTool:
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
 
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda: pytest.fail())
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda **_kw: pytest.fail())
 
         result = mcp_server.tool_find_tunnels(wing_a="../project")
         assert "error" in result
@@ -1696,7 +1696,7 @@ class TestWriteTools:
 
         mock_col = MagicMock()
         mock_col.get.side_effect = RuntimeError("precheck boom")
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: mock_col)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, **_kw: mock_col)
 
         result = mcp_server.tool_add_drawer("w", "r", "content")
 
@@ -1712,7 +1712,7 @@ class TestWriteTools:
 
         mock_col = MagicMock()
         mock_col.get.side_effect = RuntimeError("precheck boom")
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: mock_col)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, **_kw: mock_col)
 
         result = mcp_server.tool_add_drawer("w", "r", "content")
 
@@ -1727,7 +1727,7 @@ class TestWriteTools:
 
         mock_col = MagicMock()
         mock_col.get.return_value = {"ids": ["existing-drawer"]}
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: mock_col)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, **_kw: mock_col)
 
         result = mcp_server.tool_add_drawer("w", "r", "content")
 
@@ -1759,7 +1759,7 @@ class TestWriteTools:
             def upsert(self, **kwargs):
                 return None
 
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, **_kw: _FakeCol())
 
         result = mcp_server.tool_add_drawer("w", "r", "content")
         assert result["success"] is False
@@ -1824,7 +1824,7 @@ class TestWriteTools:
             "metadatas": [[{"wing": "w", "room": "r"}, None]],
             "documents": [["first doc", None]],
         }
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda: mock_col)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda **_kw: mock_col)
 
         result = mcp_server.tool_check_duplicate("any content", threshold=0.5)
 
@@ -4043,7 +4043,7 @@ class TestCacheInvalidation:
         from mempalace import mcp_server
 
         # Make _get_collection always return None
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: None)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, **_kw: None)
 
         result = mcp_server.tool_reconnect()
         assert result["success"] is False
@@ -4075,7 +4075,7 @@ class TestCacheInvalidation:
             def count(self):
                 return 7
 
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, **_kw: _FakeCol())
 
         result = mcp_server.tool_reconnect()
         assert result["success"] is True
@@ -4101,7 +4101,7 @@ class TestCacheInvalidation:
 
         monkeypatch.setattr(palace, "get_backend_for_palace", lambda _path: _FakeBackend())
         monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: False)
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, **_kw: _FakeCol())
 
         result = mcp_server.tool_reconnect()
 
@@ -4136,7 +4136,7 @@ class TestCacheInvalidation:
         monkeypatch.setattr(backends, "get_backend", lambda _name: _CachedBackend())
         monkeypatch.setattr(mcp_server, "_collection_cache_backend", "chroma")
         monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: False)
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, **_kw: _FakeCol())
 
         result = mcp_server.tool_reconnect()
 
@@ -4606,7 +4606,7 @@ class TestStructuredErrors:
         fake_b = _FakeKG()
         monkeypatch.setattr(mcp_server, "_kg_by_path", {"/a": fake_a, "/b": fake_b})
         # Bypass real ChromaDB so the test isolates KG-cache behaviour.
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda: None)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda **_kw: None)
 
         mcp_server.tool_reconnect()
 
@@ -4623,7 +4623,7 @@ class TestStructuredErrors:
                 raise RuntimeError("boom")
 
         monkeypatch.setattr(mcp_server, "_kg_by_path", {"/a": _BoomKG()})
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda: None)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda **_kw: None)
 
         mcp_server.tool_reconnect()
 
@@ -4639,7 +4639,7 @@ class TestStructuredErrors:
         gate = {palace_path}
         monkeypatch.setattr(ChromaBackend, "_quarantined_paths", gate)
         monkeypatch.setattr(mcp_server, "_config", type("C", (), {"palace_path": palace_path})())
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda: None)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda **_kw: None)
 
         mcp_server.tool_reconnect()
 

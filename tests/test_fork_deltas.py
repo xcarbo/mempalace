@@ -467,6 +467,66 @@ def test_reads_work_while_another_process_holds_the_write_lock(tmp_path, monkeyp
             holder.terminate()
 
 
+def test_mcp_read_tools_work_while_another_process_holds_the_write_lock(
+    tmp_path, monkeypatch, config, palace_path
+):
+    """Delta 17: the MCP read tools (`memp get-drawer`, `memp list-drawers`,
+    list-wings, diary-read, ...) open the palace read-only.
+
+    They went through mcp_server._get_collection, which opens writable for any
+    caller that is not a stdio MCP server, so every `memp` read run while a mine
+    held the lock waited 10 s and failed "palace busy" (2026-10-24, after delta
+    15 had fixed search and status).
+    """
+    import multiprocessing
+    import time
+
+    from mempalace import mcp_server
+    from mempalace.palace import get_backend_for_palace, get_collection
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setattr(mcp_server, "_config", config)
+    col = get_collection(palace_path, create=True)
+    col.add(
+        ids=["d1"],
+        documents=["ship the palace fix first"],
+        metadatas=[{"wing": "w", "room": "r", "filed_at": "2026-10-24T00:00:00"}],
+    )
+    get_backend_for_palace(palace_path).close_palace(palace_path)
+
+    ready, release = str(tmp_path / "ready"), str(tmp_path / "release")
+    holder = multiprocessing.get_context("spawn").Process(
+        target=_hold_lock_until_released, args=(palace_path, ready, release)
+    )
+    holder.start()
+    try:
+        for _ in range(1000):
+            if os.path.exists(ready):
+                break
+            time.sleep(0.01)
+        assert os.path.exists(ready), "child never took the palace lock"
+
+        started = time.time()
+        drawer = mcp_server.tool_get_drawer("d1")
+        listed = mcp_server.tool_list_drawers(wing="w")
+        wings = mcp_server.tool_list_wings()
+        assert drawer.get("content") == "ship the palace fix first", (
+            f"FORK DELTA REVERTED: get-drawer took the write lock: {drawer}"
+        )
+        assert listed.get("count") == 1, f"FORK DELTA REVERTED: list-drawers: {listed}"
+        assert "error" not in wings, f"FORK DELTA REVERTED: list-wings: {wings}"
+        assert time.time() - started < 8, "a read tool waited on the write lock"
+        # A read-only handle in the shared cache would be handed to the next
+        # write tool in this process.
+        assert mcp_server._collection_cache is None, "a read-only handle was cached"
+    finally:
+        open(release, "w").close()
+        holder.join(timeout=10)
+        if holder.is_alive():
+            holder.terminate()
+
+
 def test_daemon_is_a_shared_queue_not_the_palace_owner():
     """Delta 16: run_server takes no lifetime mine_palace_lock.
 

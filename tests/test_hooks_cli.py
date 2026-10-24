@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -1592,8 +1593,36 @@ def test_ingest_transcript_skips_when_target_running(tmp_path):
                 pid_file.write_text(f"{os.getpid()} {int(_time.time())}")  # live target, fresh
 
                 with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
-                    _ingest_transcript(str(transcript))
+                    with patch("mempalace.hooks_cli._log") as mock_log:
+                        _ingest_transcript(str(transcript))
                     mock_popen.assert_not_called()
+                    logged = [c.args[0] for c in mock_log.call_args_list]
+                    assert any(m.startswith("Skipping mine") for m in logged), logged
+                    assert not any("ingest started" in m for m in logged), logged
+
+
+def test_hook_spawned_mine_prints_done_line_with_duration(tmp_path, monkeypatch, capsys):
+    """A hook-spawned mine's stdout is hook.log; it ends with one timestamped
+    done line, so a slow mine shows up there rather than only in the lock file."""
+    from mempalace import cli
+
+    monkeypatch.setenv("MEMPALACE_MINE_PID_FILE", str(tmp_path / "slot.pid"))
+    with cli._hook_mine_done_line(str(tmp_path / "session.jsonl")):
+        pass
+    assert re.match(
+        r"\[\d\d:\d\d:\d\d\] Transcript ingest done: session\.jsonl in \d+\.\d s$",
+        capsys.readouterr().out.strip(),
+    )
+
+    with pytest.raises(SystemExit):
+        with cli._hook_mine_done_line(str(tmp_path / "session.jsonl")):
+            sys.exit(1)
+    assert "Transcript ingest failed: session.jsonl" in capsys.readouterr().out
+
+    monkeypatch.delenv("MEMPALACE_MINE_PID_FILE")
+    with cli._hook_mine_done_line(str(tmp_path / "session.jsonl")):
+        pass
+    assert capsys.readouterr().out == ""
 
 
 # --- _mine_already_running ---

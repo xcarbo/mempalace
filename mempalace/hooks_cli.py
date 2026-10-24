@@ -504,8 +504,11 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
         return None
 
 
-def _spawn_mine(cmd: list) -> None:
+def _spawn_mine(cmd: list) -> bool:
     """Spawn a mine subprocess if no live mine is already targeting it.
+
+    Returns True if it spawned one, False if it skipped, so callers do not
+    log "ingest started" for a mine that never ran.
 
     The PID slot is claimed atomically *before* the spawn, so two near-
     simultaneous hook fires can't both proceed — the second sees the
@@ -518,7 +521,7 @@ def _spawn_mine(cmd: list) -> None:
     pid_file = _claim_mine_slot(cmd)
     if pid_file is None:
         _log(f"Skipping mine: target already running ({' '.join(cmd[-3:])})")
-        return
+        return False
     child_env = os.environ.copy()
     child_env[_MINE_PID_FILE_ENV] = str(pid_file)
     with open(log_path, "a") as log_f:
@@ -542,6 +545,7 @@ def _spawn_mine(cmd: list) -> None:
         pid_file.write_text(f"{proc.pid} {int(time.time())}")
     except OSError:
         pass
+    return True
 
 
 def _hooks_daemon_enabled() -> bool:
@@ -1199,7 +1203,7 @@ def _ingest_transcript(transcript_path: str):
         # Route through ``_spawn_mine`` so the per-target PID guard kicks
         # in here too — repeated Stop/PreCompact fires for the same
         # transcript should not stack up parallel ingest mines.
-        _spawn_mine(
+        if _spawn_mine(
             [
                 _mempalace_python(),
                 "-m",
@@ -1211,8 +1215,8 @@ def _ingest_transcript(transcript_path: str):
                 "--wing",
                 wing,
             ]
-        )
-        _log(f"Transcript ingest started: {path.name} -> {wing}")
+        ):
+            _log(f"Transcript ingest started: {path.name} -> {wing}")
     except OSError:
         pass
     except Exception as exc:

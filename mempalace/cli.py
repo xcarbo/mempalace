@@ -752,7 +752,7 @@ def cmd_mine(args):
         _submit_daemon_cli_job("mine", payload, args, background=getattr(args, "background", False))
         return
 
-    from .palace import MineAlreadyRunning, MineValidationError
+    from .palace import MineAlreadyRunning
 
     if source_adapter:
         try:
@@ -788,6 +788,40 @@ def cmd_mine(args):
             palace_dir=palace_path,
             llm_provider=None,
         )
+
+    with _hook_mine_done_line(args.dir):
+        _run_mine(args, mode, palace_path, include_ignored)
+
+
+@contextlib.contextmanager
+def _hook_mine_done_line(source: str):
+    """Print one timestamped ``Transcript ingest done|failed`` line at the end
+    of a hook-spawned mine. Its stdout is hook.log, which otherwise never said
+    when a mine finished or how long it ran: a 30-minute mine (2026-10-24) was
+    visible only in the lock file. Hook-spawned = ``MEMPALACE_MINE_PID_FILE``
+    set (hooks_cli._spawn_mine)."""
+    if not os.environ.get("MEMPALACE_MINE_PID_FILE"):
+        yield
+        return
+    import time
+    from datetime import datetime
+
+    started = time.monotonic()
+    outcome = "failed"
+    try:
+        yield
+        outcome = "done"
+    finally:
+        stamp = datetime.now().strftime("%H:%M:%S")
+        took = time.monotonic() - started
+        print(
+            f"[{stamp}] Transcript ingest {outcome}: {Path(source).name} in {took:.1f} s",
+            flush=True,
+        )
+
+
+def _run_mine(args, mode, palace_path, include_ignored):
+    from .palace import MineAlreadyRunning, MineValidationError
 
     try:
         if mode == "convos":

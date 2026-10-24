@@ -1474,8 +1474,15 @@ def _get_client():
     return _client_cache
 
 
-def _get_collection(create=False):
+def _get_collection(create=False, read_only=False):
     """Return the configured backend collection, caching handles between calls.
+
+    ``read_only=True`` is for tools that only read (get-drawer, list-drawers,
+    list-wings, ...). On sqlite_exact it reuses a cached handle if there is one,
+    else opens read-only without caching it (the backend caches read-only
+    handles itself), so a later write in the same process still gets a
+    writable open. A writable open takes the palace write lock, and every
+    `memp` read during a mine failed "palace busy" (2026-10-24, delta 17).
 
     On failure, log the exception and retry once after clearing the client
     and collection caches. Tools were silently returning ``None`` when a
@@ -1553,6 +1560,16 @@ def _get_collection(create=False):
                 ):
                     _collection_open_error = None
                     return _collection_cache
+                if read_only and backend_name == "sqlite_exact" and not collection_read_only:
+                    from .palace import get_collection_read_only
+
+                    col = get_collection_read_only(
+                        _config.palace_path,
+                        collection_name=_config.collection_name,
+                        backend=backend_name,
+                    )
+                    _collection_open_error = None
+                    return col
                 _collection_cache = None
                 _collection_cache_backend = None
                 _collection_cache_palace = None
@@ -2351,7 +2368,7 @@ def tool_list_wings():
         for w, room_counts in wing_rooms.items():
             wings[w] = wings.get(w, 0) + sum(room_counts.values())
         return {"wings": wings}
-    col = _get_collection()
+    col = _get_collection(create=False, read_only=True)
     if not col:
         return _collection_error_or_no_palace()
     wings = {}
@@ -2401,7 +2418,7 @@ def tool_list_rooms(wing: str = None):
             for r, n in room_counts.items():
                 rooms[r] = rooms.get(r, 0) + n
         return {"wing": wing or "all", "rooms": rooms}
-    col = _get_collection()
+    col = _get_collection(create=False, read_only=True)
     if not col:
         return _collection_error_or_no_palace()
     rooms = {}
@@ -2446,7 +2463,7 @@ def tool_get_taxonomy():
     if fast is not None:
         _total, wing_rooms = fast
         return {"taxonomy": {w: dict(room_counts) for w, room_counts in wing_rooms.items()}}
-    col = _get_collection()
+    col = _get_collection(create=False, read_only=True)
     if not col:
         return _collection_error_or_no_palace()
     taxonomy = {}
@@ -2608,7 +2625,7 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
                 "duplicate detection requires vector search; run `mempalace repair` to restore"
             ),
         }
-    col = _get_collection()
+    col = _get_collection(create=False, read_only=True)
     if not col:
         return _collection_error_or_no_palace()
     try:
@@ -2655,7 +2672,7 @@ def tool_get_aaak_spec():
 def tool_traverse_graph(start_room: str, max_hops: int = 2):
     """Walk the palace graph from a room. Find connected ideas across wings."""
     max_hops = max(1, min(max_hops, 10))
-    col = _get_collection()
+    col = _get_collection(create=False, read_only=True)
     if not col:
         return _collection_error_or_no_palace()
     return traverse(start_room, col=col, max_hops=max_hops)
@@ -2668,7 +2685,7 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
         wing_b = _sanitize_optional_name(wing_b, "wing_b")
     except ValueError as e:
         return {"error": str(e)}
-    col = _get_collection()
+    col = _get_collection(create=False, read_only=True)
     if not col:
         return _collection_error_or_no_palace()
     return find_tunnels(wing_a, wing_b, col=col)
@@ -2682,7 +2699,7 @@ def tool_graph_stats():
     fast = _sqlite_graph_stats()
     if fast is not None:
         return fast
-    col = _get_collection()
+    col = _get_collection(create=False, read_only=True)
     if not col:
         return _collection_error_or_no_palace()
     return graph_stats(col=col)
@@ -2773,7 +2790,7 @@ def tool_follow_tunnels(wing: str, room: str):
         room = sanitize_name(room, "room")
     except ValueError as e:
         return {"error": str(e)}
-    col = _get_collection()
+    col = _get_collection(create=False, read_only=True)
     if not col:
         return _collection_error_or_no_palace()
     return follow_tunnels(wing, room, col=col)
@@ -3809,7 +3826,7 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
 
 def tool_get_drawer(drawer_id: str):
     """Fetch a single logical drawer by ID."""
-    col = _get_collection()
+    col = _get_collection(create=False, read_only=True)
     if not col:
         return _collection_error_or_no_palace()
 
@@ -3854,7 +3871,7 @@ def tool_list_drawers(
     except ValueError as e:
         return {"error": str(e)}
 
-    col = _get_collection()
+    col = _get_collection(create=False, read_only=True)
     if not col:
         return _collection_error_or_no_palace()
 
@@ -4476,7 +4493,7 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     except ValueError as e:
         return {"error": str(e)}
     last_n = max(1, min(last_n, 100))
-    col = _get_collection()
+    col = _get_collection(create=False, read_only=True)
     if not col:
         return _collection_error_or_no_palace()
 
