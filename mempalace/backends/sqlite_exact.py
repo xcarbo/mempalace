@@ -846,7 +846,15 @@ class SQLiteExactCollection(BaseCollection):
                     self._replace_fts(cur, collection_id, doc_id, doc, rowid)
 
     def _rows(
-        self, cur, *, where=None, where_document=None, limit=None, offset=None, with_embedding=True
+        self,
+        cur,
+        *,
+        where=None,
+        where_document=None,
+        limit=None,
+        offset=None,
+        with_embedding=True,
+        with_document=True,
     ) -> list[dict]:
         _validate_where(where)
         _validate_where(where_document)
@@ -875,7 +883,11 @@ class SQLiteExactCollection(BaseCollection):
         needs_python_filter = not compiled and (where is not None or where_document is not None)
         # The embedding blob dominates row width (1.5 KB at 384-d); skip it
         # unless the caller actually wants vectors back.
-        select_cols = "rowid, id, document, metadata_json" + (
+        # The document is the next widest column; a metadata-only sweep
+        # (include=["metadatas"]) reads none of it. The Python where_document
+        # fallback still needs it, so it stays whenever that filter is set.
+        doc_col = "document" if with_document or where_document is not None else "NULL"
+        select_cols = f"rowid, id, {doc_col}, metadata_json" + (
             ", embedding" if with_embedding else ""
         )
         sql = f"SELECT {select_cols}\nFROM documents\nWHERE collection_id = ?" + "".join(
@@ -926,6 +938,34 @@ class SQLiteExactCollection(BaseCollection):
             if not compiled_clauses:
                 # No-filter scan or Python-fallback scan: the (collection_id)
                 # index yields rowid order without a sort step.
+                if not needs_python_filter and offset:
+                    # Seek, don't skip. SQL OFFSET reads every skipped row in
+                    # full, so paging a whole palace (prefetch_mined_set,
+                    # prefetch_content_hashes) cost O(n^2) row reads: 4 s for
+                    # one page at offset 300k, 30 minutes for a one-file mine
+                    # on a 328k-drawer palace (2026-10-24). Find the page's
+                    # first rowid with an index-only walk, then read from it.
+                    # INDEXED BY: left alone the planner walks the wider
+                    # (collection_id, wing, room, hall) index and sorts it in
+                    # a temp B-tree (92 ms a page vs 14 ms). Every palace has
+                    # the index; the fallback only guards a hand-built one.
+                    anchor_sql = (
+                        "SELECT rowid FROM documents {hint}WHERE collection_id = ?"
+                        " ORDER BY rowid LIMIT 1 OFFSET ?"
+                    )
+                    anchor_params = (collection_id, int(offset))
+                    try:
+                        anchor = cur.execute(
+                            anchor_sql.format(hint="INDEXED BY idx_documents_collection "),
+                            anchor_params,
+                        ).fetchone()
+                    except sqlite3.OperationalError:
+                        anchor = cur.execute(anchor_sql.format(hint=""), anchor_params).fetchone()
+                    if anchor is None:
+                        return []
+                    sql += " AND rowid >= ?"
+                    params.append(anchor[0])
+                    offset = None
                 sql += "\nORDER BY rowid"
                 if not needs_python_filter and (limit is not None or offset):
                     pushed_page = True
@@ -1452,6 +1492,7 @@ class SQLiteExactCollection(BaseCollection):
                     limit=limit if push_page else None,
                     offset=offset if push_page else None,
                     with_embedding=spec.embeddings,
+                    with_document=spec.documents,
                 )
             )
         if not push_page:

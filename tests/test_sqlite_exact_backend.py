@@ -163,6 +163,12 @@ def _doc_select_sql(col, action):
     return result, selects
 
 
+def _split_anchor(selects):
+    """Split traced selects into the offset seek (rowid only) and the row reads."""
+    anchors = [s for s in selects if s.startswith("SELECT rowid FROM documents")]
+    return anchors, [s for s in selects if s not in anchors]
+
+
 def _seed(col, n):
     col.add(
         ids=[f"d{i}" for i in range(n)],
@@ -182,9 +188,15 @@ def test_sqlite_exact_get_unfiltered_page_pushes_limit_offset(tmp_path):
 
     assert result.ids == ["d2", "d3", "d4"]
     assert result.documents == ["doc 2", "doc 3", "doc 4"]
-    assert len(selects) == 1
-    assert "LIMIT" in selects[0]
-    assert "OFFSET" in selects[0]
+    # Seek, don't skip: the OFFSET runs on an index-only rowid lookup, and the
+    # row read starts at that rowid. An OFFSET on the row read itself reads
+    # every skipped row in full (30-minute mines, 2026-10-24).
+    anchors, reads = _split_anchor(selects)
+    assert len(anchors) == 1 and "OFFSET" in anchors[0]
+    assert len(reads) == 1
+    assert "LIMIT" in reads[0]
+    assert "OFFSET" not in reads[0]
+    assert "rowid >=" in reads[0]
 
 
 def test_sqlite_exact_get_filtered_page_compiles_without_sql_page(tmp_path):
@@ -433,10 +445,12 @@ def test_sqlite_exact_get_offset_only_and_limit_only_push(tmp_path):
 
     offset_only, offset_sql = _doc_select_sql(col, lambda: col.get(offset=3))
     assert offset_only.ids == ["d3", "d4"]
-    assert len(offset_sql) == 1
-    assert "OFFSET" in offset_sql[0]
-    # SQLite requires a LIMIT before OFFSET; an offset-only page uses LIMIT -1.
-    assert "LIMIT" in offset_sql[0]
+    anchors, reads = _split_anchor(offset_sql)
+    assert len(anchors) == 1 and "OFFSET" in anchors[0]
+    # The offset became a rowid seek, so the row read has neither bound.
+    assert len(reads) == 1
+    assert "OFFSET" not in reads[0]
+    assert "LIMIT" not in reads[0]
 
 
 def test_sqlite_exact_get_negative_bounds_use_python_slice(tmp_path):
@@ -473,6 +487,51 @@ def test_sqlite_exact_get_pages_tile_without_overlap(tmp_path):
     assert seen == [f"d{i}" for i in range(10)]
     # The same set, same rowid order, as a single unfiltered scan.
     assert col.get().ids == seen
+
+
+def test_sqlite_exact_get_offset_past_end_is_empty(tmp_path):
+    _backend, col = _collection(tmp_path)
+    _seed(col, 3)
+
+    assert col.get(limit=2, offset=3).ids == []
+    assert col.get(offset=10).ids == []
+
+
+def test_sqlite_exact_get_offset_seek_stays_in_its_collection(tmp_path):
+    backend, col = _collection(tmp_path)
+    other = backend.get_collection(
+        palace=PalaceRef(id=str(tmp_path), local_path=str(tmp_path)),
+        collection_name="other",
+        create=True,
+    )
+    # Interleave rows so the two collections' rowids alternate.
+    for i in range(6):
+        col.add(
+            ids=[f"d{i}"], documents=[f"doc {i}"], metadatas=[{"n": i}], embeddings=[[1.0, 0.0]]
+        )
+        other.add(
+            ids=[f"o{i}"], documents=[f"o {i}"], metadatas=[{"n": i}], embeddings=[[1.0, 0.0]]
+        )
+
+    assert col.get(limit=2, offset=2).ids == ["d2", "d3"]
+    assert other.get(limit=2, offset=4).ids == ["o4", "o5"]
+    assert col.get(offset=5).ids == ["d5"]
+
+
+def test_sqlite_exact_get_metadata_only_page_skips_documents(tmp_path):
+    _backend, col = _collection(tmp_path)
+    _seed(col, 4)
+
+    result, selects = _doc_select_sql(
+        col, lambda: col.get(limit=2, offset=1, include=["metadatas"])
+    )
+    assert result.ids == ["d1", "d2"]
+    assert [m["n"] for m in result.metadatas] == [1, 2]
+    _anchors, reads = _split_anchor(selects)
+    assert len(reads) == 1
+    assert "document" not in reads[0].split("FROM")[0]
+    # Asking for documents still reads them.
+    assert col.get(limit=1, offset=1, include=["documents"]).documents == ["doc 1"]
 
 
 def test_sqlite_exact_get_limit_zero_pushes_empty_page(tmp_path):

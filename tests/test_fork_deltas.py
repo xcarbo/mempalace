@@ -299,3 +299,46 @@ def test_chromadb_is_not_imported_at_module_load():
     out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
     assert out.returncode != 3, "a module-level chromadb import came back"
     assert out.returncode == 0, out.stderr[-2000:]
+
+
+def test_sqlite_exact_offset_page_seeks_instead_of_skipping(tmp_path):
+    """Delta 13: a deep get(limit, offset) page never puts OFFSET on the row read.
+
+    SQL OFFSET reads every skipped row in full. prefetch_mined_set and
+    prefetch_content_hashes page the whole palace that way, so a one-file
+    hook mine on the 328k-drawer Mini palace took 30 minutes holding the
+    palace lock (2026-10-24). The fork seeks to the page's first rowid with
+    an index-only lookup instead. A merge restoring the plain OFFSET passes
+    every behavioural test, since the rows returned are the same.
+    """
+    from mempalace.backends import PalaceRef
+    from mempalace.backends.sqlite_exact import SQLiteExactBackend
+
+    col = SQLiteExactBackend().get_collection(
+        palace=PalaceRef(id=str(tmp_path), local_path=str(tmp_path)),
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+    col.add(
+        ids=[f"d{i}" for i in range(5)],
+        documents=[f"doc {i}" for i in range(5)],
+        metadatas=[{"n": i} for i in range(5)],
+        embeddings=[[float(i), 1.0] for i in range(5)],
+    )
+    statements = []
+    conn = col._handle.conn
+    conn.set_trace_callback(statements.append)
+    try:
+        page = col.get(limit=2, offset=3, include=["metadatas"])
+    finally:
+        conn.set_trace_callback(None)
+    assert page.ids == ["d3", "d4"]
+    reads = [
+        s
+        for s in statements
+        if "FROM documents" in s and "metadata_json" in s and "ORDER BY rowid" in s
+    ]
+    assert reads, statements
+    assert all("OFFSET" not in s for s in reads), reads
+    # Metadata-only sweeps also leave the document text unread.
+    assert all("document," not in s.split("FROM")[0] for s in reads), reads

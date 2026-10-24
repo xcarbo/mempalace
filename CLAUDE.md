@@ -147,6 +147,7 @@ uv run pytest tests/test_fork_deltas.py -v
 | `mine_palace_lock` release (`palace.py`) | calls `_cleanup_mine_lock_file` | leaves the file | Every `memp` call then finds the previous call's dead holder and logs a "lock-residue GC: reclaiming" line on stderr — noise in every agent's tool output and in hook.log, one per process forever |
 | exchange stale check (`palace.py` mined-set) | no `convo_chunker_version` check | missing stamp = stale (3.11) | Any pick of upstream's `palace/mined.py` makes the next `mine --mode convos` re-mine every transcript still on disk. #2591 was taken forward-only (5878576) |
 | chromadb import (`backends/chroma.py`, `mcp_server.py`, `repair.py`) | lazy, first use only | module-level in all three | Every `memp` call, hook and write pays 0.3 to 0.55 s loading a library no fleet palace uses (all `sqlite_exact`). Restoring any one of the three imports brings the whole cost back |
+| `get(limit, offset)` paging (`backends/sqlite_exact.py` `_rows`) | rowid seek via an index-only anchor; metadata-only reads skip `document` | SQL `OFFSET` on the full-row read | Same rows either way, so nothing fails: a one-file hook mine goes back to 30 minutes on the Mini palace, holding the lock and dropping other sessions' diary saves |
 
 Two rules:
 
