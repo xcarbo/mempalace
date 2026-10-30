@@ -29,7 +29,7 @@ from .ids import (
     make_convo_sentinel_id,
     make_exchange_drawer_id,
 )
-from .normalize import normalize_conversations
+from .normalize import normalize_conversations_with_mtime
 from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
@@ -232,6 +232,7 @@ def _register_file(
     agent: str,
     extract_mode: str,
     content_hash: Optional[str] = None,
+    source_mtime: Optional[float] = None,
 ):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
@@ -248,11 +249,15 @@ def _register_file(
     already-mined transcript under a different path (see
     ``prefetch_content_hashes``) — stamping it here means the next run skips
     it via the cheap mtime check instead of re-normalizing and re-hashing it.
+
+    ``source_mtime`` is the mtime from the read when there was one. Only a file
+    that could not be read at all falls back to a stat here.
     """
-    try:
-        source_mtime = os.path.getmtime(source_file)
-    except OSError:
-        source_mtime = None
+    if source_mtime is None:
+        try:
+            source_mtime = os.path.getmtime(source_file)
+        except OSError:
+            source_mtime = None
     sentinel_id = make_convo_sentinel_id(source_file, extract_mode)
     meta = {
         "wing": wing,
@@ -743,6 +748,7 @@ def _file_chunks_locked(
     authored_at=None,
     content_dedup=True,
     content_hash=None,
+    source_mtime: Optional[float] = None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -814,10 +820,13 @@ def _file_chunks_locked(
         # a stable mtime + any surviving drawer permanently skips the file
         # and the missing exchanges never come back.
         filed_at = datetime.now().isoformat()
-        try:
-            source_mtime = os.path.getmtime(source_file)
-        except OSError:
-            source_mtime = None
+        # Prefer the mtime captured with the read. A fresh stat here can
+        # observe an append that this pass did not ingest.
+        if source_mtime is None:
+            try:
+                source_mtime = os.path.getmtime(source_file)
+            except OSError:
+                source_mtime = None
         # Content-hash dedup gate (ours): one bulk lookup for this file's
         # hashes, then O(1) skip decisions per chunk. Same-file rows never
         # match (they were just purged above, and the helper excludes them).
@@ -1118,6 +1127,7 @@ def _handle_dedup_skips(
     extract_mode,
     dedup_lineage,
     drawers_added,
+    source_mtime: Optional[float] = None,
 ) -> str:
     """Post-file bookkeeping for cross-file dedup skips.
 
@@ -1130,7 +1140,9 @@ def _handle_dedup_skips(
         return ""
     _append_dedup_lineage(palace_path, dedup_lineage)
     if drawers_added == 0:
-        _register_file(collection, source_file, wing, agent, extract_mode)
+        _register_file(
+            collection, source_file, wing, agent, extract_mode, source_mtime=source_mtime
+        )
     return f" (dedup: {len(dedup_lineage)} skipped)"
 
 
@@ -1181,12 +1193,15 @@ def _normalize_convo_conversations(
     agent: str,
     extract_mode: str,
     dry_run: bool,
-) -> Optional[list]:
+) -> Optional[tuple[list, float]]:
     """Normalize a transcript file into its individual conversations,
     registering it as filed when there's nothing worth mining. Returns None
     when the caller should skip the file (normalize failed, or the normalized
     content is only whitespace). A short transcript is still mined: the
     chunker keeps text below the min chunk size rather than dropping it.
+
+    On success the second item is the mtime from the same ``fstat`` as the
+    read. Callers stamp that value; they must not stat the file again.
 
     Kept as separate conversations rather than joined into one string so
     dedup can hash and skip per conversation — a Claude.ai privacy export
@@ -1195,7 +1210,8 @@ def _normalize_convo_conversations(
     whole-file hash and hides the conversations that didn't change.
     """
     try:
-        conversations = [c for c in normalize_conversations(str(filepath)) if c]
+        conversations, source_mtime = normalize_conversations_with_mtime(str(filepath))
+        conversations = [c for c in conversations if c]
     except (OSError, ValueError):
         if not dry_run:
             _register_file(collection, source_file, wing, agent, extract_mode)
@@ -1203,10 +1219,12 @@ def _normalize_convo_conversations(
 
     if not any(c.strip() for c in conversations):
         if not dry_run:
-            _register_file(collection, source_file, wing, agent, extract_mode)
+            _register_file(
+                collection, source_file, wing, agent, extract_mode, source_mtime=source_mtime
+            )
         return None
 
-    return conversations
+    return conversations, source_mtime
 
 
 def _open_convo_collection(
@@ -1338,7 +1356,7 @@ def _mine_convos_impl(
             files_skipped += 1
             continue
 
-        conversations = _normalize_convo_conversations(
+        normalized = _normalize_convo_conversations(
             filepath,
             source_file,
             collection,
@@ -1347,8 +1365,9 @@ def _mine_convos_impl(
             extract_mode,
             dry_run,
         )
-        if conversations is None:
+        if normalized is None:
             continue
+        conversations, source_mtime = normalized
 
         # Hash and dedup per conversation, not per file: a Claude/ChatGPT
         # privacy export bundles every conversation into one file, so a
@@ -1362,7 +1381,9 @@ def _mine_convos_impl(
         )
         if not new_items:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(
+                    collection, source_file, wing, agent, extract_mode, source_mtime=source_mtime
+                )
             dup_source = duplicates[0][1]
             print(
                 f"  = [{i:4}/{len(files)}] {filepath.name[:50]:50} "
@@ -1390,7 +1411,9 @@ def _mine_convos_impl(
 
         if not chunks:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(
+                    collection, source_file, wing, agent, extract_mode, source_mtime=source_mtime
+                )
             continue
 
         # Detect room from content (general mode uses memory_type instead)
@@ -1436,6 +1459,7 @@ def _mine_convos_impl(
             authored_at=_extract_authored_at(filepath),
             content_dedup=palace_config.convo_content_dedup,
             content_hash=content_hash,
+            source_mtime=source_mtime,
         )
         if skipped:
             files_skipped += 1
@@ -1449,6 +1473,7 @@ def _mine_convos_impl(
             extract_mode,
             dedup_lineage,
             drawers_added,
+            source_mtime=source_mtime,
         )
         total_dedup_skipped += len(dedup_lineage)
         for r, n in room_delta.items():

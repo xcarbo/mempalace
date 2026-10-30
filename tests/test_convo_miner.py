@@ -1339,3 +1339,137 @@ def test_mine_convos_dry_run_single_file_does_not_scan_siblings(
     assert "[DRY RUN] selected.txt" in output
     assert "sibling.txt" not in output
     assert not palace_path.exists()
+
+
+_THREE_TURNS = (
+    "> What is memory?\nMemory is persistence of the read.\n\n"
+    "> Why does it matter?\nIt enables continuity of the read.\n\n"
+    "> How do we build it?\nWith structured storage of the read.\n"
+)
+_LATE_APPEND = "> What landed late?\nUNIQUE_LATE_TAIL arrived after the read.\n"
+
+
+def _drawers(palace):
+    client = chromadb.PersistentClient(path=str(palace))
+    return client.get_collection("mempalace_drawers").get(include=["documents", "metadatas"])
+
+
+def test_append_after_the_read_is_mined_by_the_next_pass(tmp_path, monkeypatch):
+    """#2777: text a live session appends after the read must not be skipped.
+
+    The append lands after the miner read the file but before anything is
+    stamped. The drawers then have to carry the mtime of the bytes they hold,
+    so the next pass sees the file as changed and picks up the tail.
+    """
+    from mempalace import convo_miner
+
+    convo = tmp_path / "chat.txt"
+    convo.write_text(_THREE_TURNS, encoding="utf-8")
+    real_extract = convo_miner._extract_authored_at
+    appended = []
+
+    def append_once(filepath):
+        if not appended:
+            appended.append(True)
+            with open(convo, "a", encoding="utf-8") as f:
+                f.write(_LATE_APPEND)
+            stat = convo.stat()
+            os.utime(convo, (stat.st_atime, stat.st_mtime + 5))
+        return real_extract(filepath)
+
+    monkeypatch.setattr(convo_miner, "_extract_authored_at", append_once)
+    palace = tmp_path / "palace"
+    mine_convos(str(convo), str(palace), wing="test")
+    assert not any("UNIQUE_LATE_TAIL" in doc for doc in _drawers(palace)["documents"])
+
+    mine_convos(str(convo), str(palace), wing="test")
+    assert any("UNIQUE_LATE_TAIL" in doc for doc in _drawers(palace)["documents"])
+
+
+def test_drawer_source_mtime_is_the_read_not_a_later_stat(tmp_path, monkeypatch):
+    """The stored source_mtime comes from the fstat taken with the read."""
+    convo = tmp_path / "chat.txt"
+    convo.write_text(_THREE_TURNS, encoding="utf-8")
+    real_mtime = convo.stat().st_mtime
+    monkeypatch.setattr(os.path, "getmtime", lambda _path: real_mtime + 5000)
+
+    palace = tmp_path / "palace"
+    mine_convos(str(convo), str(palace), wing="test")
+
+    metas = _drawers(palace)["metadatas"]
+    assert metas
+    for meta in metas:
+        assert abs(float(meta["source_mtime"]) - real_mtime) < 0.001
+
+
+def test_empty_file_sentinel_uses_the_read_mtime(tmp_path, monkeypatch):
+    blank = tmp_path / "blank.txt"
+    blank.write_text("   \n", encoding="utf-8")
+    real_mtime = blank.stat().st_mtime
+    monkeypatch.setattr(os.path, "getmtime", lambda _path: real_mtime + 5000)
+
+    palace = tmp_path / "palace"
+    mine_convos(str(blank), str(palace), wing="test")
+
+    metas = _drawers(palace)["metadatas"]
+    assert len(metas) == 1
+    assert abs(float(metas[0]["source_mtime"]) - real_mtime) < 0.001
+
+
+def test_duplicate_conversation_sentinel_uses_the_read_mtime(tmp_path, monkeypatch):
+    """A file that is a whole-conversation twin registers with the read's mtime."""
+    first = tmp_path / "first.txt"
+    twin = tmp_path / "twin.txt"
+    first.write_text(_THREE_TURNS, encoding="utf-8")
+    twin.write_text(_THREE_TURNS, encoding="utf-8")
+    real_mtime = twin.stat().st_mtime
+    monkeypatch.setattr(os.path, "getmtime", lambda _path: real_mtime + 5000)
+
+    palace = tmp_path / "palace"
+    mine_convos(str(tmp_path), str(palace), wing="test", limit=0)
+
+    resolved = str(twin.resolve())
+    metas = [m for m in _drawers(palace)["metadatas"] if m["source_file"] == resolved]
+    assert metas
+    assert all(abs(float(m["source_mtime"]) - real_mtime) < 0.001 for m in metas)
+
+
+def test_chunk_dedup_sentinel_uses_the_read_mtime(tmp_path, monkeypatch):
+    """Every chunk a twin of another file: the sentinel is the only mtime stored.
+
+    This path is ours: _handle_dedup_skips registers the file after the
+    content-hash gate skipped all of its chunks.
+    """
+    from mempalace import convo_miner
+
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text(_THREE_TURNS, encoding="utf-8")
+    second.write_text(_THREE_TURNS + "\n", encoding="utf-8")
+    real_mtime = second.stat().st_mtime
+    monkeypatch.setattr(os.path, "getmtime", lambda _path: real_mtime + 5000)
+    monkeypatch.setattr(
+        convo_miner, "_split_new_and_duplicate_conversations", lambda c, *_a: ([("h", c[0])], [])
+    )
+
+    palace = tmp_path / "palace"
+    mine_convos(str(tmp_path), str(palace), wing="test")
+
+    resolved = str(second.resolve())
+    metas = [m for m in _drawers(palace)["metadatas"] if m["source_file"] == resolved]
+    assert [m["room"] for m in metas] == ["_registry"]
+    assert abs(float(metas[0]["source_mtime"]) - real_mtime) < 0.001
+
+
+def test_normalize_conversations_with_mtime_is_the_fstat_of_the_read(tmp_path):
+    from mempalace.normalize import normalize_conversations_with_mtime
+
+    convo = tmp_path / "chat.txt"
+    convo.write_text(_THREE_TURNS, encoding="utf-8")
+    conversations, mtime = normalize_conversations_with_mtime(str(convo))
+    assert conversations == [_THREE_TURNS]
+    assert mtime == convo.stat().st_mtime
+
+    blank = tmp_path / "blank.txt"
+    blank.write_text("  \n", encoding="utf-8")
+    assert normalize_conversations_with_mtime(str(blank)) == ([], blank.stat().st_mtime)
