@@ -24,15 +24,18 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .collision_scan import CollisionError
 from .config import MempalaceConfig
 from .miner import _extract_entities_for_metadata
 from .palace import (
+    StaleDrawerPurgeFailed,
     build_closet_lines,
     get_closets_collection,
     get_collection,
     mine_lock,
     purge_file_closets,
     upsert_closet_lines,
+    write_file_drawers,
 )
 
 logger = logging.getLogger(__name__)
@@ -83,10 +86,10 @@ def _diary_drawer_id_entry(wing: str, date_str: str, entry_idx: int, entry_chunk
     The ``v2_`` prefix distinguishes new IDs from the legacy file-level
     scheme (one drawer per file). Legacy drawers from pre-#1539 palaces
     are auto-purged on any ``ingest_diaries`` call that triggers a full
-    rebuild (``force=True`` or detected content change). The per-source
-    ``delete(where=...)`` step on full rebuild collects both legacy and
-    stale v2 drawers via the ``source_file`` metadata key, so the
-    schema migration runs as a side effect of normal use.
+    rebuild (``force=True`` or detected content change): the rebuild's
+    prune drops every drawer of the ``source_file`` it did not just write,
+    legacy and stale v2 alike, so the schema migration runs as a side
+    effect of normal use.
     """
     suffix = hashlib.sha256(
         f"{wing}|{date_str}|{entry_idx}|{entry_chunk_idx}".encode()
@@ -180,7 +183,7 @@ def ingest_diaries(
         with mine_lock(source_file):
             entries = _split_entries(text)
             prev_entry_count = state.get(state_key, {}).get("entry_count", 0)
-            full_rebuild = force or content_changed
+            full_rebuild = force or content_changed or prev_entry.get("rebuild_pending", False)
 
             base_meta = {
                 "date": date_str,
@@ -193,31 +196,6 @@ def ingest_diaries(
             if entities:
                 base_meta["entities"] = entities
 
-            # On full rebuild, purge ALL prior drawers for this source_file
-            # before writing fresh entries. This covers three cases in one
-            # step: (a) legacy pre-#1539 file-level drawers under the old
-            # ``drawer_diary_`` prefix, (b) v2 drawers from a prior pass
-            # where the file had MORE entries than the current run (entry
-            # deletion would otherwise leave trailing orphan drawers), and
-            # (c) in-place edits that shift content across entry boundaries.
-            if full_rebuild:
-                try:
-                    drawers_col.delete(where={"source_file": source_file})
-                except Exception as exc:
-                    # ChromaDB ``delete(where=...)`` against an empty collection
-                    # returns silently rather than raising, so this catch only
-                    # fires on real backend errors (locked DB, schema mismatch,
-                    # transient I/O). Log at debug to preserve diagnostics
-                    # without aborting the rebuild: the upsert below is the
-                    # load-bearing write, and if it also fails the state file
-                    # is left unchanged so the next pass retries cleanly.
-                    logger.debug(
-                        "legacy purge skipped for %s: %s",
-                        source_file,
-                        exc,
-                        exc_info=True,
-                    )
-
             # Per-entry drawers, with character chunking inside any entry
             # whose serialized text exceeds chunk_size. ``chunk_index`` is
             # a global counter across the file so the searcher's
@@ -226,55 +204,38 @@ def ingest_diaries(
             # regardless of entry boundary. ``entry_index`` and
             # ``entry_chunk_index`` are preserved for entry-grouping
             # consumers.
-            #
-            # Accumulate all drawers for the file into one batched upsert
-            # so the embedding pass either commits every chunk or none.
-            # A mid-loop embedding failure would otherwise leave a
-            # half-written day's drawers behind, which the next
-            # incremental pass would skip (state file already updated)
-            # and the searcher would silently return partial results.
-            global_chunk_index = 0
-            batch_ids: list[str] = []
-            batch_docs: list[str] = []
-            batch_metas: list[dict] = []
+            drawers = []
             for entry_idx, (header, body) in enumerate(entries):
                 entry_text = f"{header}\n{body}" if body else header
-                if len(entry_text) <= chunk_size:
-                    batch_ids.append(_diary_drawer_id_entry(wing, date_str, entry_idx, 0))
-                    batch_docs.append(entry_text)
-                    batch_metas.append(
-                        {
-                            **base_meta,
-                            "chunk_index": global_chunk_index,
-                            "entry_index": entry_idx,
-                            "entry_chunk_index": 0,
-                            "entry_header_preview": header[:120],
-                        }
-                    )
-                    global_chunk_index += 1
-                else:
-                    for entry_chunk_idx, start in enumerate(range(0, len(entry_text), chunk_size)):
-                        batch_ids.append(
-                            _diary_drawer_id_entry(wing, date_str, entry_idx, entry_chunk_idx)
-                        )
-                        batch_docs.append(entry_text[start : start + chunk_size])
-                        batch_metas.append(
-                            {
-                                **base_meta,
-                                "chunk_index": global_chunk_index,
-                                "entry_index": entry_idx,
-                                "entry_chunk_index": entry_chunk_idx,
-                                "entry_header_preview": header[:120],
-                            }
-                        )
-                        global_chunk_index += 1
+                for entry_chunk_idx, start in enumerate(range(0, len(entry_text), chunk_size)):
+                    meta = {
+                        **base_meta,
+                        "chunk_index": len(drawers),
+                        "entry_index": entry_idx,
+                        "entry_chunk_index": entry_chunk_idx,
+                        "entry_header_preview": header[:120],
+                    }
+                    drawer_id = _diary_drawer_id_entry(wing, date_str, entry_idx, entry_chunk_idx)
+                    drawers.append((drawer_id, entry_text[start : start + chunk_size], meta))
 
-            if batch_ids:
-                drawers_col.upsert(
-                    ids=batch_ids,
-                    documents=batch_docs,
-                    metadatas=batch_metas,
-                )
+            # A full rebuild writes the new drawers, then drops the file's
+            # others: legacy file-level drawers, trailing entries the file no
+            # longer has, and in-place edits that shift content across entry
+            # boundaries. A failed prune marks the file for a rebuild: after
+            # ``force`` the state holds no hash that could show a change. A
+            # drawer id holds only the date, so a second file for the day or a
+            # moved folder collides. That file is skipped, not overwritten, and
+            # the other days still go in.
+            try:
+                write_file_drawers(drawers_col, source_file, drawers, prune=full_rebuild)
+            except StaleDrawerPurgeFailed as exc:
+                logger.warning("%s", exc)
+                state[state_key] = {**prev_entry, "rebuild_pending": True}
+                continue
+            except CollisionError as exc:
+                logger.warning("Skipping %s: %s", source_file, exc)
+                print(f"Diary: skipped {diary_path.name}, its drawer ids belong to another file")
+                continue
 
             new_entries = entries if full_rebuild else entries[prev_entry_count:]
             if new_entries:
