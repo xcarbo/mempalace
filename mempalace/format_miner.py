@@ -70,6 +70,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from .palace import (
+    MinedSetUnavailable,
     NORMALIZE_VERSION,
     SKIP_DIRS,
     _validate_palace_fts5_after_mine,
@@ -690,6 +691,14 @@ def _file_chunks_locked(
     return drawers_added, False
 
 
+def _reraise_mine_abort(exc: Exception) -> None:
+    """Let an unreadable mined set stop the mine (#2791). The handlers around
+    the file loop keep going on anything else, which here would report success
+    with nothing checked."""
+    if isinstance(exc, MinedSetUnavailable):
+        raise exc
+
+
 def mine_formats(
     format_dir: str,
     palace_path: str,
@@ -903,6 +912,7 @@ def mine_formats(
                 if limit > 0 and files_mined >= limit:
                     break
             except Exception as exc:
+                _reraise_mine_abort(exc)
                 # Log and continue — one malformed file shouldn't kill the
                 # whole mine. Mirrors miner.py's per-file recovery.
                 files_errored += 1
@@ -921,6 +931,7 @@ def mine_formats(
         # upserts to the same rows. Print a clean summary and exit.
         print("\n  Mine interrupted by user (Ctrl-C).")
     except Exception as exc:
+        _reraise_mine_abort(exc)
         # Defense in depth — the per-file try/except above catches most
         # realistic crashes, but a programming error in the outer-loop
         # plumbing (file enumeration, scan_formats itself, etc.) would

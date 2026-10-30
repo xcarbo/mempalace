@@ -1556,3 +1556,22 @@ def test_mine_formats_threads_chunk_size_from_user_config(monkeypatch, tmp_path:
         f"chunk_text called without user's min_chunk_size "
         f"(got {call.get('min_chunk_size')}, expected 78). kwargs={call}"
     )
+
+
+def test_an_unreadable_mined_set_aborts_the_format_mine(_mine_formats_mocks):
+    """#2791: the per-file and the outer ``except Exception`` must both let it
+    through, or the mine reports success with nothing checked."""
+    from unittest.mock import patch
+
+    from mempalace.format_miner import mine_formats
+    from mempalace.palace import MinedSetUnavailable
+
+    tmp = _mine_formats_mocks["tmp_path"]
+    doc = tmp / "doc.pdf"
+    doc.write_bytes(b"pdf")
+    _mine_formats_mocks["file_already_mined"].side_effect = MinedSetUnavailable("read failed")
+    with (
+        patch("mempalace.format_miner.scan_formats", return_value=[doc]),
+        pytest.raises(MinedSetUnavailable),
+    ):
+        mine_formats(format_dir=str(tmp), palace_path=str(tmp / "palace"))

@@ -821,7 +821,7 @@ def _hook_mine_done_line(source: str):
 
 
 def _run_mine(args, mode, palace_path, include_ignored):
-    from .palace import MineAlreadyRunning, MineValidationError
+    from .palace import MineAlreadyRunning, MinedSetUnavailable, MineValidationError
 
     try:
         if mode == "convos":
@@ -867,6 +867,11 @@ def _run_mine(args, mode, palace_path, include_ignored):
         # palace. Surface the holder identity so the operator knows what
         # to wait for (or stop), and exit non-zero so wrappers like
         # nohup / scripts can detect the contention.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except MinedSetUnavailable as exc:
+        # Nothing was purged on a guess. Re-running the mine picks this up
+        # once the palace reads again.
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except MineValidationError as exc:

@@ -1551,3 +1551,57 @@ def test_write_job_meeting_a_held_lock_is_a_refusal(monkeypatch, kind):
         result = service.run_mcp_tool({"name": "mempalace_add_drawer", "arguments": {}})
     assert result["success"] is False
     assert result["error_class"] == daemon.LOCK_REFUSAL_ERROR_CLASS
+
+
+def test_run_mine_reports_an_unreadable_mined_set(tmp_path, monkeypatch):
+    import mempalace.convo_miner as convo_module
+    from mempalace import service
+    from mempalace.palace import MinedSetUnavailable
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    def _unreadable(**kw):
+        raise MinedSetUnavailable("could not read the mined set")
+
+    monkeypatch.setattr(convo_module, "mine_convos", _unreadable)
+    r = service.run_mine(
+        {"palace_path": str(palace), "source": str(tmp_path / "s.jsonl"), "mode": "convos"}
+    )
+    assert r["success"] is False
+    assert r["error_class"] == "MinedSetUnavailable"
+    assert r["exit_code"] == 1
+    assert "could not read the mined set" in r["error"]
+
+
+def test_a_stopped_mine_is_reported_and_the_diary_behind_it_still_runs(tmp_path, monkeypatch):
+    """A hook mine that stops fails its own job only: the diary save queued
+    behind it is filed, and the failure stays visible until acknowledged."""
+    import mempalace.convo_miner as convo_module
+    from mempalace import service
+    from mempalace.palace import MinedSetUnavailable
+
+    def _unreadable(**kw):
+        raise MinedSetUnavailable("could not read the mined set")
+
+    monkeypatch.setattr(convo_module, "mine_convos", _unreadable)
+    logged = []
+    monkeypatch.setattr("mempalace.hooks_cli._log", logged.append)
+
+    def execute(kind, payload):
+        if kind == "mine":
+            return service.run_mine(payload)
+        return {"success": True, "kind": kind, "exit_code": 0}
+
+    client, thread, palace, holders = _start_server(tmp_path, monkeypatch, execute)
+    try:
+        mine = client.submit("mine", {"source": str(tmp_path / "s.jsonl"), "mode": "convos"})
+        diary = client.submit("diary_write", {"entry": "x"})
+        assert client.wait(diary["id"], timeout=10)["state"] == "succeeded"
+        failed = client.wait(mine["id"], timeout=10)
+        assert failed["state"] == "failed"
+        assert "could not read the mined set" in failed["error"]["message"]
+        assert any("Daemon job failed: mine" in line for line in logged)
+        assert daemon.unacknowledged_failures(str(palace)) == 1
+    finally:
+        _stop_server(client, thread, holders)

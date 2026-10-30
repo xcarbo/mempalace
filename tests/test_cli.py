@@ -2484,3 +2484,40 @@ def test_cmd_repair_rebuild_index_alias_uses_sqlite_archive(mock_config_cls, tmp
         archive_existing_dest=True,
         dry_run=False,
     )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_stopped_by_an_unreadable_mined_set_exits_1_with_a_message(
+    mock_config_cls, monkeypatch, capsys
+):
+    """A hook-spawned mine sends stdout and stderr to hook.log, so the reason
+    and the ``failed`` line are the report. Exit 1, no traceback."""
+    from mempalace.palace import MinedSetUnavailable
+
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    monkeypatch.setenv("MEMPALACE_MINE_PID_FILE", "/fake/pid")
+    args = argparse.Namespace(
+        dir="/chats/s.jsonl",
+        palace=None,
+        mode="convos",
+        wing="mywing",
+        agent="me",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+        include_subagents=False,
+    )
+    with (
+        patch(
+            "mempalace.convo_miner.mine_convos",
+            side_effect=MinedSetUnavailable("could not read the mined set"),
+        ),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        cmd_mine(args)
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 1
+    assert "could not read the mined set" in captured.err
+    assert "Transcript ingest failed: s.jsonl" in captured.out

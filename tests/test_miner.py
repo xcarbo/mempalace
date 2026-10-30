@@ -3154,3 +3154,207 @@ def test_sqlite_wing_room_counts_keeps_distinct_chunked_drawers_apart(palace_pat
     assert result is not None
     _, wing_rooms = result
     assert dict(wing_rooms["proj"]) == {"technical": 2}
+
+
+# ---------------------------------------------------------------------------
+# MinedSetUnavailable (#2791): a read error stops the mine
+# ---------------------------------------------------------------------------
+
+
+class _UnreadableCollection:
+    def count(self):
+        return 3
+
+    def get(self, **kwargs):
+        raise RuntimeError("palace read failed")
+
+
+class _RowsCollection:
+    """Pages stored metadata rows in a fixed order, as a backend would."""
+
+    def __init__(self, rows, fail_after_pages=None, fail_scoped=False):
+        self.rows = rows
+        self.fail_after_pages = fail_after_pages
+        self.fail_scoped = fail_scoped
+        self.pages = 0
+        self.wheres = []
+
+    def count(self):
+        return len(self.rows)
+
+    def get(self, where=None, limit=1000, offset=0, include=None):
+        self.wheres.append(where)
+        if self.fail_after_pages is not None and self.pages >= self.fail_after_pages:
+            raise RuntimeError("palace read failed")
+        self.pages += 1
+        wanted = (where or {}).get("source_file")
+        if isinstance(wanted, dict):
+            if self.fail_scoped:
+                raise RuntimeError("scoped read failed")
+            wanted = set(wanted["$in"])
+        elif wanted is not None:
+            wanted = {wanted}
+        rows = [r for r in self.rows if wanted is None or r["source_file"] in wanted]
+        page = rows[offset : offset + limit]
+        return {"ids": [str(offset + i) for i in range(len(page))], "metadatas": page}
+
+
+def _mined_row(src, **overrides):
+    return {
+        "source_file": src,
+        "source_mtime": 1.0,
+        "normalize_version": NORMALIZE_VERSION,
+        **overrides,
+    }
+
+
+def test_file_already_mined_raises_when_the_palace_cannot_be_read(tmp_path):
+    from mempalace.palace import MinedSetUnavailable
+
+    src = tmp_path / "a.md"
+    write_file(src, "content")
+    for check_mtime in (False, True):
+        with pytest.raises(MinedSetUnavailable):
+            file_already_mined(_UnreadableCollection(), str(src), check_mtime=check_mtime)
+
+
+def test_file_already_mined_with_the_file_gone_is_still_not_mined(tmp_path):
+    """A vanished source is about the disk, not the palace: no stop."""
+    missing = str(tmp_path / "gone.md")
+    assert file_already_mined(_UnreadableCollection(), missing, check_mtime=True) is False
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"normalize_version": "three"},
+        {"source_mtime": "not-a-number"},
+        {"chunk_total": "many"},
+    ],
+)
+def test_one_malformed_row_means_not_mined_not_a_stopped_mine(tmp_path, row):
+    """A bad value is one file's problem. Stopping on it would stop every mine
+    for good, because the row stays in the palace."""
+    src = tmp_path / "a.md"
+    write_file(src, "content")
+    rows = [_mined_row(str(src), source_mtime=os.path.getmtime(src), **{"chunk_total": 1})]
+    rows[0].update(row)
+    assert file_already_mined(_RowsCollection(rows), str(src), check_mtime=True) is False
+
+
+def test_a_numeric_string_mtime_still_compares(tmp_path):
+    src = tmp_path / "a.md"
+    write_file(src, "content")
+    rows = [_mined_row(str(src), source_mtime=str(os.path.getmtime(src)))]
+    assert file_already_mined(_RowsCollection(rows), str(src), check_mtime=True) is True
+    assert prefetch_mined_set(_RowsCollection(rows)) == {str(src): os.path.getmtime(src)}
+
+
+def test_prefetch_mined_set_raises_on_a_read_error_instead_of_a_partial_set():
+    from mempalace.palace import MinedSetUnavailable
+
+    rows = [_mined_row(f"f{i}.jsonl") for i in range(2500)]
+    with pytest.raises(MinedSetUnavailable):
+        prefetch_mined_set(_RowsCollection(rows, fail_after_pages=1))
+
+
+def test_prefetch_mined_set_raises_when_count_fails():
+    from mempalace.palace import MinedSetUnavailable
+
+    class _NoCount(_UnreadableCollection):
+        def count(self):
+            raise RuntimeError("palace read failed")
+
+    with pytest.raises(MinedSetUnavailable):
+        prefetch_mined_set(_NoCount())
+
+
+def test_prefetch_mined_set_leaves_out_only_the_malformed_source():
+    good, bad, later = "good.jsonl", "bad.jsonl", "later.jsonl"
+    rows = [
+        _mined_row(good),
+        _mined_row(bad),
+        _mined_row(bad, normalize_version="three"),
+        _mined_row(later),
+    ]
+    assert prefetch_mined_set(_RowsCollection(rows)) == {good: 1.0, later: 1.0}
+
+
+def test_prefetch_mined_set_asks_only_for_the_candidate_files():
+    rows = [_mined_row("a.jsonl"), _mined_row("b.jsonl")]
+    col = _RowsCollection(rows)
+    assert prefetch_mined_set(col, source_files=["a.jsonl"]) == {"a.jsonl": 1.0}
+    assert col.wheres == [{"source_file": {"$in": ["a.jsonl"]}}]
+
+
+def test_prefetch_mined_set_with_no_candidates_reads_nothing():
+    col = _RowsCollection([_mined_row("a.jsonl")])
+    assert prefetch_mined_set(col, source_files=[]) == {}
+    assert col.wheres == []
+
+
+def test_prefetch_mined_set_scoped_pages_past_one_batch():
+    rows = [_mined_row("a.jsonl", chunk_total=2500) for _ in range(2500)]
+    col = _RowsCollection(rows)
+    assert prefetch_mined_set(col, source_files=["a.jsonl"]) == {"a.jsonl": 1.0}
+    assert len(col.wheres) == 3
+
+
+def test_prefetch_mined_set_over_the_threshold_scans():
+    from mempalace import palace
+
+    col = _RowsCollection([_mined_row("a.jsonl")])
+    candidates = [f"f{i}" for i in range(palace._PREFETCH_SCOPE_THRESHOLD + 1)]
+    prefetch_mined_set(col, source_files=candidates)
+    assert all(where is None for where in col.wheres)
+
+
+def test_prefetch_mined_set_falls_back_to_a_scan_when_the_scoped_read_fails():
+    col = _RowsCollection([_mined_row("a.jsonl")], fail_scoped=True)
+    assert prefetch_mined_set(col, source_files=["a.jsonl"]) == {"a.jsonl": 1.0}
+
+
+def test_prefetch_mined_set_raises_when_the_scoped_read_and_the_scan_both_fail():
+    from mempalace.palace import MinedSetUnavailable
+
+    with pytest.raises(MinedSetUnavailable):
+        prefetch_mined_set(_UnreadableCollection(), source_files=["a.jsonl"])
+
+
+def test_scoped_prefetch_runs_on_sqlite_exact(tmp_path, monkeypatch):
+    """Every fleet palace is sqlite_exact; the default test backend is chroma."""
+    from mempalace.palace import get_collection
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    col = get_collection(str(tmp_path / "palace"), create=True)
+    col.add(
+        ids=["a0", "b0"],
+        documents=["one", "two"],
+        embeddings=[[0.1, 0.2], [0.2, 0.1]],
+        metadatas=[_mined_row("a.jsonl"), _mined_row("b.jsonl")],
+    )
+    assert prefetch_mined_set(col, source_files=["a.jsonl"]) == {"a.jsonl": 1.0}
+
+
+def test_mine_aborts_when_the_mined_set_cannot_be_read(tmp_path, monkeypatch):
+    from mempalace.palace import MinedSetUnavailable, get_collection
+
+    project_root = tmp_path / "proj"
+    _make_minable_project(project_root, n_files=2)
+    palace_path = str(tmp_path / "palace")
+    mine(str(project_root), palace_path)
+    col = get_collection(palace_path)
+    before = sorted(col.get(include=["metadatas"])["ids"])
+    real_get = type(col).get
+
+    def failing_get(self, *args, **kwargs):
+        if "source_file" in (kwargs.get("where") or {}):
+            raise RuntimeError("palace read failed")
+        return real_get(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(col), "get", failing_get)
+    with pytest.raises(MinedSetUnavailable):
+        mine(str(project_root), palace_path)
+
+    monkeypatch.setattr(type(col), "get", real_get)
+    assert sorted(get_collection(palace_path).get(include=["metadatas"])["ids"]) == before

@@ -1473,3 +1473,81 @@ def test_normalize_conversations_with_mtime_is_the_fstat_of_the_read(tmp_path):
     blank = tmp_path / "blank.txt"
     blank.write_text("  \n", encoding="utf-8")
     assert normalize_conversations_with_mtime(str(blank)) == ([], blank.stat().st_mtime)
+
+
+def _fail_palace_reads(palace, monkeypatch, when=lambda kwargs: True):
+    from mempalace.palace import get_collection
+
+    col_type = type(get_collection(str(palace)))
+    real_get = col_type.get
+
+    def failing_get(self, *args, **kwargs):
+        if when(kwargs):
+            raise RuntimeError("palace read failed")
+        return real_get(self, *args, **kwargs)
+
+    monkeypatch.setattr(col_type, "get", failing_get)
+    return lambda: monkeypatch.setattr(col_type, "get", real_get)
+
+
+def test_convo_mine_stops_when_the_prefetch_cannot_read(tmp_path, monkeypatch):
+    """#2791: a changed file is not purged and refiled on a guess."""
+    from mempalace.palace import MinedSetUnavailable
+
+    convo = tmp_path / "chat.txt"
+    convo.write_text(_THREE_TURNS, encoding="utf-8")
+    palace = tmp_path / "palace"
+    mine_convos(str(convo), str(palace), wing="test")
+    before = sorted(_drawers(palace)["ids"])
+
+    with open(convo, "a", encoding="utf-8") as f:
+        f.write(_LATE_APPEND)
+    restore = _fail_palace_reads(palace, monkeypatch)
+    with pytest.raises(MinedSetUnavailable):
+        mine_convos(str(convo), str(palace), wing="test")
+    restore()
+
+    assert sorted(_drawers(palace)["ids"]) == before
+
+
+def test_convo_mine_stops_when_the_locked_recheck_cannot_read(tmp_path, monkeypatch):
+    """The per-file check under the lock raises before the purge runs."""
+    from mempalace import convo_miner
+    from mempalace.palace import MinedSetUnavailable
+
+    convo = tmp_path / "chat.txt"
+    convo.write_text(_THREE_TURNS, encoding="utf-8")
+    palace = tmp_path / "palace"
+    mine_convos(str(convo), str(palace), wing="test")
+    before = sorted(_drawers(palace)["ids"])
+    resolved = str(convo.resolve())
+
+    with open(convo, "a", encoding="utf-8") as f:
+        f.write(_LATE_APPEND)
+    monkeypatch.setattr(convo_miner, "prefetch_mined_set", lambda *_a, **_k: {})
+    restore = _fail_palace_reads(
+        palace, monkeypatch, when=lambda kw: kw.get("where") == {"source_file": resolved}
+    )
+    with pytest.raises(MinedSetUnavailable):
+        mine_convos(str(convo), str(palace), wing="test")
+    restore()
+
+    assert sorted(_drawers(palace)["ids"]) == before
+
+
+def test_convo_mine_prefetches_only_its_own_files(tmp_path, monkeypatch):
+    """#2567: a one-file hook mine must not page the whole palace for this."""
+    from mempalace import convo_miner
+
+    convo = tmp_path / "chat.txt"
+    convo.write_text(_THREE_TURNS, encoding="utf-8")
+    asked = []
+    real = convo_miner.prefetch_mined_set
+
+    def spy(collection, extract_mode=None, source_files=None):
+        asked.append(source_files)
+        return real(collection, extract_mode=extract_mode, source_files=source_files)
+
+    monkeypatch.setattr(convo_miner, "prefetch_mined_set", spy)
+    mine_convos(str(convo), str(tmp_path / "palace"), wing="test")
+    assert asked == [[str(convo.resolve())]]

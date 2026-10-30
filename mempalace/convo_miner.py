@@ -1306,7 +1306,11 @@ def _mine_convos_impl(
     # prefetch_mined_set() does the same decisions in a single scan; loop
     # body becomes an O(1) dict lookup + a cheap local mtime comparison.
     mined_mtimes: dict = (
-        prefetch_mined_set(collection, extract_mode=extract_mode) if collection is not None else {}
+        prefetch_mined_set(
+            collection, extract_mode=extract_mode, source_files=[str(f) for f in files]
+        )
+        if collection is not None
+        else {}
     )
     # content_hash -> source_file for transcripts already filed. Repeated
     # exports from Claude/ChatGPT commonly land under a new filename each

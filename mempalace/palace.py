@@ -1226,6 +1226,14 @@ class MineAlreadyRunning(RuntimeError):
     """Raised when another `mempalace mine` already holds the per-palace lock."""
 
 
+class MinedSetUnavailable(RuntimeError):
+    """The palace could not be read to learn what is already mined.
+
+    Stops the mine. Answering "not mined" instead would purge and re-file
+    every source the failed read did not see.
+    """
+
+
 class MineValidationError(RuntimeError):
     """Raised at end of mine when PRAGMA quick_check on the palace reports errors."""
 
@@ -1719,26 +1727,37 @@ def file_already_mined(
     drawer with no ``chunk_total`` (legacy rows, or a single-shot
     ``add_drawer()`` call with no partial-batch risk) is trusted on its own,
     exactly as before.
+
+    Raises :class:`MinedSetUnavailable` when the palace cannot be read: a read
+    error that answered False would re-file the source as unmined. A row whose
+    values cannot be compared still answers False, because it is this one
+    file's problem and stays in the palace: stopping on it would stop every
+    later mine too.
     """
-    try:
-        # Under the additive-mining model, a single ``source_file`` can have
-        # multiple ``parent_drawer_id`` groups in the palace — one per
-        # mining pass — each with its own stored ``source_mtime`` and
-        # ``normalize_version``. The function must return True if ANY stored
-        # group is current (matching version + matching mtime when checked),
-        # because ChromaDB's ``get(..., limit=1)`` has undefined ordering
-        # across multiple matching rows: a ``limit=1`` shortcut picks
-        # whichever row ChromaDB orders first and only checks that one,
-        # causing spurious re-mines whenever the stale group is returned.
-        # Iterating via the same paginated pattern used in the
-        # extract_mode-is-set branch lets the function short-circuit on the
-        # first matching group regardless of ordering.
-        current_mtime = os.path.getmtime(source_file) if check_mtime else None
-        offset = 0
-        # Tracks, per matching stored_mtime group, how many drawers have
-        # been seen so far toward that group's own chunk_total (#21).
-        group_counts: dict = {}
-        while True:
+    # Under the additive-mining model, a single ``source_file`` can have
+    # multiple ``parent_drawer_id`` groups in the palace — one per
+    # mining pass — each with its own stored ``source_mtime`` and
+    # ``normalize_version``. The function must return True if ANY stored
+    # group is current (matching version + matching mtime when checked),
+    # because ChromaDB's ``get(..., limit=1)`` has undefined ordering
+    # across multiple matching rows: a ``limit=1`` shortcut picks
+    # whichever row ChromaDB orders first and only checks that one,
+    # causing spurious re-mines whenever the stale group is returned.
+    # Iterating via the same paginated pattern used in the
+    # extract_mode-is-set branch lets the function short-circuit on the
+    # first matching group regardless of ordering.
+    current_mtime = None
+    if check_mtime:
+        try:
+            current_mtime = os.path.getmtime(source_file)
+        except (OSError, ValueError):
+            return False
+    offset = 0
+    # Tracks, per matching stored_mtime group, how many drawers have
+    # been seen so far toward that group's own chunk_total (#21).
+    group_counts: dict = {}
+    while True:
+        try:
             results = collection.get(
                 where={"source_file": source_file},
                 limit=1000,
@@ -1747,6 +1766,12 @@ def file_already_mined(
             )
             ids = results.get("ids") or []
             metadatas = results.get("metadatas") or []
+        except Exception as exc:
+            raise MinedSetUnavailable(
+                f"could not read whether {source_file} is already mined; stopping "
+                f"rather than filing it again ({exc!r})"
+            ) from exc
+        try:
             for meta in metadatas:
                 meta = meta or {}
                 # extract_mode scoping (was the existing ``else`` branch):
@@ -1774,16 +1799,21 @@ def file_already_mined(
                 group_counts[stored_mtime] = seen
                 if seen >= chunk_total:
                     return True
-            if not ids:
-                break
-            offset += len(ids)
-        return False
-    except Exception:
-        return False
+        except (TypeError, ValueError):
+            return False
+        if not ids:
+            break
+        offset += len(ids)
+    return False
+
+
+# Above this many candidate files, one filtered get costs more round trips
+# than a full paginated scan, so the scoped path below stops paying off.
+_PREFETCH_SCOPE_THRESHOLD = 50
 
 
 def prefetch_mined_set(
-    collection, extract_mode: Optional[str] = None
+    collection, extract_mode: Optional[str] = None, source_files: Optional[list] = None
 ) -> dict[str, Optional[float]]:
     """Pre-fetch source_file -> stored source_mtime for files already mined
     at the current NORMALIZE_VERSION, in one bulk pass instead of one
@@ -1816,46 +1846,95 @@ def prefetch_mined_set(
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
+
+    When `source_files` is given and holds at most `_PREFETCH_SCOPE_THRESHOLD`
+    paths, a paged `where={"source_file": {"$in": ...}}` get() replaces the
+    full scan, which is what a one-file hook mine needs. Above the threshold,
+    or when source_files is omitted, the full scan runs as before. A scoped
+    read that fails falls back to the scan.
+
+    Raises :class:`MinedSetUnavailable` when the scan cannot finish: a partial
+    set would read every source it missed as new. A row whose values cannot be
+    compared leaves out only its own source, which the per-file check then
+    answers.
     """
     # Per source_file: per stored_mtime group → count + optional chunk_total.
     # A source is only "mined" once some group is complete.
     groups: dict[str, dict] = {}
-    try:
+    unprovable: set = set()
+
+    def _absorb(meta):
+        meta = meta or {}
+        src = meta.get("source_file")
+        if not src:
+            return
+        if not _metadata_matches_extract_mode(meta, extract_mode):
+            return
+        try:
+            # Same default as file_already_mined: missing version == 1
+            version = meta.get("normalize_version", 1)
+            if version < NORMALIZE_VERSION:
+                return
+            stored_mtime = meta.get("source_mtime")
+            mtime_key = float(stored_mtime) if stored_mtime is not None else None
+        except (TypeError, ValueError):
+            unprovable.add(src)
+            return
+        entry = groups.setdefault(src, {}).setdefault(mtime_key, {"count": 0, "chunk_total": None})
+        entry["count"] += 1
+        chunk_total = meta.get("chunk_total")
+        if chunk_total is not None:
+            try:
+                entry["chunk_total"] = int(chunk_total)
+            except (TypeError, ValueError):
+                pass
+
+    def _scan_all():
         total = collection.count()
         offset = 0
         while offset < total:
             batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
             for meta in batch["metadatas"]:
-                meta = meta or {}
-                src = meta.get("source_file")
-                if not src:
-                    continue
-                if not _metadata_matches_extract_mode(meta, extract_mode):
-                    continue
-                # Same default as file_already_mined: missing version == 1
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
-                    continue
-                stored_mtime = meta.get("source_mtime")
-                mtime_key = float(stored_mtime) if stored_mtime is not None else None
-                entry = groups.setdefault(src, {}).setdefault(
-                    mtime_key, {"count": 0, "chunk_total": None}
-                )
-                entry["count"] += 1
-                chunk_total = meta.get("chunk_total")
-                if chunk_total is not None:
-                    try:
-                        entry["chunk_total"] = int(chunk_total)
-                    except (TypeError, ValueError):
-                        pass
+                _absorb(meta)
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])
-    except Exception:
-        logger.warning("prefetch_mined_set: partial fetch, %d source groups loaded", len(groups))
+
+    try:
+        if source_files is not None and len(source_files) <= _PREFETCH_SCOPE_THRESHOLD:
+            if source_files:
+                try:
+                    offset = 0
+                    while True:
+                        scoped = collection.get(
+                            where={"source_file": {"$in": list(source_files)}},
+                            include=["metadatas"],
+                            limit=1000,
+                            offset=offset,
+                        )
+                        ids = scoped.get("ids") or []
+                        for meta in scoped.get("metadatas") or []:
+                            _absorb(meta)
+                        if len(ids) < 1000:
+                            break
+                        offset += len(ids)
+                except Exception:
+                    logger.warning("prefetch_mined_set: scoped fetch failed; scanning")
+                    groups.clear()
+                    unprovable.clear()
+                    _scan_all()
+        else:
+            _scan_all()
+    except Exception as exc:
+        raise MinedSetUnavailable(
+            f"could not read which files are already mined ({len(groups)} sources "
+            f"loaded); stopping rather than filing the rest again ({exc!r})"
+        ) from exc
 
     mined: dict[str, Optional[float]] = {}
     for src, by_mtime in groups.items():
+        if src in unprovable:
+            continue
         for mtime_key, entry in by_mtime.items():
             chunk_total = entry["chunk_total"]
             if chunk_total is None:
