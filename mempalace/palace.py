@@ -1766,6 +1766,10 @@ def file_already_mined(
             )
             ids = results.get("ids") or []
             metadatas = results.get("metadatas") or []
+        except UnicodeError:
+            # A name the backend cannot encode (non-UTF-8 on Linux) is this
+            # file's problem, not an unreadable palace.
+            return False
         except Exception as exc:
             raise MinedSetUnavailable(
                 f"could not read whether {source_file} is already mined; stopping "
@@ -2010,6 +2014,9 @@ def prefetch_content_hashes(
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])
-    except Exception:
-        logger.warning("prefetch_content_hashes: partial fetch, %d hashes loaded", len(hashes))
+    except Exception as exc:
+        raise MinedSetUnavailable(
+            f"could not read which conversations are already filed ({len(hashes)} "
+            f"hashes loaded); stopping rather than filing them again ({exc!r})"
+        ) from exc
     return hashes

@@ -506,3 +506,153 @@ def test_a_failed_purge_keeps_the_delete_and_says_so(revision_palace, monkeypatc
     assert result["revisions_deleted"] is None
     assert result["revisions_error"] == "revision purge failed: PermissionError"
     assert _revised_ids(revision_palace) == {AUTH_DRAWER}
+
+
+# ── found in review ──────────────────────────────────────────────────────
+
+
+def test_rewriting_the_same_text_saves_nothing(revision_palace):
+    result = mcp_server.tool_update_drawer(AUTH_DRAWER, content=AUTH_TEXT)
+
+    assert result["success"] is True and "revision_id" not in result
+    assert not revisions_path(revision_palace).exists()
+
+
+def test_a_no_change_update_of_a_chunked_drawer_saves_nothing(revision_palace):
+    added = mcp_server.tool_add_drawer("proj", "roadmap", "words of the roadmap " * 200)
+    assert added["chunks"] > 1
+
+    assert mcp_server.tool_update_drawer(added["drawer_id"], wing="proj")["success"]
+    assert not revisions_path(revision_palace).exists()
+
+    assert mcp_server.tool_update_drawer(added["drawer_id"], room="moved")["revision_id"]
+
+
+def test_a_purge_that_failed_can_be_retried_after_the_delete(revision_palace, monkeypatch):
+    _revise(AUTH_DRAWER, "drawer_proj_backend_bbb")
+
+    def locked(*_args, **_kwargs):
+        raise PermissionError("revisions file is held open")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(revisions, "purge_drawer_revisions", locked)
+        assert mcp_server.tool_delete_drawer(AUTH_DRAWER)["revisions_deleted"] is None
+        assert mcp_server.tool_delete_by_source("db.py", dry_run=False)["success"] is True
+
+    again = mcp_server.tool_delete_drawer(AUTH_DRAWER)
+    assert again["success"] is False and again["revisions_deleted"] == 1
+    by_source = mcp_server.tool_delete_by_source("db.py", dry_run=False)
+    assert by_source["deleted"] == 0 and by_source["revisions_deleted"] == 1
+    assert not revisions_path(revision_palace).exists()
+
+
+def test_the_palace_lock_comes_before_the_drawer_lock(revision_palace, monkeypatch):
+    """Same order as a batch. The other order waits on the palace while
+    holding the drawer, and a batch then blocks on the drawer with the palace
+    held, so every other writer in the palace stalls behind the two."""
+    import contextlib
+
+    from mempalace import palace
+
+    order = []
+    real_palace, real_drawer = palace.short_writer_palace_lock, palace.mine_lock
+
+    @contextlib.contextmanager
+    def spy_palace(path):
+        order.append("palace")
+        with real_palace(path):
+            yield
+
+    @contextlib.contextmanager
+    def spy_drawer(key):
+        if key.startswith("update_drawer:"):
+            order.append("drawer")
+        with real_drawer(key):
+            yield
+
+    monkeypatch.setattr(palace, "short_writer_palace_lock", spy_palace)
+    monkeypatch.setattr(palace, "mine_lock", spy_drawer)
+
+    assert mcp_server.tool_update_drawer(AUTH_DRAWER, content="new")["success"]
+    assert mcp_server.tool_delete_drawer(AUTH_DRAWER)["success"]
+    assert order[:2] == ["palace", "drawer"]
+    assert order.count("drawer") == 2
+
+
+def test_a_busy_palace_refuses_the_update_with_nothing_saved(revision_palace, monkeypatch):
+    from mempalace import palace
+
+    def busy(_path):
+        raise palace.MineAlreadyRunning("palace is held by PID 999")
+
+    monkeypatch.setattr(palace, "short_writer_palace_lock", busy)
+
+    result = mcp_server.tool_update_drawer(AUTH_DRAWER, content="new")
+
+    assert result["success"] is False and "PID 999" in result["error"]
+    assert not revisions_path(revision_palace).exists()
+
+
+def test_a_delete_waits_for_an_update_of_the_same_drawer(revision_palace, monkeypatch):
+    """Otherwise the update recreates the deleted drawer, or its revision
+    lands after the purge and the deleted text stays on disk."""
+    updating, finish_update = threading.Event(), threading.Event()
+    real_wal = mcp_server._wal_log
+
+    def pause_update(operation, entry):
+        if operation == "update_drawer":
+            updating.set()
+            finish_update.wait(timeout=5)
+        return real_wal(operation, entry)
+
+    monkeypatch.setattr(mcp_server, "_wal_log", pause_update)
+    update = threading.Thread(
+        target=mcp_server.tool_update_drawer, args=(AUTH_DRAWER,), kwargs={"content": "new"}
+    )
+    delete = threading.Thread(target=mcp_server.tool_delete_drawer, args=(AUTH_DRAWER,))
+    update.start()
+    assert updating.wait(timeout=5)
+    delete.start()
+    delete.join(timeout=0.3)
+    assert delete.is_alive(), "the delete ran while the update held the drawer"
+    finish_update.set()
+    update.join(timeout=10)
+    delete.join(timeout=10)
+
+    assert not revisions_path(revision_palace).exists()
+    assert "error" in mcp_server.tool_get_drawer(AUTH_DRAWER)
+
+
+def test_a_purge_and_a_first_append_fsync_the_directory(tmp_path, monkeypatch):
+    """Without it a crash after the rename can bring the deleted text back."""
+    palace = str(tmp_path)
+    synced = []
+    real_fsync = revisions._fsync_directory
+
+    def spy(path):
+        synced.append(str(path))
+        return real_fsync(path)
+
+    monkeypatch.setattr(revisions, "_fsync_directory", spy)
+
+    append_drawer_revision(palace, "d1", "gone")
+    assert synced == [palace]
+    append_drawer_revision(palace, "d2", "kept")
+    assert synced == [palace]
+    purge_drawer_revisions(palace, ["d1"])
+    assert synced == [palace, palace]
+    purge_drawer_revisions(palace, ["d2"])
+    assert synced == [palace, palace, palace]
+
+
+def test_copy_drawer_revisions_keeps_what_the_target_has(tmp_path):
+    source, dest, empty = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+    append_drawer_revision(str(source), "d1", "old palace")
+
+    assert revisions.copy_drawer_revisions(str(source), str(dest)) is True
+    assert _contents(str(dest)) == ["old palace"]
+
+    append_drawer_revision(str(dest), "d2", "new palace")
+    assert revisions.copy_drawer_revisions(str(source), str(dest)) is False
+    assert _contents(str(dest)) == ["old palace", "new palace"]
+    assert revisions.copy_drawer_revisions(str(empty), str(dest)) is False

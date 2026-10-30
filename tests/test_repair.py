@@ -3632,3 +3632,16 @@ def test_vacuum_and_rebuild_fts5_heals_a_malformed_destination_index(tmp_path):
 
     after = repair.sqlite_integrity_errors(palace)
     assert not after, f"destination left malformed after the rebuild: {after[:3]}"
+
+
+def test_rebuild_in_place_carries_the_drawer_revisions(tmp_path):
+    """The rebuilt palace keeps every drawer, so it keeps their earlier text."""
+    from mempalace.revisions import append_drawer_revision, load_drawer_revisions
+
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "body", {"wing": "w", "room": "r"})])
+    append_drawer_revision(str(palace), "d1", "the earlier text")
+
+    repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+
+    assert [r["content"] for r in load_drawer_revisions(str(palace))] == ["the earlier text"]

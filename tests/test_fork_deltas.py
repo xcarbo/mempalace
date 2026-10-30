@@ -44,9 +44,10 @@ Register:
 19. ``QueueStore.prune_terminal`` keeps failed jobs until ``memp daemon ack``
     (capped at ``FAILED_RETENTION_DAYS``); upstream prunes them after the
     retention window, unseen.
-21. ``mcp_server.tool_update_drawer`` holds one lock per drawer across its
-    read, check-and-set, revision and write. Upstream has no such lock and no
-    check-and-set, so a merge can take its version of the function whole.
+21. ``mcp_server.tool_update_drawer`` holds ``_drawer_write_lock`` (palace,
+    then one lock per drawer) across its read, check-and-set, revision and
+    write. Upstream has no such lock and no check-and-set, so a merge can take
+    its version of the function whole.
 """
 
 from __future__ import annotations
@@ -625,7 +626,9 @@ def test_a_stop_diary_retry_gets_back_the_job_already_stored(tmp_path, monkeypat
 def test_update_drawer_serialises_its_check_and_write(monkeypatch, config, kg, seeded_collection):
     """Delta 21: two check-and-set writers on one drawer cannot both pass.
 
-    Without the lock both read the same text and both pass ``if_unchanged``.
+    Without the lock both read the same text and both pass ``if_unchanged``
+    (across processes the palace lock stops them first, and
+    tests/test_revisions.py pins that it is taken).
     The second write then replaces the first writer's text, and the revision it
     saved holds the older text, so the first writer's words are gone with
     nothing to show for it: a silent loss on the roadmap singletons.
@@ -658,11 +661,16 @@ def test_update_drawer_serialises_its_check_and_write(monkeypatch, config, kg, s
             drawer_id, content=text, if_unchanged=original["content_sha256"]
         )
 
+    # Held here as a threaded MCP server holds its writer lease. The palace lock
+    # is re-entrant inside one process, so only the per-drawer lock is left.
+    from mempalace.palace import mine_palace_lock
+
     threads = [threading.Thread(target=write, args=(text,)) for text in ("first", "second")]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=30)
+    with mine_palace_lock(config.palace_path):
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
 
     assert sorted(bool(r.get("conflict")) for r in results.values()) == [False, True], (
         "FORK DELTA REVERTED: two check-and-set writers both passed"

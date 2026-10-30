@@ -2,8 +2,10 @@
 
 The write-ahead log redacts content. This log lives in the palace directory,
 the same privacy domain as the drawers, and keeps the verbatim document
-``update_drawer`` is about to replace. Nothing caps the file. Deleting a
-drawer removes its revisions too (``purge_drawer_revisions``).
+``update_drawer`` is about to replace. Nothing caps the file. The
+``delete_drawer`` and ``delete_by_source`` tools remove a drawer's revisions
+too (``purge_drawer_revisions``). Sync, dedup and repair delete rows directly
+and leave them here, and ``delete_drawer`` on the gone id clears them.
 
 Ported from upstream #2767 and #2866. ``recorded_at`` is naive local time, like
 every ``filed_at`` in this fork. The text is written as ASCII JSON so a lone
@@ -15,6 +17,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -52,6 +55,7 @@ def append_drawer_revision(
     }
     line = json.dumps(record, default=str) + "\n"
     with _revisions_lock(path):
+        created = not path.exists()
         if _ends_mid_line(path):
             line = "\n" + line  # a crash tore the last append; start a fresh line
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
@@ -66,7 +70,24 @@ def append_drawer_revision(
             os.fsync(fd)
         finally:
             os.close(fd)
+        if created:
+            _fsync_directory(path.parent)
     return revision_id
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make a create, rename or unlink in ``directory`` survive a crash.
+
+    The file's own fsync does not cover its directory entry: a crash after an
+    ``os.replace`` can bring the old bytes back, here a deleted drawer's text.
+    """
+    if os.name == "nt":
+        return  # Windows cannot open a directory for fsync
+    fd = os.open(str(directory), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _revisions_lock(path: Path):
@@ -157,6 +178,7 @@ def _purge_locked(path: Path, ids: set, source_file: str | None) -> int:
         return 0
     if not kept:
         path.unlink()
+        _fsync_directory(path.parent)
         return removed
     tmp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
@@ -169,4 +191,20 @@ def _purge_locked(path: Path, ids: set, source_file: str | None) -> int:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+    _fsync_directory(path.parent)
     return removed
+
+
+def copy_drawer_revisions(source_palace: str, dest_palace: str) -> bool:
+    """Carry the log into a palace built to replace ``source_palace``.
+
+    A migrate or an in-place rebuild keeps every drawer but builds a new
+    directory, and this file lives in the old one. Returns True when it
+    copied. A target that already has a log keeps it.
+    """
+    source, dest = revisions_path(source_palace), revisions_path(dest_palace)
+    if not source.is_file() or dest.exists():
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(source), str(dest))
+    return True

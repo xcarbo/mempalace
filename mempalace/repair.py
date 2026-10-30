@@ -50,6 +50,7 @@ from .backends.chroma import (
     hnsw_capacity_status,
 )
 from .config import sqlite_read_uri
+from .revisions import copy_drawer_revisions
 
 
 def __getattr__(name: str):
@@ -2245,6 +2246,7 @@ def _rebuild_from_sqlite_locked(
 
     os.makedirs(dest_palace, exist_ok=True)
     _preserve_knowledge_graph_sqlite(source_palace, dest_palace)
+    copy_drawer_revisions(source_palace, dest_palace)
 
     # Backend lifetime is wrapped in try/finally so the dest palace's
     # PersistentClient handle (opened lazily inside ``create_collection``

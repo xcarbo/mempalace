@@ -3367,8 +3367,34 @@ def _purge_revisions(drawer_ids=(), source_file=None):
     return {"revisions_deleted": removed}
 
 
+@contextlib.contextmanager
+def _drawer_write_lock(drawer_id: str):
+    """Hold a drawer still for one read-check-write.
+
+    The palace lock comes first, the order a batch takes them in. It stops
+    other processes but is re-entrant inside one, so the per-drawer lock is
+    what stops another thread of a threaded server.
+    """
+    from .palace import mine_lock, short_writer_palace_lock
+
+    with short_writer_palace_lock(_config.palace_path):
+        with mine_lock(f"update_drawer:{drawer_id}"):
+            yield
+
+
 def tool_delete_drawer(drawer_id: str):
     """Delete a single logical drawer by ID."""
+    from .palace import MineAlreadyRunning
+
+    try:
+        with _drawer_write_lock(drawer_id):
+            return _delete_drawer_locked(drawer_id)
+    except (OSError, MineAlreadyRunning) as e:
+        return {"success": False, "error": str(e)}
+
+
+def _delete_drawer_locked(drawer_id: str):
+    """The body of :func:`tool_delete_drawer`, with the drawer's lock held."""
     global _metadata_cache
 
     col = _get_collection()
@@ -3378,7 +3404,13 @@ def tool_delete_drawer(drawer_id: str):
     try:
         record = _logical_drawer_record(col, drawer_id)
         if record is None:
-            return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+            # Purged here too: a purge that failed after the delete, or a
+            # drawer sync or dedup removed, has no other way to clear its text.
+            return {
+                "success": False,
+                "error": f"Drawer not found: {drawer_id}",
+                **_purge_revisions([drawer_id]),
+            }
 
         _wal_log(
             "delete_drawer",
@@ -3776,6 +3808,7 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
             "dry_run": False,
             "source_file": source_file,
             "deleted": 0,
+            **_purge_revisions(source_file=source_file),
         }
 
     _wal_log(
@@ -3952,22 +3985,22 @@ def tool_update_drawer(
     roadmap, the wings-registry) are read-modify-write, so a blind second writer
     silently reverts the first — that is what this guards.
 
-    The read, the check, the revision and the write all happen under one lock
-    per drawer. Without it two writers can both pass ``if_unchanged`` on the
-    same text, and the second then replaces the first writer's words while
-    its revision holds only the older text.
+    The read, the check, the revision and the write all happen under
+    :func:`_drawer_write_lock`. Without it two writers can both pass
+    ``if_unchanged`` on the same text, and the second then replaces the first
+    writer's words while its revision holds only the older text.
     """
     if content is None and wing is None and room is None:
         return {"success": True, "drawer_id": drawer_id, "noop": True}
 
-    from .palace import mine_lock
+    from .palace import MineAlreadyRunning
 
     try:
-        with mine_lock(f"update_drawer:{drawer_id}"):
+        with _drawer_write_lock(drawer_id):
             return _update_drawer_locked(drawer_id, content, wing, room, if_unchanged)
-    except OSError as e:
+    except (OSError, MineAlreadyRunning) as e:
         log_write_failure("update_drawer", e, drawer_id=drawer_id)
-        return {"success": False, "error": f"could not lock drawer {drawer_id}: {e}"}
+        return {"success": False, "error": str(e)}
 
 
 def _update_drawer_locked(drawer_id, content, wing, room, if_unchanged):
@@ -4072,9 +4105,10 @@ def _update_drawer_locked(drawer_id, content, wing, room, if_unchanged):
 
         # The chunked path rewrites stored documents even for a metadata-only
         # change. Keep the prior verbatim text before either overwrite. The WAL
-        # redacts content, so it is not this copy.
+        # redacts content, so it is not this copy. Nothing changing means
+        # nothing to keep: the file has no cap.
         revision_id = None
-        if content is not None or should_chunk:
+        if new_doc != old_doc or (should_chunk and new_meta != old_meta):
             from . import revisions
 
             try:
@@ -5559,7 +5593,7 @@ TOOLS = {
         "handler": tool_checkpoint,
     },
     "mempalace_delete_drawer": {
-        "description": "Delete a drawer by ID. Irreversible. Its earlier revisions in drawer_revisions.jsonl are removed too.",
+        "description": "Delete a drawer by ID. Irreversible. Its earlier revisions in drawer_revisions.jsonl are removed too; call it again on a deleted drawer's ID to clear any left behind.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -5701,7 +5735,7 @@ TOOLS = {
         "handler": tool_list_drawers,
     },
     "mempalace_update_drawer": {
-        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found. The replaced text is kept verbatim in the palace's drawer_revisions.jsonl until the drawer is deleted. Pass if_unchanged for a check-and-set write — required practice for singleton drawers (a project's roadmap, the wings-registry) where a blind second writer silently reverts the first.",
+        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found. The replaced text is kept verbatim in the palace's drawer_revisions.jsonl until delete_drawer or delete_by_source removes it. Pass if_unchanged for a check-and-set write — required practice for singleton drawers (a project's roadmap, the wings-registry) where a blind second writer silently reverts the first.",
         "input_schema": {
             "type": "object",
             "properties": {

@@ -123,7 +123,7 @@ Save a whole session in one call. Semantic-dedups each item, files the non-dupli
 
 ### `mempalace_delete_drawer`
 
-Delete a drawer by ID. Irreversible. Its earlier revisions in `drawer_revisions.jsonl` are removed too.
+Delete a drawer by ID. Irreversible. Its earlier revisions in `drawer_revisions.jsonl` are removed too; call it again on a deleted drawer's ID to clear any left behind.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -210,7 +210,7 @@ List drawers with pagination. Optional wing/room filter. Returns IDs, wings, roo
 
 ### `mempalace_update_drawer`
 
-Update an existing drawer's content and/or metadata (wing, room). Fetches the existing drawer first; returns an error if not found. The replaced text is kept verbatim in the palace's `drawer_revisions.jsonl` until the drawer is deleted, and the update is refused if that copy cannot be saved.
+Update an existing drawer's content and/or metadata (wing, room). Fetches the existing drawer first; returns an error if not found. The replaced text is kept verbatim in the palace's `drawer_revisions.jsonl` until `mempalace_delete_drawer` or `mempalace_delete_by_source` removes it, and the update is refused if that copy cannot be saved.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

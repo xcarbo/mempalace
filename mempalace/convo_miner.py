@@ -807,7 +807,7 @@ def _file_chunks_locked(
                 file=sys.stderr,
             )
             logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
-            return 0, room_counts_delta, True
+            return 0, room_counts_delta, True, dedup_lineage
 
         # Batch chunks into bounded upserts so large transcripts keep most of
         # the embedding speedup without one huge Chroma/SQLite request. Keep

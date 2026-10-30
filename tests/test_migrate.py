@@ -501,3 +501,31 @@ def test_migrate_restores_palace_on_swap_failure(tmp_path, capsys):
     # No CRITICAL message — rollback succeeded cleanly.
     out = capsys.readouterr().out
     assert "CRITICAL" not in out
+
+
+def test_migrate_carries_the_drawer_revisions_across_the_swap(tmp_path):
+    """Every drawer survives a migrate, so the text they replaced must too."""
+    from mempalace.revisions import append_drawer_revision, load_drawer_revisions
+
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    (palace_dir / "chroma.sqlite3").write_text("dummy db")
+    append_drawer_revision(str(palace_dir), "id1", "the earlier roadmap")
+
+    fake_col = MagicMock()
+    fake_col.count.return_value = 1
+    drawers = [{"id": "id1", "document": "doc", "metadata": {"wing": "w", "room": "r"}}]
+
+    with (
+        patch("mempalace.migrate.detect_chromadb_version", return_value="0.5.x"),
+        patch("mempalace.backends.chroma.ChromaBackend") as mock_backend_cls,
+        patch("mempalace.migrate.collection_write_roundtrip_works", return_value=False),
+        patch("mempalace.migrate.extract_drawers_from_sqlite", return_value=drawers),
+        patch("mempalace.migrate.confirm_destructive_action", return_value=True),
+    ):
+        mock_backend_cls.backend_version.return_value = "1.5.4"
+        mock_backend_cls.return_value.get_collection.return_value = fake_col
+        mock_backend_cls.return_value.get_or_create_collection.return_value = fake_col
+        migrate(str(palace_dir))
+
+    assert [r["content"] for r in load_drawer_revisions(str(palace_dir))] == ["the earlier roadmap"]

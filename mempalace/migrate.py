@@ -31,6 +31,7 @@ from datetime import datetime
 
 from .backups import copy_palace_dir, prune_backups
 from .config import MempalaceConfig
+from .revisions import copy_drawer_revisions
 
 
 def _restore_stale_palace(palace_path: str, stale_path: str) -> None:
@@ -360,6 +361,7 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
         # Swap: rename old palace aside, then move new one into place.
         # This avoids a window where both old and new are missing.
         print("  Swapping old palace for migrated version...")
+        copy_drawer_revisions(palace_path, temp_palace)
         stale_path = palace_path + ".old"
         if os.path.exists(stale_path):
             shutil.rmtree(stale_path)

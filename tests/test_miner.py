@@ -3358,3 +3358,15 @@ def test_mine_aborts_when_the_mined_set_cannot_be_read(tmp_path, monkeypatch):
 
     monkeypatch.setattr(type(col), "get", real_get)
     assert sorted(get_collection(palace_path).get(include=["metadatas"])["ids"]) == before
+
+
+def test_a_filename_the_backend_cannot_encode_is_that_files_problem(tmp_path, monkeypatch):
+    """A non-UTF-8 name on Linux is one bad file, not an unreadable palace.
+
+    Stopping on it would stop every later mine at the same file.
+    """
+    from mempalace.palace import get_collection
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    col = get_collection(str(tmp_path / "palace"), create=True)
+    assert file_already_mined(col, "/transcripts/caf\udce9.pdf") is False
