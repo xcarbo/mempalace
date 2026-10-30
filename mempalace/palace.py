@@ -16,6 +16,7 @@ from typing import Optional
 
 from .backends import (
     BackendClosedError,
+    BackendError,
     BackendMismatchError,
     CollectionNotInitializedError,
     PalaceNotFoundError,
@@ -27,6 +28,7 @@ from .backends import (
     resolve_backend_for_palace,
 )
 from .backends.embedding_wrapper import EmbeddingCollection
+from .collision_scan import CollisionError, assert_no_collisions, assert_no_duplicate_ids
 from .entity_detector import (
     _apply_known_systems_prepass,
     _collapse_long_ascii_runs,
@@ -120,6 +122,32 @@ def clear_validated_embedder_identity(palace_path: Optional[str] = None) -> None
         _VALIDATED_IDENTITY.discard(key)
 
 
+def _current_embedder_identity(collection):
+    """The identity a write through ``collection`` embeds with, or ``None``.
+
+    A server_embedder backend embeds with its own model and ignores the
+    injected/core embedder, so its effective identity — not the configured
+    model — is the one that counts. Falls back to the configured model name
+    (dimension 0, unknown) for the normal core-embedder case.
+    """
+    from .backends.base import EmbedderIdentity
+    from .embedding import current_model_name
+
+    try:
+        effective = collection.effective_embedder_identity()
+    except Exception:
+        effective = None
+    if effective is not None and getattr(effective, "model_name", ""):
+        return effective
+    try:
+        model_name = current_model_name()
+    except Exception:
+        return None
+    if not model_name:
+        return None  # nameless embedder — cannot enforce identity
+    return EmbedderIdentity(model_name=model_name, dimension=0)
+
+
 def _enforce_embedder_identity(collection, palace_path, collection_name, *, create) -> None:
     """Check (and, for a brand-new collection, record) embedder identity (RFC 001).
 
@@ -137,32 +165,14 @@ def _enforce_embedder_identity(collection, palace_path, collection_name, *, crea
 
     from .backends.base import (
         DimensionMismatchError,
-        EmbedderIdentity,
         EmbedderIdentityMismatchError,
         EmbedderIdentityUnknownWarning,
         check_embedder_identity,
     )
-    from .embedding import current_model_name
 
-    # A server_embedder backend embeds with its own model and ignores the
-    # injected/core embedder, so its effective identity — not the configured
-    # model — is what must be checked and recorded. Fall back to the configured
-    # model name for the normal (core-embedder) case.
-    current: Optional[EmbedderIdentity] = None
-    try:
-        effective = collection.effective_embedder_identity()
-    except Exception:
-        effective = None
-    if effective is not None and getattr(effective, "model_name", ""):
-        current = effective
-    else:
-        try:
-            model_name = current_model_name()
-        except Exception:
-            return
-        if not model_name:
-            return  # nameless embedder — cannot enforce identity
-        current = EmbedderIdentity(model_name=model_name, dimension=0)
+    current = _current_embedder_identity(collection)
+    if current is None:
+        return
 
     model_name = current.model_name
     key = (str(palace_path), str(collection_name), model_name)
@@ -897,6 +907,16 @@ def purge_file_closets(closets_col, source_file: str) -> None:
         logger.debug("Closet purge failed for %s", source_file, exc_info=True)
 
 
+def file_has_closets(closets_col, source_file: str) -> bool:
+    """True when ``source_file`` has a closet. A failed read answers False."""
+    try:
+        got = closets_col.get(where={"source_file": source_file}, limit=1, include=[])
+    except Exception:
+        logger.debug("Closet read failed for %s", source_file, exc_info=True)
+        return False
+    return bool(got.get("ids"))
+
+
 def upsert_closet_lines(closets_col, closet_id_base, lines, metadata):
     """Write topic lines to closets, packed greedily without splitting a line.
 
@@ -1229,7 +1249,7 @@ class MineAlreadyRunning(RuntimeError):
 class MinedSetUnavailable(RuntimeError):
     """The palace could not be read to learn what is already mined.
 
-    Stops the mine. Answering "not mined" instead would purge and re-file
+    Stops the mine. Answering "not mined" instead would re-file and prune
     every source the failed read did not see.
     """
 
@@ -1728,6 +1748,11 @@ def file_already_mined(
     ``add_drawer()`` call with no partial-batch risk) is trusted on its own,
     exactly as before.
 
+    Rows count only toward others with the same ``chunk_total``. A re-file
+    marks its drawers one above their count until the stale ones are gone (see
+    :func:`write_file_drawers`), so old and new rows can share an mtime with
+    different totals; adding them up would call that set finished.
+
     Raises :class:`MinedSetUnavailable` when the palace cannot be read: a read
     error that answered False would re-file the source as unmined. A row whose
     values cannot be compared still answers False, because it is this one
@@ -1753,8 +1778,8 @@ def file_already_mined(
         except (OSError, ValueError):
             return False
     offset = 0
-    # Tracks, per matching stored_mtime group, how many drawers have
-    # been seen so far toward that group's own chunk_total (#21).
+    # Tracks, per matching (stored_mtime, chunk_total) group, how many
+    # drawers have been seen so far toward that chunk_total (#21).
     group_counts: dict = {}
     while True:
         try:
@@ -1799,8 +1824,8 @@ def file_already_mined(
                     # No completion marker on this drawer — can't verify
                     # completeness for its group, trust the match as before.
                     return True
-                seen = group_counts.get(stored_mtime, 0) + 1
-                group_counts[stored_mtime] = seen
+                seen = group_counts.get((stored_mtime, chunk_total), 0) + 1
+                group_counts[(stored_mtime, chunk_total)] = seen
                 if seen >= chunk_total:
                     return True
         except (TypeError, ValueError):
@@ -1862,7 +1887,7 @@ def prefetch_mined_set(
     compared leaves out only its own source, which the per-file check then
     answers.
     """
-    # Per source_file: per stored_mtime group → count + optional chunk_total.
+    # Per source_file: per (stored_mtime, chunk_total) group → row count.
     # A source is only "mined" once some group is complete.
     groups: dict[str, dict] = {}
     unprovable: set = set()
@@ -1884,14 +1909,14 @@ def prefetch_mined_set(
         except (TypeError, ValueError):
             unprovable.add(src)
             return
-        entry = groups.setdefault(src, {}).setdefault(mtime_key, {"count": 0, "chunk_total": None})
-        entry["count"] += 1
         chunk_total = meta.get("chunk_total")
         if chunk_total is not None:
             try:
-                entry["chunk_total"] = int(chunk_total)
+                chunk_total = int(chunk_total)
             except (TypeError, ValueError):
-                pass
+                chunk_total = None
+        by_group = groups.setdefault(src, {})
+        by_group[(mtime_key, chunk_total)] = by_group.get((mtime_key, chunk_total), 0) + 1
 
     def _scan_all():
         total = collection.count()
@@ -1936,16 +1961,12 @@ def prefetch_mined_set(
         ) from exc
 
     mined: dict[str, Optional[float]] = {}
-    for src, by_mtime in groups.items():
+    for src, by_group in groups.items():
         if src in unprovable:
             continue
-        for mtime_key, entry in by_mtime.items():
-            chunk_total = entry["chunk_total"]
-            if chunk_total is None:
-                # Legacy / registry: no completion marker — trust membership.
-                mined[src] = mtime_key
-                break
-            if entry["count"] >= chunk_total:
+        for (mtime_key, chunk_total), count in by_group.items():
+            # Legacy / registry: no completion marker — trust membership.
+            if chunk_total is None or count >= chunk_total:
                 mined[src] = mtime_key
                 break
     return mined
@@ -2020,3 +2041,246 @@ def prefetch_content_hashes(
             f"hashes loaded); stopping rather than filing them again ({exc!r})"
         ) from exc
     return hashes
+
+
+# =============================================================================
+# FILING ONE SOURCE FILE
+# =============================================================================
+
+
+# Drawers per upsert: most of the embedding batch speedup without one huge
+# Chroma/SQLite request for a large file.
+DRAWER_UPSERT_BATCH_SIZE = 1000
+
+# Metadata key naming the model that made a drawer's stored vector.
+EMBEDDER_STAMP_KEY = "embedder_model"
+
+# Errors that end the whole mine. Anything else fails the one file.
+MINE_ABORTS = (BackendError, CollisionError, MineAlreadyRunning, MinedSetUnavailable)
+
+
+class StaleDrawerPurgeFailed(RuntimeError):
+    """A file's new drawers are written but its stale ones could not be removed.
+
+    The new drawers still carry their unfinished marker, so the file reads as
+    not mined and the next mine finishes the job.
+    """
+
+
+def _source_file_delete_ids(collection, source_file: str, extract_mode: Optional[str]) -> list:
+    """Collect drawer IDs for one source file in one extraction mode's scope.
+
+    ``extract_mode=None`` is every drawer for the path. Legacy conversation
+    drawers did not carry extract_mode; treat those as exchange-mode rows so
+    schema rebuilds can still clean them up without deleting newer
+    general-mode drawers for the same transcript.
+    """
+    ids: list = []
+    offset = 0
+    while True:
+        batch = collection.get(
+            where={"source_file": source_file},
+            limit=1000,
+            offset=offset,
+            include=["metadatas"],
+        )
+        batch_ids = batch.get("ids") or []
+        metadatas = batch.get("metadatas") or []
+        for drawer_id, meta in zip(batch_ids, metadatas):
+            if _metadata_matches_extract_mode(meta or {}, extract_mode):
+                ids.append(drawer_id)
+        if not batch_ids:
+            break
+        offset += len(batch_ids)
+    return ids
+
+
+class FiledDrawers(int):
+    """How many drawers :func:`write_file_drawers` wrote.
+
+    ``unchanged`` is true for a pruning re-file that stored every drawer
+    under its old id with its old text and removed nothing, so the file's
+    closets still describe it.
+    """
+
+    unchanged = False
+
+
+def _reusable_vector(vector, dimension: int) -> bool:
+    return vector is not None and dimension > 0 and len(vector) == dimension
+
+
+def _stored_vectors(collection, ids: list) -> dict:
+    if not ids:
+        return {}
+    try:
+        got = collection.get(ids=ids, include=["embeddings"])
+    except Exception:
+        logger.warning(
+            "Could not read stored vectors; re-embedding %d drawers", len(ids), exc_info=True
+        )
+        return {}
+    vectors = got.get("embeddings")
+    if vectors is None:
+        return {}
+    return dict(zip(got.get("ids") or [], vectors))
+
+
+def _split_unchanged(collection, batch: list, identity, total: Optional[int]) -> tuple:
+    """Split ``batch`` into rows to embed and rows whose stored vector still fits.
+
+    Upstream #2813 with a stricter test. A drawer keeps its vector only when
+    it is stored under the same id with the same text, its row names the
+    model in use, and the vector has that model's dimension. The name is the
+    part upstream does not check: ``set-embedder --force`` leaves the old
+    vectors in place, and minilm and bge-small are both 384-d, so a dimension
+    check alone would keep the old model's vector for good. A row with no
+    name is embedded again and gets one: the rows that predate the stamp, and
+    MCP drawers, whose vector is of a breadcrumb plus the text
+    (``embedding_input.py``) and not of the text alone.
+
+    Chroma keeps the metadata keys an upsert omits, so there a key the
+    re-filed drawer no longer has is sent as ``None``, which removes it;
+    without that a drawer re-mined over its old id would keep, say, entities
+    its new text dropped. Backends that replace the metadata need nothing.
+
+    Vectors are read only for drawers that pass the text and name checks, so
+    a first mine never reads one, and reuse is only a saving: a failed read
+    embeds those drawers instead of failing the mine.
+
+    Returns ``(to_embed, reuse, reuse_vectors, changed)``. ``changed`` lists
+    the ids that are not settled on this text, which is not the same as
+    ``to_embed``: a row embedded only for want of a stamp did not change. The
+    text differs, or the row carries another ``chunk_total`` than this pass's
+    ``total``: a killed re-file already stored the new text, so its retry
+    finds the text equal while the closets still describe the old file.
+    """
+    embedder = identity.model_name if identity else ""
+    existing = collection.get(
+        ids=[drawer_id for drawer_id, _, _ in batch],
+        include=["documents", "metadatas"],
+    )
+    ids = existing.get("ids") or []
+    documents = existing.get("documents") or [None] * len(ids)
+    metadatas = existing.get("metadatas") or [None] * len(ids)
+    stored = {
+        drawer_id: (doc, meta or {}) for drawer_id, doc, meta in zip(ids, documents, metadatas)
+    }
+    merges = getattr(collection, "upsert_merges_metadata", False) is True
+    rows, candidates, changed = [], [], []
+    for drawer_id, doc, meta in batch:
+        old_doc, old_meta = stored.get(drawer_id, (None, {}))
+        if merges:
+            meta = {**dict.fromkeys(set(old_meta) - set(meta)), **meta}
+        old_total = old_meta.get("chunk_total")
+        if old_doc != doc or (total is not None and old_total not in (None, total)):
+            changed.append(drawer_id)
+        fits = old_doc == doc and bool(embedder) and old_meta.get(EMBEDDER_STAMP_KEY) == embedder
+        rows.append((drawer_id, doc, meta, fits))
+        if fits:
+            candidates.append(drawer_id)
+    vectors = _stored_vectors(collection, candidates)
+    dimension = 0
+    if vectors:
+        from .embedding import probe_dimension
+
+        dimension = identity.dimension or probe_dimension()
+    to_embed, reuse, reuse_vectors = [], [], []
+    for drawer_id, doc, meta, fits in rows:
+        vector = vectors.get(drawer_id)
+        if fits and _reusable_vector(vector, dimension):
+            reuse.append((drawer_id, doc, meta))
+            reuse_vectors.append(vector)
+        else:
+            to_embed.append((drawer_id, doc, meta))
+    return to_embed, reuse, reuse_vectors, changed
+
+
+def _upsert(collection, rows: list, embeddings=None) -> None:
+    if not rows:
+        return
+    kwargs = {} if embeddings is None else {"embeddings": embeddings}
+    collection.upsert(
+        ids=[drawer_id for drawer_id, _, _ in rows],
+        documents=[doc for _, doc, _ in rows],
+        metadatas=[meta for _, _, meta in rows],
+        **kwargs,
+    )
+
+
+def write_file_drawers(
+    collection,
+    source_file: str,
+    drawers: list,
+    *,
+    extract_mode: Optional[str] = None,
+    prune: bool = True,
+) -> int:
+    """File one source file's drawers: write the new ones, then drop the stale.
+
+    The one path every miner re-files through (upstream #2798). ``drawers`` is
+    a list of ``(drawer_id, document, metadata)``. The caller holds
+    ``mine_lock(source_file)`` and has already decided the file needs filing.
+
+    With ``prune``, every new drawer is written with ``chunk_total`` one
+    higher than the count, so ``file_already_mined`` reads the set as
+    unfinished. The file's other drawers in the ``extract_mode`` scope (see
+    :func:`_source_file_delete_ids`) are then deleted, and only after that is
+    ``chunk_total`` set to the real count, as a metadata-only update. A crash
+    anywhere leaves the old drawers or the new ones readable and the file
+    marked unfinished, so the next mine redoes it. After a crash before the
+    delete, search can return both the old drawers and the new ones until
+    that next mine.
+
+    Without ``prune`` the drawers are written as given and nothing is removed.
+
+    Returns a :class:`FiledDrawers` count of the drawers written. Raises
+    :class:`StaleDrawerPurgeFailed` when the stale drawers could not be
+    removed; an error in :data:`MINE_ABORTS` (a dead backend) propagates as is.
+    """
+    total = len(drawers)
+    identity = _current_embedder_identity(collection)
+    stamp = {EMBEDDER_STAMP_KEY: identity.model_name} if identity else {}
+    marker = {"chunk_total": total + 1} if prune else {}
+    drawers = [(i, doc, {**meta, **stamp, **marker}) for i, doc, meta in drawers]
+    assert_no_duplicate_ids([(drawer_id, meta) for drawer_id, _, meta in drawers])
+    written = []
+    changed = []
+    for start in range(0, len(drawers), DRAWER_UPSERT_BATCH_SIZE):
+        batch = drawers[start : start + DRAWER_UPSERT_BATCH_SIZE]
+        assert_no_collisions([(drawer_id, meta) for drawer_id, _, meta in batch], collection)
+        to_embed, reuse, reuse_vectors, batch_changed = _split_unchanged(
+            collection, batch, identity, total if prune else None
+        )
+        _upsert(collection, reuse, embeddings=reuse_vectors)
+        _upsert(collection, to_embed)
+        written += reuse + to_embed
+        changed += batch_changed
+    if not prune:
+        return FiledDrawers(len(written))
+
+    fresh = {drawer_id for drawer_id, _, _ in drawers}
+    try:
+        stale = [
+            drawer_id
+            for drawer_id in _source_file_delete_ids(collection, source_file, extract_mode)
+            if drawer_id not in fresh
+        ]
+        if stale:
+            collection.delete(ids=stale)
+    except MINE_ABORTS:
+        raise
+    except Exception as exc:
+        raise StaleDrawerPurgeFailed(
+            f"stale-drawer purge failed for {source_file!r} ({exc!r}); the new drawers "
+            "stay marked unfinished and the next mine retries"
+        ) from exc
+    for start in range(0, len(written), DRAWER_UPSERT_BATCH_SIZE):
+        batch = written[start : start + DRAWER_UPSERT_BATCH_SIZE]
+        collection.update(
+            ids=[drawer_id for drawer_id, _, _ in batch],
+            metadatas=[{**meta, "chunk_total": total} for _, _, meta in batch],
+        )
+    filed = FiledDrawers(len(written))
+    filed.unchanged = bool(written) and not changed and not stale
+    return filed

@@ -22,7 +22,6 @@ from collections import defaultdict
 from typing import Optional
 
 from .backends import PalaceNotFoundError
-from .collision_scan import assert_no_collisions
 from .ids import (
     ID_RECIPE,
     make_convo_drawer_id,
@@ -34,7 +33,7 @@ from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
-    _metadata_matches_extract_mode,
+    StaleDrawerPurgeFailed,
     _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
@@ -42,6 +41,7 @@ from .palace import (
     mine_palace_lock,
     prefetch_content_hashes,
     prefetch_mined_set,
+    write_file_drawers,
 )
 
 logger = logging.getLogger("mempalace_mcp")
@@ -177,7 +177,6 @@ CHUNK_SIZE = 800  # chars per drawer — align with miner.py
 CHUNK_OVERLAP = 120
 _LINE_GROUP_SIZE = 25  # lines per fallback group when no paragraph breaks
 _LINE_FALLBACK_MIN_NEWLINES = 20  # trigger line-group fallback above this newline count
-DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # Matches miner.py at 500 MB. Long Claude Code sessions, multi-year
 # ChatGPT exports, and lifetime Slack dumps routinely exceed 10 MB; the
@@ -282,33 +281,6 @@ def _register_file(
         ids=[sentinel_id],
         metadatas=[meta],
     )
-
-
-def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list[str]:
-    """Collect drawer IDs for one source file and extraction mode.
-
-    Legacy conversation drawers did not carry extract_mode; treat those as
-    exchange-mode rows so schema rebuilds can still clean them up without
-    deleting newer general-mode drawers for the same transcript.
-    """
-    ids: list[str] = []
-    offset = 0
-    while True:
-        batch = collection.get(
-            where={"source_file": source_file},
-            limit=1000,
-            offset=offset,
-            include=["metadatas"],
-        )
-        batch_ids = batch.get("ids") or []
-        metadatas = batch.get("metadatas") or []
-        for drawer_id, meta in zip(batch_ids, metadatas):
-            if _metadata_matches_extract_mode(meta or {}, extract_mode):
-                ids.append(drawer_id)
-        if not batch_ids:
-            break
-        offset += len(batch_ids)
-    return ids
 
 
 # =============================================================================
@@ -750,15 +722,15 @@ def _file_chunks_locked(
     content_hash=None,
     source_mtime: Optional[float] = None,
 ):
-    """Lock the source file, purge stale drawers, and upsert fresh chunks.
+    """Lock the source file and replace its drawers in this extraction mode.
 
-    Combines the per-file serialization that prevents concurrent agents from
-    duplicating work (via mine_lock) with the rebuild contract
-    (purge-before-insert so stale drawers never survive) that fires on
-    either a normalize-version bump OR a changed/grown source file (mtime
-    differs from what's stored) -- transcripts are not assumed immutable,
-    since a Claude Code session keeps appending to its own file while
-    active and /compact or /clear can rewrite one in place.
+    The lock stops concurrent agents from duplicating work, and
+    ``write_file_drawers`` files the fresh chunks before it drops the stale
+    ones. That rebuild fires on either a normalize-version bump OR a
+    changed/grown source file (mtime differs from what's stored) --
+    transcripts are not assumed immutable, since a Claude Code session keeps
+    appending to its own file while active and /compact or /clear can rewrite
+    one in place.
 
     When ``content_dedup`` is on, a chunk whose exact content already exists
     in this wing from a DIFFERENT source file is skipped instead of stored —
@@ -773,52 +745,16 @@ def _file_chunks_locked(
     Returns (drawers_added, room_counts_delta, skipped, dedup_lineage).
     """
     room_counts_delta: dict = defaultdict(int)
-    drawers_added = 0
     dedup_lineage: list = []
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
-        # still fall through to the purge+rebuild path below.
+        # still fall through to the rebuild below.
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
             return 0, room_counts_delta, True, dedup_lineage
 
-        # Purge stale drawers first. Fires both on a normalize-schema bump
-        # (file_already_mined() returned False for pre-v2 drawers) and on a
-        # changed/grown transcript (mtime differs) — clean them out so the
-        # source doesn't end up with mixed old/new drawers.
-        #
-        # A failed purge must abort this file's mine attempt rather than
-        # fall through to upsert: proceeding on top of an unpurged (or
-        # partially purged) set produces duplicate/stale drawers under
-        # mixed schema versions, with no operator-visible signal beyond a
-        # debug log (#105 — convo_miner's own instance of the same swallow
-        # already fixed for miner.py at #23). Returning here leaves the old
-        # drawers' stored mtime untouched, so the next mine still sees a
-        # mismatch and retries.
-        try:
-            delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-            if delete_ids:
-                collection.delete(ids=delete_ids)
-        except Exception as exc:
-            print(
-                f"  ! [skip] stale-drawer purge failed for {source_file!r} "
-                f"({exc!r}); leaving existing drawers untouched, will retry "
-                f"on the next mine",
-                file=sys.stderr,
-            )
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
-            return 0, room_counts_delta, True, dedup_lineage
-
-        # Batch chunks into bounded upserts so large transcripts keep most of
-        # the embedding speedup without one huge Chroma/SQLite request. Keep
-        # one filed_at per source file so all transcript drawers share an
+        # Keep one filed_at per source file so all transcript drawers share an
         # ingest timestamp.
-        #
-        # Every drawer of this pass carries ``chunk_total`` so
-        # ``file_already_mined`` / ``prefetch_mined_set`` can tell a complete
-        # multi-batch mine from one that crashed mid-file (#2183). Without it
-        # a stable mtime + any surviving drawer permanently skips the file
-        # and the missing exchanges never come back.
         filed_at = datetime.now().isoformat()
         # Prefer the mtime captured with the read. A fresh stat here can
         # observe an append that this pass did not ingest.
@@ -828,8 +764,10 @@ def _file_chunks_locked(
             except OSError:
                 source_mtime = None
         # Content-hash dedup gate (ours): one bulk lookup for this file's
-        # hashes, then O(1) skip decisions per chunk. Same-file rows never
-        # match (they were just purged above, and the helper excludes them).
+        # hashes, then O(1) skip decisions per chunk. This file's old rows are
+        # still stored at this point, so the helper's own-source exclusion is
+        # load-bearing: a chunk that matched its own old row would be skipped,
+        # then pruned as stale, and the only copy would be gone.
         chunk_hashes = [_chunk_content_hash(chunk["content"]) for chunk in chunks]
         duplicate_map = (
             _existing_content_hashes(collection, wing, chunk_hashes, source_file)
@@ -837,114 +775,83 @@ def _file_chunks_locked(
             else {}
         )
 
-        # chunk_total (theirs, 759b8f1) is how many drawers this source SHOULD
-        # have once filed — upstream's completeness rule reads it back to spot a
-        # partial mine. It must therefore count what we will actually file, not
-        # len(chunks): every chunk the dedup gate skips is a deliberate absence,
-        # and counting it would make the source look permanently incomplete and
-        # be re-mined on every pass, forever. With dedup off (or nothing
-        # duplicated) duplicate_map is empty and this is exactly len(chunks),
-        # i.e. upstream's own value.
-        chunk_total = sum(1 for h in chunk_hashes if h not in duplicate_map)
-
-        try:
-            for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-                batch_docs: list = []
-                batch_ids: list = []
-                batch_metas: list = []
-                for offset, chunk in enumerate(
-                    chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
-                ):
-                    chunk_hash = chunk_hashes[batch_start + offset]
-                    duplicate = duplicate_map.get(chunk_hash)
-                    if duplicate is not None:
-                        dedup_lineage.append(
-                            {
-                                "source_file": source_file,
-                                "chunk_index": chunk["chunk_index"],
-                                "content_hash": chunk_hash,
-                                "duplicate_of_drawer": duplicate[0],
-                                "duplicate_of_source": duplicate[1],
-                                "wing": wing,
-                                "skipped_at": filed_at,
-                            }
-                        )
-                        continue
-                    chunk_room = (
-                        chunk.get("memory_type", room) if extract_mode == "general" else room
-                    )
-                    if extract_mode == "general":
-                        room_counts_delta[chunk_room] += 1
-                    drawer_id = make_convo_drawer_id(
-                        wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
-                    )
-                    batch_docs.append(chunk["content"])
-                    batch_ids.append(drawer_id)
-                    meta = {
-                        "wing": wing,
-                        "room": chunk_room,
-                        "hall": _detect_hall_cached(chunk["content"]),
+        drawers = []
+        for chunk, chunk_hash in zip(chunks, chunk_hashes):
+            duplicate = duplicate_map.get(chunk_hash)
+            if duplicate is not None:
+                dedup_lineage.append(
+                    {
                         "source_file": source_file,
                         "chunk_index": chunk["chunk_index"],
-                        "added_by": agent,
-                        "filed_at": filed_at,
-                        "entities": entities_metadata(chunk["content"]),
-                        "authored_at": authored_at if authored_at is not None else filed_at,
-                        "ingest_mode": "convos",
-                        "extract_mode": extract_mode,
-                        "normalize_version": NORMALIZE_VERSION,
-                        "id_recipe": ID_RECIPE,
-                        "chunk_total": chunk_total,
-                        # OURS owns the ``content_hash`` key: a per-CHUNK hash,
-                        # stamped on every row, read back by
-                        # _existing_content_hashes. ~201k live drawers already
-                        # carry it, so renaming it would blind the dedup gate to
-                        # all existing history until the v3 re-mine.
                         "content_hash": chunk_hash,
+                        "duplicate_of_drawer": duplicate[0],
+                        "duplicate_of_source": duplicate[1],
+                        "wing": wing,
+                        "skipped_at": filed_at,
                     }
-                    if source_mtime is not None:
-                        meta["source_mtime"] = source_mtime
-                    # THEIRS keeps its conversation-level hash, but under a
-                    # distinct key. Both designs shipped independently and both
-                    # wanted "content_hash"; they hold different values (a chunk
-                    # digest vs a whole normalized transcript digest), so sharing
-                    # one key would mix two hash namespaces in one field and
-                    # would also feed all ~201k of our chunk hashes into
-                    # prefetch_content_hashes' conversation map. Chunk 0 only,
-                    # exactly as upstream does it, so bundle hashes are not
-                    # O(N^2)-duplicated across every row.
-                    if content_hash is not None and chunk.get("chunk_index", 0) == 0:
-                        meta["conversation_content_hash"] = content_hash
-                    batch_metas.append(meta)
-                if not batch_ids:
-                    continue
-                assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
-                try:
-                    collection.upsert(
-                        documents=batch_docs,
-                        ids=batch_ids,
-                        metadatas=batch_metas,
-                    )
-                    drawers_added += len(batch_docs)
-                except Exception as e:
-                    if "already exists" not in str(e).lower():
-                        raise
-        except Exception:
-            # A successful earlier batch has the source's current mtime and
-            # chunk_total. Leaving those drawers behind would make the next
-            # run treat the incomplete set as fully filed (#2183 / #2122).
-            try:
-                delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-                if delete_ids:
-                    collection.delete(ids=delete_ids)
-            except Exception:
-                logger.warning(
-                    "Failed to clean partial convo drawers after upsert error for %s",
-                    source_file,
-                    exc_info=True,
                 )
-            raise
-    return drawers_added, room_counts_delta, False, dedup_lineage
+                continue
+            chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
+            if extract_mode == "general":
+                room_counts_delta[chunk_room] += 1
+            drawer_id = make_convo_drawer_id(
+                wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
+            )
+            meta = {
+                "wing": wing,
+                "room": chunk_room,
+                "hall": _detect_hall_cached(chunk["content"]),
+                "source_file": source_file,
+                "chunk_index": chunk["chunk_index"],
+                "added_by": agent,
+                "filed_at": filed_at,
+                "entities": entities_metadata(chunk["content"]),
+                "authored_at": authored_at if authored_at is not None else filed_at,
+                "ingest_mode": "convos",
+                "extract_mode": extract_mode,
+                "normalize_version": NORMALIZE_VERSION,
+                "id_recipe": ID_RECIPE,
+                # OURS owns the ``content_hash`` key: a per-CHUNK hash,
+                # stamped on every row, read back by
+                # _existing_content_hashes. ~201k live drawers already
+                # carry it, so renaming it would blind the dedup gate to
+                # all existing history until the v3 re-mine.
+                "content_hash": chunk_hash,
+            }
+            if source_mtime is not None:
+                meta["source_mtime"] = source_mtime
+            # THEIRS keeps its conversation-level hash, but under a
+            # distinct key. Both designs shipped independently and both
+            # wanted "content_hash"; they hold different values (a chunk
+            # digest vs a whole normalized transcript digest), so sharing
+            # one key would mix two hash namespaces in one field and
+            # would also feed all ~201k of our chunk hashes into
+            # prefetch_content_hashes' conversation map. Chunk 0 only,
+            # exactly as upstream does it, so bundle hashes are not
+            # O(N^2)-duplicated across every row.
+            if content_hash is not None and chunk.get("chunk_index", 0) == 0:
+                meta["conversation_content_hash"] = content_hash
+            drawers.append((drawer_id, chunk["content"], meta))
+
+        # chunk_total (theirs, 759b8f1), stamped by write_file_drawers, is how
+        # many drawers this source SHOULD have once filed — upstream's
+        # completeness rule reads it back to spot a partial mine. It must
+        # therefore count what we will actually file, not len(chunks): every
+        # chunk the dedup gate skips is a deliberate absence, and counting it
+        # would make the source look permanently incomplete and be re-mined on
+        # every pass, forever. ``drawers`` holds exactly the chunks that pass.
+        #
+        # A failed stale-drawer purge skips this file for now (#105): the new
+        # drawers stay marked unfinished, so the next mine retries.
+        try:
+            drawers_added = write_file_drawers(
+                collection, source_file, drawers, extract_mode=extract_mode
+            )
+        except StaleDrawerPurgeFailed as exc:
+            print(f"  ! [skip] {exc}", file=sys.stderr)
+            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+            return 0, room_counts_delta, True, dedup_lineage
+    return int(drawers_added), room_counts_delta, False, dedup_lineage
 
 
 def _is_ai_tool_path(path: Path) -> bool:
@@ -1349,9 +1256,9 @@ def _mine_convos_impl(
         # a Claude Code session keeps appending to the same file while
         # active, and /compact or /clear can rewrite one in place -- so
         # "we've seen this source_file before" alone is not sufficient.
-        # Falling through re-mines: _file_chunks_locked purges this
-        # source_file's stale drawers before inserting fresh ones, so this
-        # never leaves duplicates behind.
+        # Falling through re-mines: _file_chunks_locked writes the fresh
+        # drawers, then drops this source_file's stale ones, so this never
+        # leaves duplicates behind.
         if _is_unchanged_since_last_mine(source_file, mined_mtimes):
             files_skipped += 1
             continue
@@ -1450,8 +1357,8 @@ def _mine_convos_impl(
         if extract_mode != "general":
             room_counts[room] += 1
 
-        # Lock + purge stale + file fresh chunks. Lock serializes concurrent
-        # agents; purge removes pre-v2 drawers so the schema bump applies.
+        # Lock + file fresh chunks + prune stale. Lock serializes concurrent
+        # agents; the prune removes pre-v2 drawers so the schema bump applies.
         drawers_added, room_delta, skipped, dedup_lineage = _file_chunks_locked(
             collection,
             source_file,

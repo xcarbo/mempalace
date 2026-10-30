@@ -679,6 +679,133 @@ def test_update_drawer_serialises_its_check_and_write(monkeypatch, config, kg, s
     assert [row["content"] for row in saved] == [original["content"]]
 
 
+def test_vector_reuse_needs_the_model_that_made_the_vector(tmp_path, monkeypatch):
+    """Upstream #2813 reuses a stored vector when the text and the dimension
+    match. ``set-embedder --force`` leaves the old vectors in place, and minilm
+    and bge-small are both 384-d, so that check passes and a re-mine keeps the
+    old model's vector: a wrong result in every search, and nothing raises. A
+    merge that drops the ``embedder_model`` check brings that back.
+    """
+    from mempalace import embedding
+    from mempalace.backends import embedding_wrapper
+    from mempalace.backends.base import EmbedderIdentity
+    from mempalace.palace import EMBEDDER_STAMP_KEY, get_collection, write_file_drawers
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setattr(embedding, "probe_dimension", lambda *a, **k: 384)
+    col = get_collection(str(tmp_path / "palace"))
+    drawer = ("drawer_0", "verbatim", {"source_file": "/s.md", "chunk_index": 0})
+    write_file_drawers(col, "/s.md", [drawer])
+
+    embedded = []
+    real = embedding_wrapper._embed_texts
+
+    def counting(texts, is_query=False):
+        embedded.extend(texts)
+        return real(texts, is_query=is_query)
+
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", counting)
+    write_file_drawers(col, "/s.md", [drawer])
+    assert embedded == [], "the same model should keep its vector"
+
+    monkeypatch.setattr(
+        "mempalace.palace._current_embedder_identity",
+        lambda collection: EmbedderIdentity(model_name="another-model", dimension=384),
+    )
+    write_file_drawers(col, "/s.md", [drawer])
+    assert embedded == ["verbatim"], (
+        "FORK DELTA REVERTED: a vector from another model was reused because the "
+        "text and dimension matched. Restore the embedder_model check."
+    )
+    meta = col.get(ids=["drawer_0"], include=["metadatas"])["metadatas"][0]
+    assert meta[EMBEDDER_STAMP_KEY] == "another-model"
+
+
+def test_old_and_new_rows_under_one_mtime_do_not_add_up_to_a_finished_file(tmp_path):
+    """Upstream counts rows per mtime. A re-file marks its rows N+1 until the
+    stale rows are gone, so three new rows (marker 4) beside two old rows of a
+    five-row file reach five and read as finished: the stale rows stay for good
+    and nothing raises. Ours counts per (mtime, chunk_total), in both readers.
+    """
+    from mempalace.palace import NORMALIZE_VERSION, file_already_mined, prefetch_mined_set
+
+    source = tmp_path / "chat.txt"
+    source.write_text("text\n", encoding="utf-8")
+    mtime = source.stat().st_mtime
+    rows = [
+        {
+            "source_file": str(source),
+            "source_mtime": mtime,
+            "chunk_total": total,
+            "normalize_version": NORMALIZE_VERSION,
+        }
+        for total in (4, 4, 4, 5, 5)
+    ]
+
+    class Rows:
+        def get(self, where=None, limit=None, offset=0, include=None):
+            page = rows[offset : offset + (limit or len(rows))]
+            return {"ids": [str(i) for i in range(len(page))], "metadatas": page}
+
+    assert not file_already_mined(Rows(), str(source), check_mtime=True), (
+        "FORK DELTA REVERTED: file_already_mined added up rows with different chunk_total"
+    )
+    assert str(source) not in prefetch_mined_set(Rows(), source_files=[str(source)]), (
+        "FORK DELTA REVERTED: prefetch_mined_set added up rows with different chunk_total"
+    )
+
+
+def test_a_row_embedded_for_want_of_a_stamp_still_counts_as_unchanged(tmp_path, monkeypatch):
+    """Upstream reads "nothing was embedded" as "nothing changed". Every row
+    filed before our stamp is embedded once, so with that reading the first
+    re-mine of an unchanged file would drop its closets, LLM-generated ones
+    included. Ours compares the text.
+    """
+    from mempalace.palace import get_collection, write_file_drawers
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    col = get_collection(str(tmp_path / "palace"))
+    meta = {"source_file": "/s.md", "chunk_index": 0}
+    col.upsert(ids=["drawer_0"], documents=["verbatim"], metadatas=[meta])
+
+    filed = write_file_drawers(col, "/s.md", [("drawer_0", "verbatim", meta)])
+
+    assert filed.unchanged is True, (
+        "FORK DELTA REVERTED: a re-file with no text change reads as changed, so "
+        "the project miner purges that file's closets."
+    )
+
+
+def test_the_dedup_gate_ignores_the_files_own_rows(tmp_path, monkeypatch):
+    """Our content-hash gate has no upstream equivalent. Since the write comes
+    first, a file's old rows are still stored when the gate runs. If they
+    counted as twins, an unchanged chunk would be skipped and then pruned, and
+    the only copy of that text would be gone.
+    """
+    from mempalace import convo_miner
+    from mempalace.palace import get_collection
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    source = tmp_path / "chat.txt"
+    source.write_text("> one\nreply\n", encoding="utf-8")
+    col = get_collection(str(tmp_path / "palace"))
+    chunks = [{"content": f"unchanged chunk {i}", "chunk_index": i} for i in range(3)]
+
+    def file_it(mtime):
+        return convo_miner._file_chunks_locked(
+            col, str(source), chunks, "w", "r", "agent", "exchange", source_mtime=mtime
+        )
+
+    file_it(1.0)
+    file_it(2.0)
+
+    got = col.get(where={"source_file": str(source)}, include=["documents"])
+    assert sorted(got["documents"]) == sorted(c["content"] for c in chunks), (
+        "FORK DELTA REVERTED: the dedup gate matched a file's own rows, and the "
+        "prune then removed the only copy."
+    )
+
+
 def test_a_moved_drawer_does_not_stop_the_next_mine():
     """Upstream's ``_same_owner`` compares the stored wing. Our ``update_drawer``
     and wing splits change that and keep the id, so with the old row still
@@ -697,3 +824,23 @@ def test_a_moved_drawer_does_not_stop_the_next_mine():
 
     proposed = [("drawer_0", {"source_file": "/f.md", "chunk_index": 0, "wing": "original"})]
     assert_no_collisions(proposed, Stored())
+
+
+def test_a_killed_refile_rebuilds_its_closets_on_the_retry(tmp_path, monkeypatch):
+    """A re-file stores the new text before it is done, so the retry finds the
+    text equal. Reading that as "nothing changed" keeps the old file's closets
+    for good. A stored ``chunk_total`` other than this pass's means unsettled.
+    """
+    from mempalace.palace import get_collection, write_file_drawers
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    col = get_collection(str(tmp_path / "palace"))
+    meta = {"source_file": "/s.md", "chunk_index": 0}
+    col.upsert(ids=["d0"], documents=["new text"], metadatas=[{**meta, "chunk_total": 2}])
+
+    filed = write_file_drawers(col, "/s.md", [("d0", "new text", meta)])
+
+    assert filed.unchanged is False, (
+        "FORK DELTA REVERTED: the retry of a killed re-file read as unchanged, so "
+        "the project miner kept closets that describe the old text."
+    )

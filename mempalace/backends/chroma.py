@@ -2138,6 +2138,8 @@ class ChromaCollection(BaseCollection):
     directly without going through ``ChromaBackend``.
     """
 
+    upsert_merges_metadata = True
+
     def __init__(self, collection, palace_path: Optional[str] = None):
         self._collection = collection
         self._palace_path = palace_path

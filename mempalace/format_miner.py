@@ -70,20 +70,20 @@ from pathlib import Path
 from typing import Optional, Union
 
 from .palace import (
-    MinedSetUnavailable,
+    MINE_ABORTS,
     NORMALIZE_VERSION,
     SKIP_DIRS,
     _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
     mine_lock,
+    write_file_drawers,
 )
 
 # Module-level imports from .miner so tests can patch them via
 # mempalace.format_miner.<name>. Lazy imports inside functions would not
 # expose these as attributes of this module, breaking the test seams.
 from .config import MempalaceConfig, normalize_wing_name
-from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
 from .miner import (
     _compute_topic_tunnels_for_wing,
@@ -103,9 +103,6 @@ __all__ = [
     "mine_formats",
 ]
 
-
-# Same batch size as miner.py / convo_miner.py — bounds memory + Chroma payload.
-DRAWER_UPSERT_BATCH_SIZE = 1000
 
 # Minimum chunk size (chars) — drawers below this are dropped as not useful.
 MIN_CHUNK_SIZE = 50
@@ -502,7 +499,7 @@ def scan_formats(directory: Union[Path, str]) -> list[Path]:
 # ─────────────────────────────────────────────────────────────────────────────
 # mine_formats — orchestrator. Walks a directory, transforms each supported
 # file via extract_text, chunks the resulting Markdown via miner.chunk_text,
-# files drawers via the same lock + purge + upsert pattern convo_miner uses.
+# files drawers via the same lock + write_file_drawers path convo_miner uses.
 # Source files on disk are never modified.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -593,10 +590,10 @@ def _file_chunks_locked(
     source_mtime: Optional[float] = None,
     content: Optional[str] = None,
 ):
-    """Lock the source file, purge stale drawers, and upsert fresh chunks.
+    """Lock the source file and replace its format-mode drawers.
 
-    Mirrors the canonical convo_miner pattern (locked purge + batched upsert)
-    but with ``ingest_mode="extract"`` so format-mined drawers are
+    Mirrors the canonical convo_miner pattern (locked write_file_drawers) but
+    with ``ingest_mode="extract"`` so format-mined drawers are
     distinguishable from project / convo drawers in the palace.
 
     Each drawer's metadata includes:
@@ -617,7 +614,6 @@ def _file_chunks_locked(
     # the body-scan branch; if absent, the helper still uses filename + mtime.
     file_content_date = _extract_content_date(source_file, content or "")
 
-    drawers_added = 0
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file.
         # Use check_mtime=True so an updated source file is re-mined even
@@ -632,70 +628,50 @@ def _file_chunks_locked(
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode="format"):
             return 0, True
 
-        try:
-            collection.delete(where={"source_file": source_file})
-        except Exception:
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
-
         filed_at = datetime.now().isoformat()
-        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-            batch_docs: list = []
-            batch_ids: list = []
-            batch_metas: list = []
-            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"])
-                content = chunk["content"]
-                meta: dict = {
-                    "wing": wing,
-                    "room": room,
-                    "source_file": source_file,
-                    "chunk_index": chunk["chunk_index"],
-                    "added_by": agent,
-                    "filed_at": filed_at,
-                    "ingest_mode": "extract",
-                    "extract_mode": "format",
-                    "normalize_version": NORMALIZE_VERSION,
-                    "hall": detect_hall(content),
-                    "id_recipe": ID_RECIPE,
-                }
-                if source_mtime is not None:
-                    meta["source_mtime"] = source_mtime
-                # Tier 6a — propagate line range from chunk dict into drawer
-                # metadata so closet pointers can carry "where in source"
-                # info. Chunks emitted by older code paths without these
-                # keys produce drawers without the keys (graceful fallback).
-                if chunk.get("line_start") is not None:
-                    meta["line_start"] = chunk["line_start"]
-                if chunk.get("line_end") is not None:
-                    meta["line_end"] = chunk["line_end"]
-                # Tier 6a content-date: shared across all chunks of the file.
-                if file_content_date:
-                    meta["content_date"] = file_content_date
-                entities = _extract_entities_for_metadata(content)
-                if entities:
-                    meta["entities"] = entities
-                batch_docs.append(content)
-                batch_ids.append(drawer_id)
-                batch_metas.append(meta)
-            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
-            try:
-                collection.upsert(
-                    documents=batch_docs,
-                    ids=batch_ids,
-                    metadatas=batch_metas,
-                )
-                drawers_added += len(batch_docs)
-            except Exception as exc:
-                if "already exists" not in str(exc).lower():
-                    raise
-    return drawers_added, False
+        drawers = []
+        for chunk in chunks:
+            text = chunk["content"]
+            meta: dict = {
+                "wing": wing,
+                "room": room,
+                "source_file": source_file,
+                "chunk_index": chunk["chunk_index"],
+                "added_by": agent,
+                "filed_at": filed_at,
+                "ingest_mode": "extract",
+                "extract_mode": "format",
+                "normalize_version": NORMALIZE_VERSION,
+                "hall": detect_hall(text),
+                "id_recipe": ID_RECIPE,
+            }
+            if source_mtime is not None:
+                meta["source_mtime"] = source_mtime
+            # Tier 6a — propagate line range from chunk dict into drawer
+            # metadata so closet pointers can carry "where in source"
+            # info. Chunks emitted by older code paths without these
+            # keys produce drawers without the keys (graceful fallback).
+            if chunk.get("line_start") is not None:
+                meta["line_start"] = chunk["line_start"]
+            if chunk.get("line_end") is not None:
+                meta["line_end"] = chunk["line_end"]
+            # Tier 6a content-date: shared across all chunks of the file.
+            if file_content_date:
+                meta["content_date"] = file_content_date
+            entities = _extract_entities_for_metadata(text)
+            if entities:
+                meta["entities"] = entities
+            drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"])
+            drawers.append((drawer_id, text, meta))
+        drawers_added = write_file_drawers(collection, source_file, drawers, extract_mode="format")
+    return int(drawers_added), False
 
 
 def _reraise_mine_abort(exc: Exception) -> None:
-    """Let an unreadable mined set stop the mine (#2791). The handlers around
-    the file loop keep going on anything else, which here would report success
-    with nothing checked."""
-    if isinstance(exc, MinedSetUnavailable):
+    """Let an unreadable mined set or a dead backend stop the mine (#2791). The
+    handlers around the file loop keep going on anything else, which here would
+    report success with nothing checked."""
+    if isinstance(exc, MINE_ABORTS):
         raise exc
 
 

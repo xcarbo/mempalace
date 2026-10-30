@@ -662,6 +662,7 @@ def _mine_formats_mocks(tmp_path: Path):
     collection = MagicMock()
     collection.delete = MagicMock()
     collection.upsert = MagicMock()
+    collection.get.return_value = {"ids": [], "metadatas": []}
 
     @contextmanager
     def _fake_lock(source_file):

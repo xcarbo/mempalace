@@ -26,11 +26,13 @@ from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
     MineValidationError,
+    StaleDrawerPurgeFailed,
     _candidate_entity_words,
     _open_collection_or_explain,
     _validate_palace_fts5_after_mine,
     build_closet_lines,
     file_already_mined,
+    file_has_closets,
     get_closets_collection,
     get_collection,
     get_collection_read_only,
@@ -38,13 +40,13 @@ from .palace import (
     mine_palace_lock,
     purge_file_closets,
     upsert_closet_lines,
+    write_file_drawers,
 )
 
 # Module-level import so tests can patch it as
 # ``mempalace.miner.compute_hallways_for_wing``. The integration call
 # lives at the end of _mine_impl, alongside the existing
 # ``_compute_topic_tunnels_for_wing`` post-mine block.
-from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
 
@@ -193,7 +195,6 @@ from .config import (  # noqa: E402  (kept here for the legacy alias)
     DEFAULT_MIN_CHUNK_SIZE as MIN_CHUNK_SIZE,
 )
 
-DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # A safety rail against pathological generated artifacts (lockfiles not in
 # SKIP_FILENAMES, vendored data dumps, etc.). Originally 500 to bound ONNX
@@ -203,7 +204,7 @@ MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # magnitude of safety margin against the original lockfile case
 # (~1124 chunks for `pnpm-lock.yaml` per #1296) while not touching
 # hand-written prose. Per-ONNX-call exposure is bounded by
-# `DRAWER_UPSERT_BATCH_SIZE` (1000 chunks/batch) regardless of this cap,
+# `palace.DRAWER_UPSERT_BATCH_SIZE` (1000 chunks/batch) regardless of this cap,
 # so the cap is a per-file admission rail, not a per-batch limit. Lower
 # this via `MEMPALACE_MAX_CHUNKS_PER_FILE` or
 # `mempalace mine --max-chunks-per-file N` if you hit ONNX bad_alloc on
@@ -1404,7 +1405,6 @@ def _build_drawer_metadata(
     line_start: Optional[int] = None,
     line_end: Optional[int] = None,
     content_date: Optional[str] = None,
-    chunk_total: Optional[int] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -1447,8 +1447,6 @@ def _build_drawer_metadata(
         metadata["line_end"] = line_end
     if content_date:
         metadata["content_date"] = content_date
-    if chunk_total is not None:
-        metadata["chunk_total"] = chunk_total
     metadata["hall"] = detect_hall(content)
     entities = _extract_entities_for_metadata(content)
     if entities:
@@ -1553,37 +1551,12 @@ def process_file(
         print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
         return len(chunks), room, None
 
-    # Lock this file so concurrent agents don't interleave delete+insert.
-    # Without the lock, two agents can both pass file_already_mined(),
-    # both delete, and both insert — creating duplicates or losing data.
+    # Lock this file so concurrent agents don't interleave their re-files.
+    # Without the lock, two agents can both pass file_already_mined(), both
+    # write and both prune -- creating duplicates or losing data.
     with mine_lock(source_file):
         # Re-check after acquiring lock — another agent may have just finished
         if file_already_mined(collection, source_file, check_mtime=True):
-            return 0, room, None
-
-        # Purge stale drawers for this file before re-inserting the fresh chunks.
-        # Converts modified-file re-mines from upsert-over-existing-IDs (which hits
-        # hnswlib's thread-unsafe updatePoint path and can segfault on macOS ARM
-        # with chromadb 0.6.3) into a clean delete+insert, bypassing the update
-        # path entirely.
-        #
-        # A failed purge must abort this file's mine attempt rather than fall
-        # through to upsert: proceeding would either leave stale tail entries
-        # as permanent orphans (old chunk count > new) or silently overwrite
-        # only the overlapping chunk_index positions (not a real re-mine) --
-        # see #23. Returning here (without touching source_mtime/chunk_total)
-        # leaves the old drawers' stored mtime untouched, so the next mine
-        # still sees a mismatch against the current on-disk mtime and retries.
-        try:
-            collection.delete(where={"source_file": source_file})
-        except Exception as exc:
-            print(
-                f"  ! [skip] {filepath.name[:50]:50} stale-drawer purge failed "
-                f"({exc!r}); leaving existing drawers untouched, will retry "
-                f"on the next mine",
-                file=sys.stderr,
-            )
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
             return 0, room, None
 
         # source_mtime is the mtime paired with the content actually read
@@ -1601,90 +1574,61 @@ def process_file(
         # falls back to filed_at downstream.
         file_content_date = _extract_content_date(source_file, content)
 
-        drawers_added = 0
-        # Accumulate drawer metadata across batches so the closet emitter
-        # below can consume it (Tier 6a date+line locators). Without this,
-        # the new ``drawer_metas`` kwarg never reaches ``build_closet_lines``
-        # in production and the 4-segment pointer form lives only in tests.
-        # Per PR #1584 review (Igor, 2026-05-22).
-        all_metas: list = []
-        try:
-            for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-                batch_docs: list = []
-                batch_ids: list = []
-                batch_metas: list = []
-                for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                    drawer_id = make_drawer_id_from_chunk(
-                        wing, room, source_file, chunk["chunk_index"]
-                    )
-                    batch_docs.append(chunk["content"])
-                    batch_ids.append(drawer_id)
-                    batch_metas.append(
-                        _build_drawer_metadata(
-                            wing,
-                            room,
-                            source_file,
-                            chunk["chunk_index"],
-                            agent,
-                            chunk["content"],
-                            source_mtime,
-                            line_start=chunk.get("line_start"),
-                            line_end=chunk.get("line_end"),
-                            content_date=file_content_date,
-                            chunk_total=len(chunks),
-                        )
-                    )
-                assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
-                collection.upsert(
-                    documents=batch_docs,
-                    ids=batch_ids,
-                    metadatas=batch_metas,
-                )
-                drawers_added += len(batch_docs)
-                all_metas.extend(batch_metas)
-        except Exception:
-            # A successful earlier batch has the source's current mtime (and
-            # often chunk_total). Leaving those drawers behind would make the
-            # next run skip this incomplete rebuild when chunk_total is absent
-            # on legacy rows, and would leave partial content searchable until
-            # the next mine. The source lock prevents this cleanup from
-            # deleting another miner's work for the same file. (#2122)
-            try:
-                collection.delete(where={"source_file": source_file})
-            except Exception:
-                logger.warning(
-                    "Failed to clean partial drawers after upsert error for %s",
+        drawers = [
+            (
+                make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"]),
+                chunk["content"],
+                _build_drawer_metadata(
+                    wing,
+                    room,
                     source_file,
-                    exc_info=True,
-                )
-            if closets_col:
-                purge_file_closets(closets_col, source_file)
-            raise
+                    chunk["chunk_index"],
+                    agent,
+                    chunk["content"],
+                    source_mtime,
+                    line_start=chunk.get("line_start"),
+                    line_end=chunk.get("line_end"),
+                    content_date=file_content_date,
+                ),
+            )
+            for chunk in chunks
+        ]
+        # Every drawer for this path is replaced, whichever miner filed it. A
+        # failed stale-drawer purge skips the closets below: the new drawers
+        # stay marked unfinished, so the next mine sees the file as not mined
+        # and finishes the job (#23).
+        try:
+            drawers_added = write_file_drawers(collection, source_file, drawers)
+        except StaleDrawerPurgeFailed as exc:
+            print(f"  ! [skip] {filepath.name[:50]:50} {exc}", file=sys.stderr)
+            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+            return 0, room, None
 
         # Build closet — the searchable index pointing to these drawers.
-        # Purge unconditionally: the old drawers this closet pointed at were
-        # already deleted above regardless of how many chunks survived this
-        # pass's own length filter, so a re-mine that ends up with zero filed
-        # drawers must still end up with zero closets, not stale ones
-        # dangling on deleted drawer IDs (see #24). Only the closet
-        # rebuild itself is conditional on there being new drawers to point at.
+        # Purge unconditionally: the old drawers this closet pointed at are
+        # gone regardless of how many chunks survived this pass's own length
+        # filter, so a re-mine that ends up with zero filed drawers must still
+        # end up with zero closets, not stale ones dangling on deleted drawer
+        # IDs (see #24). Only the closet rebuild itself is conditional on
+        # there being new drawers to point at. A re-file that changed no text
+        # keeps the closets it has, including LLM-generated ones; a file with
+        # none still gets them.
+        if closets_col and drawers_added.unchanged and file_has_closets(closets_col, source_file):
+            closets_col = None
         if closets_col:
             purge_file_closets(closets_col, source_file)
         if closets_col and drawers_added > 0:
-            drawer_ids = [
-                make_drawer_id_from_chunk(wing, room, source_file, c["chunk_index"]) for c in chunks
-            ]
             # Pass drawer_metas so build_closet_lines can emit the Tier 6a
             # 4-segment pointer (``topic|entities|YYYY-MM-DD:Lstart-Lend|→ids``)
             # when line_start / line_end / content_date are present. Falls
             # back to the legacy 3-segment form automatically when not.
             closet_lines = build_closet_lines(
                 source_file,
-                drawer_ids,
+                [drawer_id for drawer_id, _, _ in drawers],
                 content,
                 wing,
                 room,
-                drawer_metas=all_metas,
+                drawer_metas=[meta for _, _, meta in drawers],
             )
             closet_id_base = (
                 f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
@@ -1694,7 +1638,7 @@ def process_file(
                 "wing": wing,
                 "room": room,
                 "source_file": source_file,
-                "drawer_count": drawers_added,
+                "drawer_count": int(drawers_added),
                 "filed_at": datetime.now().isoformat(),
                 "normalize_version": NORMALIZE_VERSION,
             }

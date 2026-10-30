@@ -1555,13 +1555,13 @@ def test_convo_mine_prefetches_only_its_own_files(tmp_path, monkeypatch):
 
 def test_a_failed_purge_skips_the_file_and_the_mine_goes_on(tmp_path, monkeypatch, capsys):
     """A purge that fails must not end the mine for every other file."""
-    from mempalace import convo_miner
+    from mempalace import palace
 
     first = tmp_path / "a.txt"
     second = tmp_path / "b.txt"
     first.write_text(_THREE_TURNS, encoding="utf-8")
     second.write_text(_THREE_TURNS.replace("memory", "recall"), encoding="utf-8")
-    real = convo_miner._source_file_delete_ids
+    real = palace._source_file_delete_ids
     calls = []
 
     def fail_first(collection, source_file, extract_mode):
@@ -1570,12 +1570,18 @@ def test_a_failed_purge_skips_the_file_and_the_mine_goes_on(tmp_path, monkeypatc
             raise RuntimeError("palace busy")
         return real(collection, source_file, extract_mode)
 
-    monkeypatch.setattr(convo_miner, "_source_file_delete_ids", fail_first)
+    monkeypatch.setattr(palace, "_source_file_delete_ids", fail_first)
     mine_convos(str(tmp_path), str(tmp_path / "palace"), wing="test")
 
     assert "stale-drawer purge failed" in capsys.readouterr().err
-    mined = {m["source_file"] for m in _drawers(tmp_path / "palace")["metadatas"]}
-    assert mined == {calls[1]}
+    assert len(calls) == 2
+    metas = _drawers(tmp_path / "palace")["metadatas"]
+    assert {m["source_file"] for m in metas} == {str(first), str(second)}
+    col = palace.get_collection(str(tmp_path / "palace"))
+    finished = [
+        str(f) for f in (first, second) if file_already_mined(col, str(f), check_mtime=True)
+    ]
+    assert finished == [calls[1]]
 
 
 def test_a_content_hash_read_error_stops_the_mine(tmp_path, monkeypatch):

@@ -71,6 +71,10 @@ class EmbeddingCollection(BaseCollection):
         return getattr(self._inner, name)
 
     @property
+    def upsert_merges_metadata(self):
+        return self._inner.upsert_merges_metadata
+
+    @property
     def distance_metric(self) -> str:
         # Explicit delegation: ``BaseCollection`` defines ``distance_metric``
         # as a property, so it resolves on this subclass and ``__getattr__``
