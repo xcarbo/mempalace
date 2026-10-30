@@ -677,3 +677,23 @@ def test_update_drawer_serialises_its_check_and_write(monkeypatch, config, kg, s
     )
     saved = load_drawer_revisions(config.palace_path, drawer_id)
     assert [row["content"] for row in saved] == [original["content"]]
+
+
+def test_a_moved_drawer_does_not_stop_the_next_mine():
+    """Upstream's ``_same_owner`` compares the stored wing. Our ``update_drawer``
+    and wing splits change that and keep the id, so with the old row still
+    stored at write time the next mine of the file raises ``CollisionError``,
+    which ends the mine for every later file, every run. The id already hashes
+    the wing, so the source file is the only compare that proves anything.
+    """
+    from mempalace.collision_scan import assert_no_collisions
+
+    class Stored:
+        def get(self, ids=None, include=None):
+            return {
+                "ids": ids,
+                "metadatas": [{"source_file": "/f.md", "chunk_index": 0, "wing": "moved"}],
+            }
+
+    proposed = [("drawer_0", {"source_file": "/f.md", "chunk_index": 0, "wing": "original"})]
+    assert_no_collisions(proposed, Stored())

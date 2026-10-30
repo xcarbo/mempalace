@@ -1,9 +1,9 @@
 """Pre-mining defense against drawer_id collisions.
 
-Runs immediately before a batched chromadb upsert. Computes the union of
-incoming drawer_ids and existing drawer_ids that share a key with the
-batch; raises ``CollisionError`` if any drawer_id appears more than once
-in that union with conflicting ``(source_file, chunk_index)`` metadata.
+Runs immediately before a batched chromadb upsert. Raises
+``CollisionError`` when a drawer_id in the batch appears twice with
+conflicting ``(source_file, chunk_index)`` metadata, or when it already
+belongs to a stored drawer of another ``source_file``.
 
 Under the v2 hash recipe (see :mod:`mempalace.ids`) accidental collisions
 are vanishingly rare — SHA-256 truncated to 24 hex chars makes random
@@ -16,9 +16,9 @@ collision ~2^-96. The scan exists for two reasons:
 2. Catch the astronomical-but-possible SHA-256 hash collision with a
    clear message instead of a silent overwrite at upsert time.
 
-The scan does NOT fire on idempotent re-mines — when an incoming drawer
-matches an existing one with the SAME ``(source_file, chunk_index)``
-metadata, that is normal re-write behavior, not collision.
+The scan does NOT fire on re-mines — an incoming drawer that matches a
+stored one of the same source is a re-write, even when its ``chunk_index``
+moved (a diary entry keeps its id when an earlier entry grows).
 """
 
 from __future__ import annotations
@@ -50,6 +50,21 @@ def _metadata_key(meta: dict) -> tuple:
     return (source_file, chunk_index)
 
 
+def assert_no_duplicate_ids(proposed: list[tuple[str, dict]]) -> None:
+    """Abort when one drawer_id carries two chunks of the proposed set.
+
+    :func:`assert_no_collisions` runs per upsert batch and accepts a stored
+    row of the same source, so across batches of one file only this check can
+    see two chunks hashed to one id. Run it once over the whole file.
+    """
+    keys: dict[str, set[tuple]] = defaultdict(set)
+    for drawer_id, meta in proposed:
+        keys[drawer_id].add(_metadata_key(meta))
+    collisions = {did: found for did, found in keys.items() if len(found) > 1}
+    if collisions:
+        raise CollisionError(_format_collisions(collisions))
+
+
 def assert_no_collisions(
     proposed: list[tuple[str, dict]],
     collection,
@@ -66,9 +81,9 @@ def assert_no_collisions(
             returning a dict with ``ids`` and ``metadatas`` keys.
 
     Raises:
-        CollisionError: when a drawer_id maps to two or more distinct
-            ``(source_file, chunk_index)`` tuples in the union of
-            incoming and existing rows.
+        CollisionError: when a drawer_id maps to two distinct
+            ``(source_file, chunk_index)`` tuples within the batch, or to a
+            stored drawer of a different source.
     """
     if not proposed:
         return
@@ -77,8 +92,11 @@ def assert_no_collisions(
     # Using a set collapses duplicate-metadata cases (same chunk twice
     # in the batch) without flagging them as collisions.
     incoming: dict[str, set[tuple]] = defaultdict(set)
+    incoming_meta: dict[str, dict] = {}
     for drawer_id, meta in proposed:
         incoming[drawer_id].add(_metadata_key(meta))
+        incoming_meta.setdefault(drawer_id, meta)
+    collisions = {did: set(keys) for did, keys in incoming.items() if len(keys) > 1}
 
     # Query existing rows for any incoming id. ChromaDB's get(ids=...)
     # returns only the rows whose ids are present; missing ids are
@@ -88,13 +106,14 @@ def assert_no_collisions(
     existing_ids: list = result["ids"] if hasattr(result, "__getitem__") else []
     existing_metas: list = result["metadatas"] if existing_ids else []
 
-    # Merge existing metadata into the incoming map. A real collision is
-    # a drawer_id whose incoming + existing metadata key tuples are not
-    # all the same.
     for drawer_id, meta in zip(existing_ids, existing_metas):
-        incoming[drawer_id].add(_metadata_key(meta or {}))
+        meta = meta or {}
+        # Only the source tells drawers apart here. The wing and extract_mode
+        # are already in the id, and a moved drawer keeps its id while its
+        # stored wing changes, so comparing them would stop every later mine.
+        if meta.get("source_file") != incoming_meta[drawer_id].get("source_file"):
+            collisions.setdefault(drawer_id, set(incoming[drawer_id])).add(_metadata_key(meta))
 
-    collisions = {did: keys for did, keys in incoming.items() if len(keys) > 1}
     if collisions:
         raise CollisionError(_format_collisions(collisions))
 

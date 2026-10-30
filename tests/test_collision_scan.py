@@ -19,7 +19,11 @@ from typing import Optional
 
 import pytest
 
-from mempalace.collision_scan import CollisionError, assert_no_collisions
+from mempalace.collision_scan import (
+    CollisionError,
+    assert_no_collisions,
+    assert_no_duplicate_ids,
+)
 
 
 class _MockGet:
@@ -226,3 +230,53 @@ def test_assert_no_collisions_tolerates_chromadb_get_failure():
     proposed = [("drawer_X", {"source_file": "/f.md", "chunk_index": 0})]
     with pytest.raises(RuntimeError, match="chromadb is sad"):
         assert_no_collisions(proposed, _RaisingCollection())
+
+
+# ── Same source re-filing vs another source ──────────────────────────
+
+
+def test_assert_no_collisions_lets_the_same_source_move_an_ids_chunk_index():
+    """A diary entry keeps its id when an earlier entry grows, so its
+    chunk_index moves. The stored row is the same source's: a re-write."""
+    proposed = [("drawer_diary", {"source_file": "/2026-04-13.md", "chunk_index": 4})]
+    col = _MockCollection(
+        existing={"drawer_diary": {"source_file": "/2026-04-13.md", "chunk_index": 1}}
+    )
+    assert_no_collisions(proposed, col)
+
+
+def test_assert_no_collisions_still_raises_on_two_chunks_of_one_file_in_a_batch():
+    proposed = [
+        ("drawer_X", {"source_file": "/f.md", "chunk_index": 0}),
+        ("drawer_X", {"source_file": "/f.md", "chunk_index": 1}),
+    ]
+    with pytest.raises(CollisionError):
+        assert_no_collisions(proposed, _MockCollection())
+
+
+@pytest.mark.parametrize("key", ["wing", "extract_mode"])
+def test_assert_no_collisions_lets_a_moved_drawer_keep_its_id(key):
+    """update_drawer and wing splits change the stored wing, not the id."""
+    proposed = [("drawer_X", {"source_file": "/f.md", "chunk_index": 0, key: "new"})]
+    col = _MockCollection(
+        existing={"drawer_X": {"source_file": "/f.md", "chunk_index": 0, key: "old"}}
+    )
+    assert_no_collisions(proposed, col)
+
+
+def test_assert_no_collisions_raises_when_another_source_owns_the_id():
+    proposed = [("drawer_X", {"source_file": "/new.md", "chunk_index": 0})]
+    col = _MockCollection(existing={"drawer_X": {"source_file": "/old.md", "chunk_index": 0}})
+    with pytest.raises(CollisionError):
+        assert_no_collisions(proposed, col)
+
+
+def test_assert_no_duplicate_ids_sees_a_whole_file_at_once():
+    proposed = [
+        ("drawer_X", {"source_file": "/f.md", "chunk_index": 5}),
+        ("drawer_Y", {"source_file": "/f.md", "chunk_index": 6}),
+        ("drawer_X", {"source_file": "/f.md", "chunk_index": 1200}),
+    ]
+    with pytest.raises(CollisionError):
+        assert_no_duplicate_ids(proposed)
+    assert_no_duplicate_ids(proposed[:2])
