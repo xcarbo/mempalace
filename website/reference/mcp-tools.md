@@ -123,7 +123,7 @@ Save a whole session in one call. Semantic-dedups each item, files the non-dupli
 
 ### `mempalace_delete_drawer`
 
-Delete a drawer by ID. Irreversible.
+Delete a drawer by ID. Irreversible. Its earlier revisions in `drawer_revisions.jsonl` are removed too.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -153,7 +153,7 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. Wra
 
 ### `mempalace_delete_by_source`
 
-Bulk-delete every drawer mined from one `source_file` (exact match). Use this to clean up benchmark or test data that was accidentally mined into a user wing — for example ShareGPT dumps or `results_mempal_*.jsonl` eval files drowning out real memories in semantic search. Matching is pushed down to the storage backend via a `where` filter, so it is not subject to the SQLite variable limit no matter how many drawers share the source. Returns a dry-run match count and a small sample by default; pass `dry_run=false` to commit. Irreversible.
+Bulk-delete every drawer mined from one `source_file` (exact match). Use this to clean up benchmark or test data that was accidentally mined into a user wing — for example ShareGPT dumps or `results_mempal_*.jsonl` eval files drowning out real memories in semantic search. Matching is pushed down to the storage backend via a `where` filter, so it is not subject to the SQLite variable limit no matter how many drawers share the source. Returns a dry-run match count and a small sample by default; pass `dry_run=false` to commit. Irreversible; a commit also removes those drawers' earlier revisions.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -210,7 +210,7 @@ List drawers with pagination. Optional wing/room filter. Returns IDs, wings, roo
 
 ### `mempalace_update_drawer`
 
-Update an existing drawer's content and/or metadata (wing, room). Fetches the existing drawer first; returns an error if not found.
+Update an existing drawer's content and/or metadata (wing, room). Fetches the existing drawer first; returns an error if not found. The replaced text is kept verbatim in the palace's `drawer_revisions.jsonl` until the drawer is deleted, and the update is refused if that copy cannot be saved.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

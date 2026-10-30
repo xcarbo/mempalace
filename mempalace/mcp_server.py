@@ -3345,6 +3345,28 @@ def tool_add_drawer(
         return {"success": False, "error": str(e)}
 
 
+def _purge_revisions(drawer_ids=(), source_file=None):
+    """Drop the saved prior text of drawers that were just deleted.
+
+    Runs after the drawer delete commits, so a failed delete keeps them. The
+    drawers are already gone, so a failure here is logged and reported in the
+    result, not raised. Returns the fields to merge into the delete result.
+    """
+    from . import revisions
+
+    try:
+        removed = revisions.purge_drawer_revisions(
+            _config.palace_path, drawer_ids=drawer_ids, source_file=source_file
+        )
+    except Exception as exc:
+        logger.exception("Revision purge failed after a drawer delete")
+        return {
+            "revisions_deleted": None,
+            "revisions_error": f"revision purge failed: {type(exc).__name__}",
+        }
+    return {"revisions_deleted": removed}
+
+
 def tool_delete_drawer(drawer_id: str):
     """Delete a single logical drawer by ID."""
     global _metadata_cache
@@ -3378,6 +3400,7 @@ def tool_delete_drawer(drawer_id: str):
             "drawer_id": drawer_id,
             "deleted_ids": record["ids"],
             "chunks_deleted": len(record["ids"]),
+            **_purge_revisions([drawer_id, *record["ids"]]),
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -3780,6 +3803,7 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
             "source_file": source_file,
             "deleted": match_count,
             "closets_deleted": closets_deleted,
+            **_purge_revisions(source_file=source_file),
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -3927,11 +3951,28 @@ def tool_update_drawer(
     if anyone rewrote the drawer in between. Singleton drawers (a project's
     roadmap, the wings-registry) are read-modify-write, so a blind second writer
     silently reverts the first — that is what this guards.
-    """
-    global _metadata_cache
 
+    The read, the check, the revision and the write all happen under one lock
+    per drawer. Without it two writers can both pass ``if_unchanged`` on the
+    same text, and the second then replaces the first writer's words while
+    its revision holds only the older text.
+    """
     if content is None and wing is None and room is None:
         return {"success": True, "drawer_id": drawer_id, "noop": True}
+
+    from .palace import mine_lock
+
+    try:
+        with mine_lock(f"update_drawer:{drawer_id}"):
+            return _update_drawer_locked(drawer_id, content, wing, room, if_unchanged)
+    except OSError as e:
+        log_write_failure("update_drawer", e, drawer_id=drawer_id)
+        return {"success": False, "error": f"could not lock drawer {drawer_id}: {e}"}
+
+
+def _update_drawer_locked(drawer_id, content, wing, room, if_unchanged):
+    """The body of :func:`tool_update_drawer`, with the drawer's lock held."""
+    global _metadata_cache
 
     col = _get_collection()
     if not col:
@@ -4026,6 +4067,30 @@ def tool_update_drawer(
             if room != str(old_meta.get("room") or ""):
                 new_meta["room"] = room
 
+        chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
+        should_chunk = bool(record.get("chunked")) or len(new_doc) > chunk_size
+
+        # The chunked path rewrites stored documents even for a metadata-only
+        # change. Keep the prior verbatim text before either overwrite. The WAL
+        # redacts content, so it is not this copy.
+        revision_id = None
+        if content is not None or should_chunk:
+            from . import revisions
+
+            try:
+                revision_id = revisions.append_drawer_revision(
+                    _config.palace_path,
+                    drawer_id,
+                    old_doc if isinstance(old_doc, str) else "",
+                    old_meta,
+                )
+            except OSError as exc:
+                log_write_failure("update_drawer", exc, drawer_id=drawer_id)
+                return {
+                    "success": False,
+                    "error": f"could not record prior drawer text: {exc}",
+                }
+
         _wal_log(
             "update_drawer",
             {
@@ -4036,11 +4101,9 @@ def tool_update_drawer(
                 "new_room": new_meta.get("room", ""),
                 "content_changed": content is not None,
                 "content_preview": new_doc[:200] if content is not None else None,
+                "revision_id": revision_id,
             },
         )
-
-        chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
-        should_chunk = bool(record.get("chunked")) or len(new_doc) > chunk_size
 
         if should_chunk:
             chunk_ids, chunk_docs, chunk_metas = _build_chunk_rows(
@@ -4102,6 +4165,7 @@ def tool_update_drawer(
                 "room": new_meta.get("room", ""),
                 "chunks": len(chunk_ids),
                 "chunk_ids": chunk_ids,
+                **({"revision_id": revision_id} if revision_id else {}),
             }
 
         update_kwargs = {"ids": [record["ids"][0]]}
@@ -4134,6 +4198,7 @@ def tool_update_drawer(
             "drawer_id": drawer_id,
             "wing": new_meta.get("wing", ""),
             "room": new_meta.get("room", ""),
+            **({"revision_id": revision_id} if revision_id else {}),
         }
     except Exception as e:
         log_write_failure("update_drawer", e, drawer_id=drawer_id)
@@ -5494,7 +5559,7 @@ TOOLS = {
         "handler": tool_checkpoint,
     },
     "mempalace_delete_drawer": {
-        "description": "Delete a drawer by ID. Irreversible.",
+        "description": "Delete a drawer by ID. Irreversible. Its earlier revisions in drawer_revisions.jsonl are removed too.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -5559,7 +5624,7 @@ TOOLS = {
         "handler": tool_mine,
     },
     "mempalace_delete_by_source": {
-        "description": "Bulk-delete every drawer mined from one source_file (exact match). Use to clean up benchmark/test data accidentally mined into a user wing (#1722). Returns a dry-run match count and sample by default; pass dry_run=false to commit. Irreversible.",
+        "description": "Bulk-delete every drawer mined from one source_file (exact match). Use to clean up benchmark/test data accidentally mined into a user wing (#1722). Returns a dry-run match count and sample by default; pass dry_run=false to commit. Irreversible; a commit also removes those drawers' earlier revisions.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -5636,7 +5701,7 @@ TOOLS = {
         "handler": tool_list_drawers,
     },
     "mempalace_update_drawer": {
-        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found. Pass if_unchanged for a check-and-set write — required practice for singleton drawers (a project's roadmap, the wings-registry) where a blind second writer silently reverts the first.",
+        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found. The replaced text is kept verbatim in the palace's drawer_revisions.jsonl until the drawer is deleted. Pass if_unchanged for a check-and-set write — required practice for singleton drawers (a project's roadmap, the wings-registry) where a blind second writer silently reverts the first.",
         "input_schema": {
             "type": "object",
             "properties": {

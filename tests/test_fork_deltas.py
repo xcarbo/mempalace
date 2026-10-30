@@ -44,6 +44,9 @@ Register:
 19. ``QueueStore.prune_terminal`` keeps failed jobs until ``memp daemon ack``
     (capped at ``FAILED_RETENTION_DAYS``); upstream prunes them after the
     retention window, unseen.
+21. ``mcp_server.tool_update_drawer`` holds one lock per drawer across its
+    read, check-and-set, revision and write. Upstream has no such lock and no
+    check-and-set, so a merge can take its version of the function whole.
 """
 
 from __future__ import annotations
@@ -617,3 +620,52 @@ def test_a_stop_diary_retry_gets_back_the_job_already_stored(tmp_path, monkeypat
     store.finish(job.id, state="succeeded")
     again = store.enqueue("diary_write", {}, dedupe_key="k", reuse_succeeded=True)
     assert again.id == job.id, "FORK DELTA REVERTED: a retried diary is filed twice"
+
+
+def test_update_drawer_serialises_its_check_and_write(monkeypatch, config, kg, seeded_collection):
+    """Delta 21: two check-and-set writers on one drawer cannot both pass.
+
+    Without the lock both read the same text and both pass ``if_unchanged``.
+    The second write then replaces the first writer's text, and the revision it
+    saved holds the older text, so the first writer's words are gone with
+    nothing to show for it: a silent loss on the roadmap singletons.
+    """
+    import threading
+
+    from mempalace import mcp_server
+    from mempalace.revisions import load_drawer_revisions
+
+    monkeypatch.setattr(mcp_server, "_config", config)
+    monkeypatch.setattr(mcp_server, "_get_kg", lambda *a, **kw: kg)
+    drawer_id = "drawer_proj_backend_aaa"
+    original = mcp_server.tool_get_drawer(drawer_id)
+    both_past_the_check = threading.Barrier(2)
+    real_wal = mcp_server._wal_log
+
+    def wait_for_the_other_writer(operation, entry):
+        if operation == "update_drawer":
+            try:
+                both_past_the_check.wait(timeout=1)
+            except threading.BrokenBarrierError:
+                pass
+        return real_wal(operation, entry)
+
+    monkeypatch.setattr(mcp_server, "_wal_log", wait_for_the_other_writer)
+    results = {}
+
+    def write(text):
+        results[text] = mcp_server.tool_update_drawer(
+            drawer_id, content=text, if_unchanged=original["content_sha256"]
+        )
+
+    threads = [threading.Thread(target=write, args=(text,)) for text in ("first", "second")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert sorted(bool(r.get("conflict")) for r in results.values()) == [False, True], (
+        "FORK DELTA REVERTED: two check-and-set writers both passed"
+    )
+    saved = load_drawer_revisions(config.palace_path, drawer_id)
+    assert [row["content"] for row in saved] == [original["content"]]
