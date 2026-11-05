@@ -48,6 +48,11 @@ Register:
     then one lock per drawer) across its read, check-and-set, revision and
     write. Upstream has no such lock and no check-and-set, so a merge can take
     its version of the function whole.
+22. Access levels (``mempalace/levels.py``): ``palace.get_collection`` and
+    ``mcp_server._get_collection`` wrap the collection in the level filter
+    when levels are on, and the daemon runs each job at its submitter's level.
+    Upstream has neither; a merge that takes either function whole drops the
+    filter for every caller, and only a palace with a levels file notices.
 """
 
 from __future__ import annotations
@@ -843,4 +848,28 @@ def test_a_killed_refile_rebuilds_its_closets_on_the_retry(tmp_path, monkeypatch
     assert filed.unchanged is False, (
         "FORK DELTA REVERTED: the retry of a killed re-file read as unchanged, so "
         "the project miner kept closets that describe the old text."
+    )
+
+
+def test_collection_openers_wrap_in_the_level_filter(tmp_path, monkeypatch):
+    """Delta 22: with a levels file present, every collection a caller gets is
+    the level-filtered one, from both openers, and a daemon job runs at the
+    level it was submitted with."""
+    import json as _json
+
+    from mempalace import levels, mcp_server, palace, service
+
+    levels_file = tmp_path / "levels.json"
+    levels_file.write_text(_json.dumps({"default": "team", "owners_folders": []}))
+    monkeypatch.setenv("MEMPALACE_LEVELS_FILE", str(levels_file))
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    col = palace.get_collection(str(tmp_path / "palace"), create=True)
+    assert getattr(col, "_levels_wrapper", False), (
+        "FORK DELTA REVERTED: palace.get_collection no longer wraps in the level filter"
+    )
+    assert "wrap_collection" in inspect.getsource(mcp_server._get_collection), (
+        "FORK DELTA REVERTED: mcp_server._get_collection no longer wraps in the level filter"
+    )
+    assert "caller_level(job_level(payload))" in inspect.getsource(service.execute_job), (
+        "FORK DELTA REVERTED: daemon jobs no longer run at their submitter's level"
     )

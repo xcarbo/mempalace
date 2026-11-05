@@ -1587,6 +1587,9 @@ def submit_job(
     resolved_palace = canonical_palace_path(palace_path or payload.get("palace_path"))
     payload = dict(payload)
     payload["palace_path"] = resolved_palace  # override, never trust client input
+    from .levels import attach_level
+
+    attach_level(payload)  # the daemon runs the job at the submitter's level
     if backend:
         payload["backend"] = backend
     client = ensure_client(resolved_palace, backend=backend, auto_start=auto_start)

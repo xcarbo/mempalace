@@ -1059,8 +1059,11 @@ def _bm25_only_via_sqlite(
         collection_name = get_configured_collection_name()
 
     def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
-        clauses = []
-        params = []
+        from .levels import chroma_access_sql
+
+        access_sql, access_params = chroma_access_sql(row_id_expr)
+        clauses = [access_sql] if access_sql else []
+        params = list(access_params)
         for key, value in (("wing", wing), ("room", room), ("source_file", source_file)):
             if not value:
                 continue

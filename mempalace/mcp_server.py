@@ -45,6 +45,7 @@ sys.stdout = sys.stderr
 
 import argparse  # noqa: E402  (deferred until after stdio protection above)
 import contextlib  # noqa: E402
+import contextvars  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
 import re  # noqa: E402
@@ -106,6 +107,8 @@ from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
 from .logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
 from .collision_scan import assert_no_collisions  # noqa: E402
 from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
+from . import levels as _levels  # noqa: E402
+from .levels import wrap_collection  # noqa: E402
 
 
 class _MempalaceLogFilter(logging.Filter):
@@ -1142,6 +1145,9 @@ def _get_kg(canonical_path=None) -> KnowledgeGraph:
         kg = _kg_by_path.get(path)
         if kg is None:
             kg = KnowledgeGraph(db_path=path)
+            # Facts follow their source drawer's level; look drawers up in the
+            # palace this server serves, not whatever config.json names.
+            kg.access_resolver = lambda ids: _levels.drawer_access_lookup(ids, _config.palace_path)
             _kg_by_path[path] = kg
     return kg
 
@@ -1475,6 +1481,18 @@ def _get_client():
 
 
 def _get_collection(create=False, read_only=False):
+    """The configured collection, wrapped in the access-level filter when levels are on.
+
+    The wrap is decided per call, not cached, so a daemon job or HTTP request
+    running under :func:`mempalace.levels.caller_level` is always filtered.
+    """
+    col = _get_collection_raw(create=create, read_only=read_only)
+    if col is not None and _levels.levels_active():
+        return wrap_collection(col)
+    return col
+
+
+def _get_collection_raw(create=False, read_only=False):
     """Return the configured backend collection, caching handles between calls.
 
     ``read_only=True`` is for tools that only read (get-drawer, list-drawers,
@@ -1915,13 +1933,22 @@ _METADATA_CACHE_TTL = 5.0  # seconds
 _MAX_RESULTS = 100  # upper bound for search/list limit params
 
 
+_metadata_cache_level = None
+
+
 def _get_cached_metadata(col, where=None):
-    """Return cached metadata if fresh, else fetch and cache."""
-    global _metadata_cache, _metadata_cache_time
+    """Return cached metadata if fresh, else fetch and cache.
+
+    The cache is per access level: a daemon or HTTP server answers callers at
+    different levels from one process.
+    """
+    global _metadata_cache, _metadata_cache_time, _metadata_cache_level
     now = time.time()
+    level = _levels.current_level() if _levels.levels_active() else None
     if (
         where is None
         and _metadata_cache is not None
+        and _metadata_cache_level == level
         and (now - _metadata_cache_time) < _METADATA_CACHE_TTL
     ):
         return _metadata_cache
@@ -1929,6 +1956,7 @@ def _get_cached_metadata(col, where=None):
     if where is None:
         _metadata_cache = result
         _metadata_cache_time = now
+        _metadata_cache_level = level
     return result
 
 
@@ -2007,6 +2035,7 @@ def _tool_status_via_sqlite() -> dict:
     try:
         conn = _sqlite3.connect(sqlite_read_uri(db_path), uri=True)
         try:
+            access_sql, access_params = _levels.chroma_access_sql("e.id")
             row = conn.execute(
                 """
                 SELECT COUNT(*)
@@ -2014,8 +2043,9 @@ def _tool_status_via_sqlite() -> dict:
                 JOIN segments s ON e.segment_id = s.id
                 JOIN collections c ON s.collection = c.id
                 WHERE c.name = ?
-                """,
-                (collection_name,),
+                """
+                + access_sql,
+                (collection_name, *access_params),
             ).fetchone()
             total = int(row[0]) if row and row[0] is not None else 0
             for key, target in (("wing", wings), ("room", rooms)):
@@ -2029,9 +2059,10 @@ def _tool_status_via_sqlite() -> dict:
                     WHERE c.name = ?
                       AND em.key = ?
                       AND em.string_value IS NOT NULL
-                    GROUP BY em.string_value
-                    """,
-                    (collection_name, key),
+                    """
+                    + access_sql
+                    + " GROUP BY em.string_value",
+                    (collection_name, key, *access_params),
                 ):
                     target[value] = count
         finally:
@@ -2070,7 +2101,7 @@ def _sqlite_taxonomy():
     index, which costs tens of seconds per call on large palaces and is what
     times them out under the MCP host limit.
     """
-    if not _is_chroma_backend():
+    if not _is_chroma_backend() or _levels.filter_needed():
         return None
     try:
         from .backends.chroma import _sqlite_wing_room_counts
@@ -2116,7 +2147,7 @@ def _sqlite_graph_stats():
     wing and a usable room name (the catch-all ``"general"`` is excluded), and
     edges are the per-hall cross-wing crossings of multi-wing rooms.
     """
-    if not _is_chroma_backend():
+    if not _is_chroma_backend() or _levels.filter_needed():
         return None
     import sqlite3 as _sqlite3
     from collections import Counter, defaultdict
@@ -2478,8 +2509,15 @@ def tool_get_taxonomy():
             wings = list(wing_counts.keys())
             temp_taxonomy = {}
             with ThreadPoolExecutor(max_workers=max(1, min(8, len(wings)))) as executor:
+                # copy_context: a worker thread must keep the caller's
+                # access level (a daemon job or HTTP request override).
                 futures = {
-                    wing: executor.submit(col.facet_counts, "room", where={"wing": wing})
+                    wing: executor.submit(
+                        contextvars.copy_context().run,
+                        col.facet_counts,
+                        "room",
+                        where={"wing": wing},
+                    )
                     for wing in wings
                 }
                 for wing, future in futures.items():
@@ -2757,7 +2795,8 @@ def tool_list_tunnels(wing: str = None):
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    return list_tunnels(wing)
+    col = _get_collection(create=False, read_only=True) if _levels.filter_needed() else None
+    return list_tunnels(wing, col=col)
 
 
 def tool_delete_tunnel(tunnel_id: str):
@@ -2773,7 +2812,8 @@ def tool_list_hallways(wing: str = None):
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    return list_hallways(wing)
+    col = _get_collection(create=False, read_only=True) if _levels.filter_needed() else None
+    return list_hallways(wing, col=col)
 
 
 def tool_delete_hallway(hallway_id: str):

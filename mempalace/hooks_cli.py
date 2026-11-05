@@ -1744,6 +1744,66 @@ def _ingest_wing(transcript_path: str) -> str:
     return _wing_from_transcript_path(transcript_path)
 
 
+def _ingest_level(transcript_path: str, payload_cwd: Optional[str] = None) -> Optional[int]:
+    """Access level for a hook-ingested transcript, or ``None`` when levels are off.
+
+    Beside :func:`_ingest_wing`: the folder is the transcript's own cwd (a
+    worktree resolves to its main repo, a herdr-spawn worktree through its
+    ``meta.json``), a Grok session's folder comes from its path, and the
+    hook payload's cwd counts too. The most private of those and an
+    inherited ``MEMPALACE_LEVEL`` wins (mempalace/levels.py).
+    """
+    from . import levels
+
+    if not levels.levels_active():
+        return None
+    folders: list[str] = []
+    if transcript_path:
+        for cwd in _jsonl_cwds(transcript_path):
+            folders.append(cwd)
+            break
+        match = re.search(
+            r"/sessions/(%2F[^/]+)/[^/]+/[^/]+\.jsonl$", transcript_path.replace("\\", "/")
+        )
+        if match:
+            folders.append(unquote(match.group(1)))
+    if payload_cwd:
+        folders.append(payload_cwd)
+    if not folders:
+        folders.append(os.getcwd())
+    level = min(levels.folder_level(f) for f in folders)
+    inherited = levels.env_level()
+    if inherited is not None:
+        level = min(level, inherited)
+    return level
+
+
+def _pin_hook_level(data: dict, harness: str) -> None:
+    """Pin this hook process to its session's level before any read or write.
+
+    Set in ``MEMPALACE_LEVEL`` so the diary, the transcript ingest (direct,
+    spawned or handed to the daemon) and every read in this hook run at one
+    level. Never raises: a level that cannot be computed leaves the env as is.
+    """
+    from . import levels
+
+    try:
+        if not levels.levels_active():
+            return
+        transcript = ""
+        cwd = data.get("cwd") if isinstance(data, dict) else None
+        if harness in SUPPORTED_HARNESSES:
+            try:
+                transcript = _parse_harness_input(data, harness).get("transcript_path") or ""
+            except SystemExit:
+                transcript = ""
+        level = _ingest_level(transcript, cwd if isinstance(cwd, str) else None)
+        if level is not None:
+            os.environ[levels.LEVEL_ENV] = str(level)
+    except Exception as exc:  # noqa: BLE001 - hooks must never crash the session
+        _log(f"level pin failed: {exc}")
+
+
 def hook_stop(data: dict, harness: str):
     """Stop hook: block every N messages for auto-save."""
     if not _palace_root_exists():
@@ -2149,4 +2209,5 @@ def run_hook(hook_name: str, harness: str):
         print(f"Unknown hook: {hook_name}", file=sys.stderr)
         sys.exit(1)
 
+    _pin_hook_level(data, harness)
     handler(data, harness)

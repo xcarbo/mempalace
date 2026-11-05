@@ -241,6 +241,13 @@ class _WhereNotTranslatable(Exception):
 # whole collection per call (measured 775 ms warm, seconds cold, ×2 per
 # closet-boosted hit — the entire 2026-08-09 cutover latency tail).
 _GENERATED_META_COLUMNS = ("wing", "room", "authored_at", "source_file", "parent_drawer_id")
+# Integer-valued keys get a generated column with NO declared type (so no
+# affinity: the stored JSON value compares exactly as _matches_where sees it).
+# ``access`` is the drawer's access level (mempalace/levels.py). Built by the
+# writable open only, so the where compiler keeps reading json_extract for it:
+# a read-only open of a palace not yet upgraded has no such column. The level
+# filter is a NOT IN over every row either way; the index serves counts.
+_GENERATED_UNTYPED_COLUMNS = ("access",)
 
 # JSON path keys we can quote safely inside ``$."<key>"``. A double quote or
 # backslash would need JSON-path escaping SQLite does not define; those keys
@@ -2062,6 +2069,16 @@ class SQLiteExactBackend(BaseBackend):
             "CREATE INDEX IF NOT EXISTS idx_documents_collection_dim "
             "ON documents(collection_id, dim)"
         )
+        for col in _GENERATED_UNTYPED_COLUMNS:
+            if col not in doc_columns:
+                conn.execute(
+                    f"ALTER TABLE documents ADD COLUMN {col} "
+                    f"GENERATED ALWAYS AS (json_extract(metadata_json, '$.\"{col}\"')) VIRTUAL"
+                )
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_documents_{col} "
+                f"ON documents(collection_id, {col}, dim)"
+            )
         if version != "3":
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES ('index_version', '3') "

@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Optional
 from .config import sanitize_iso_temporal
 from .ids import make_triple_id
+from . import levels as _levels
 
 
 DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
@@ -207,6 +208,44 @@ class KnowledgeGraph:
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.row_factory = sqlite3.Row
         return self._connection
+
+    # Access levels: a fact is as private as the drawer it came from. The
+    # drawer is ``source_drawer_id`` or a ``drawer_...`` id named in the
+    # subject or object (the ``action:<drawer_id>`` convention). A fact that
+    # names no drawer is team. Set ``access_resolver`` to a callable
+    # ``ids -> {id: level}`` to override the palace lookup (tests, replicas).
+    access_resolver = None
+
+    def _visible_fact_rows(self, rows, name_fields):
+        if not rows or not _levels.filter_needed():
+            return rows
+        level = _levels.current_level()
+        refs_per_row = []
+        all_refs: set = set()
+        for row in rows:
+            refs = set()
+            keys = row.keys()
+            if "source_drawer_id" in keys and row["source_drawer_id"]:
+                refs.add(str(row["source_drawer_id"]))
+            for field in name_fields:
+                text = row[field] if field in keys else field
+                if isinstance(text, str):
+                    refs.update(_levels.DRAWER_ID_RE.findall(text))
+            refs_per_row.append(refs)
+            all_refs |= refs
+        if not all_refs:
+            return rows
+        resolver = self.access_resolver or _levels.drawer_access_lookup
+        try:
+            access = resolver(sorted(all_refs))
+        except Exception:
+            # Fail closed: a fact we cannot place is hidden, never shown.
+            access = {}
+        out = []
+        for row, refs in zip(rows, refs_per_row):
+            if all(access.get(ref, _levels.LOWEST_LEVEL) >= level for ref in refs):
+                out.append(row)
+        return out
 
     def close(self):
         """Close the database connection."""
@@ -514,7 +553,9 @@ class KnowledgeGraph:
                 )
                 params = [eid] + temporal_params
 
-                for row in conn.execute(query, params).fetchall():
+                for row in self._visible_fact_rows(
+                    conn.execute(query, params).fetchall(), (name, "obj_name")
+                ):
                     results.append(
                         {
                             "direction": "outgoing",
@@ -536,7 +577,9 @@ class KnowledgeGraph:
                 )
                 params = [eid] + temporal_params
 
-                for row in conn.execute(query, params).fetchall():
+                for row in self._visible_fact_rows(
+                    conn.execute(query, params).fetchall(), ("sub_name", name)
+                ):
                     results.append(
                         {
                             "direction": "incoming",
@@ -575,7 +618,9 @@ class KnowledgeGraph:
         results = []
         with self._lock:
             conn = self._conn()
-            for row in conn.execute(query, params).fetchall():
+            for row in self._visible_fact_rows(
+                conn.execute(query, params).fetchall(), ("sub_name", "obj_name")
+            ):
                 results.append(
                     {
                         "subject": row["sub_name"],
@@ -616,6 +661,7 @@ class KnowledgeGraph:
                     LIMIT 100
                 """).fetchall()
 
+        rows = self._visible_fact_rows(rows, ("sub_name", "obj_name"))
         return [
             {
                 "subject": r["sub_name"],
@@ -660,6 +706,8 @@ class KnowledgeGraph:
         columns = self._REPLICATION_TABLES.get(table)
         if columns is None:
             raise ValueError(f"table must be one of {sorted(self._REPLICATION_TABLES)}")
+        # A replication dump is every fact, unfiltered: owners-level callers only.
+        _levels.require_owners("KG replication dump")
         with self._lock:
             conn = self._conn()
             rows = conn.execute(

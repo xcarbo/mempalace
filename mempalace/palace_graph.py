@@ -30,6 +30,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 from .config import MempalaceConfig, normalize_wing_name
+from . import levels as _levels
 from .dynamics import initialize_dynamics_fields
 from .palace import get_collection as _get_palace_collection
 from .palace import mine_lock
@@ -63,6 +64,7 @@ _graph_cache_lock = threading.Lock()
 _graph_cache_nodes = None
 _graph_cache_edges = None
 _graph_cache_time = 0.0
+_graph_cache_level = None
 _GRAPH_CACHE_TTL = 60.0  # seconds — graph changes less often than metadata
 
 
@@ -106,12 +108,18 @@ def build_graph(col=None, config=None):
         nodes: dict of {room: {wings: set, halls: set, count: int}}
         edges: list of {room, wing_a, wing_b, hall} — one per tunnel crossing
     """
-    global _graph_cache_nodes, _graph_cache_edges, _graph_cache_time
+    global _graph_cache_nodes, _graph_cache_edges, _graph_cache_time, _graph_cache_level
     now = time.time()
+    # The graph is built from what the caller may see, so the cache is per level.
+    level = _levels.current_level() if _levels.levels_active() else None
     # NOTE: warm cache ignores col/config args — intentional for the MCP server's
     # single-palace use case. Callers switching collections must invalidate first.
     with _graph_cache_lock:
-        if _graph_cache_nodes is not None and (now - _graph_cache_time) < _GRAPH_CACHE_TTL:
+        if (
+            _graph_cache_nodes is not None
+            and _graph_cache_level == level
+            and (now - _graph_cache_time) < _GRAPH_CACHE_TTL
+        ):
             return _graph_cache_nodes, _graph_cache_edges
 
     if col is None:
@@ -186,6 +194,7 @@ def build_graph(col=None, config=None):
             _graph_cache_nodes = nodes
             _graph_cache_edges = edges
             _graph_cache_time = time.time()
+            _graph_cache_level = level
 
     return nodes, edges
 
@@ -612,7 +621,7 @@ def create_tunnel(
     return tunnel
 
 
-def list_tunnels(wing: str = None):
+def list_tunnels(wing: str = None, col=None):
     """List all explicit tunnels, optionally filtered by wing.
 
     Returns tunnels where ``wing`` appears as either source or target
@@ -633,7 +642,33 @@ def list_tunnels(wing: str = None):
             if _normalize_wing((t.get("source") or {}).get("wing")) == norm_wing
             or _normalize_wing((t.get("target") or {}).get("wing")) == norm_wing
         ]
-    return tunnels
+    return _drop_hidden_tunnels(tunnels, col)
+
+
+def _drop_hidden_tunnels(tunnels, col=None):
+    """Hide tunnels that touch a wing the caller cannot see (access levels).
+
+    Fails closed: if the palace cannot be read to tell which wings are
+    visible, no tunnel is shown.
+    """
+    if not tunnels or not _levels.filter_needed():
+        return tunnels
+    try:
+        col = col or _get_collection()
+        if col is None:
+            return []
+        hidden = {_normalize_wing(w) for w in _levels.hidden_wings(col)}
+    except Exception:
+        logger.warning("level filter could not read the palace; hiding all tunnels")
+        return []
+    if not hidden:
+        return tunnels
+    return [
+        t
+        for t in tunnels
+        if _normalize_wing((t.get("source") or {}).get("wing")) not in hidden
+        and _normalize_wing((t.get("target") or {}).get("wing")) not in hidden
+    ]
 
 
 def delete_tunnel(tunnel_id: str):
@@ -657,7 +692,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
     # mempalace.yaml slug (underscore) and an explicit ``--wing`` slug
     # (verbatim) both resolve through the same comparison.
     norm_wing = _normalize_wing(wing) or wing
-    tunnels = _load_tunnels()
+    tunnels = _drop_hidden_tunnels(_load_tunnels(), col)
     connections = []
 
     for t in tunnels:

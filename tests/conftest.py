@@ -211,6 +211,10 @@ _AMBIENT_VARS_TO_SCRUB = (
     "MEMPALACE_RERANK_BLEND",
     "MEMPALACE_ARCHIVE_WINGS",
     "MEMPALACE_ARCHIVE_RANK_PENALTY",
+    # Access levels (mempalace/levels.py): a session pinned to a level must not
+    # turn the filter on for the whole suite.
+    "MEMPALACE_LEVEL",
+    "MEMPALACE_LEVELS_FILE",
 )
 
 

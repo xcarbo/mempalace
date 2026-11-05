@@ -1206,6 +1206,10 @@ def _sqlite_wing_room_counts(
       the ChromaDB path, which surfaces a numeric wing/room natively rather
       than dropping it to ``"?"``.
     """
+    from ..levels import filter_needed
+
+    if filter_needed():
+        return None  # callers fall back to the filtered collection path
     db_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return None

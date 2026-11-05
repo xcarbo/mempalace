@@ -161,6 +161,7 @@ uv run pytest tests/test_fork_deltas.py -v
 | re-file `unchanged` (`write_file_drawers`, `FiledDrawers`) | judged on the stored text and `chunk_total` | judged on nothing having been embedded | Every row older than the stamp is embedded once, so the first re-mine of an unchanged file would drop its closets, LLM-generated ones included. And the retry of a killed re-file finds the new text already stored, so it would keep the old file's closets |
 | collision scan (`collision_scan.assert_no_collisions`) | a stored row is compared on `source_file` only | `_same_owner` also compares `wing` and `extract_mode` | Moves keep the drawer id, and the old row is still stored at write time. The next mine of a moved drawer's file raises `CollisionError`, which ends the mine for every later file, every run |
 | dedup gate under write-first (`convo_miner._existing_content_hashes`) | a file's own rows are excluded, and that is load-bearing | no such gate | Old rows are still stored when the gate runs. Matching them skips an unchanged chunk, then the prune removes the only copy |
+| access levels (`levels.py`; `palace.get_collection`, `mcp_server._get_collection`, `service.execute_job`) | collections wrapped in the level filter when a levels file or `MEMPALACE_LEVEL` is set; daemon jobs run at the submitter's level | no levels | A merge that takes either opener whole drops the filter for every caller, and only a palace with a levels file (fcore) would ever notice |
 
 Two rules:
 

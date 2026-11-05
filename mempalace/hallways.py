@@ -378,9 +378,27 @@ def compute_hallways_for_wing(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def list_hallways(wing: Optional[str] = None, config=None) -> list[dict]:
-    """List hallway records. Filter by ``wing`` if specified."""
+def list_hallways(wing: Optional[str] = None, config=None, col=None) -> list[dict]:
+    """List hallway records. Filter by ``wing`` if specified.
+
+    With access levels on, hallways of a wing the caller cannot see are
+    hidden; if the palace cannot be read to tell, none are shown.
+    """
     all_hallways = _load_hallways(config)
+    from . import levels as _levels
+
+    if _levels.filter_needed():
+        try:
+            if col is None and config is not None:
+                from .palace import get_collection_read_only
+
+                col = get_collection_read_only(
+                    config.palace_path, collection_name=config.collection_name
+                )
+            hidden = _levels.hidden_wings(col)
+        except Exception:
+            return []
+        all_hallways = [h for h in all_hallways if h.get("wing") not in hidden]
     if wing is None:
         return list(all_hallways)
     return [h for h in all_hallways if h.get("wing") == wing]

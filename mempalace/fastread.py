@@ -177,6 +177,10 @@ def get_drawer(palace_path: str, collection_name: str, drawer_id: str) -> Option
     function cannot tell those two cases apart and must never be the thing that
     reports a drawer lost.
     """
+    from . import levels as _levels
+
+    if _levels.filter_needed():
+        return None  # the collection path applies the access filter
     db_path = os.path.join(palace_path, "chroma.sqlite3")
     conn = _connect(db_path)
     if conn is None:
@@ -253,6 +257,10 @@ def get_rows(
     if (row_id is None) == (parent_id is None):
         raise ValueError("pass exactly one of row_id or parent_id")
 
+    from . import levels as _levels
+
+    if _levels.filter_needed():
+        return None  # the collection path applies the access filter
     db_path = os.path.join(palace_path, "chroma.sqlite3")
     conn = _connect(db_path)
     if conn is None:

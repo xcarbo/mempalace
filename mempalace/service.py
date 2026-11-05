@@ -154,8 +154,13 @@ def execute_job(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     # them after the job so one job's _apply_backend / palace_path injection
     # can't leak into the next job in the same long-lived process.
     saved_env = {key: os.environ.get(key) for key in _PER_JOB_ENV}
+    from .levels import caller_level, job_level
+
     try:
-        result, stdout, stderr = _capture(_run)
+        # Access levels: the job reads and stamps at its submitter's level,
+        # not the daemon's own (mempalace/levels.py).
+        with caller_level(job_level(payload)):
+            result, stdout, stderr = _capture(_run)
     finally:
         for key, value in saved_env.items():
             if value is None:

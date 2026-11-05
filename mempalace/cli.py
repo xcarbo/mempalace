@@ -1317,6 +1317,9 @@ def cmd_submit(args):
         sys.exit(2)
     palace = canonical_palace_path(args.palace or MempalaceConfig().palace_path)
     payload["palace_path"] = palace
+    from .levels import attach_level
+
+    attach_level(payload)  # the daemon files the batch at this session's level
     # The same batch sent twice while it waits is queued once.
     digest = hashlib.sha256(
         json.dumps({k: payload.get(k) for k in ("wing", "steps")}, sort_keys=True).encode()
@@ -2849,6 +2852,36 @@ def _reconfigure_stdio_utf8_on_windows():
     reconfigure_stdio_utf8_on_windows(stdout_errors="replace", stderr_errors="replace")
 
 
+# Admin commands read or rewrite the palace below the access filter (raw
+# SQLite, whole-palace rebuilds, replication). With levels on they need an
+# owners-level session; with levels off this is a no-op.
+_OWNERS_ONLY_COMMANDS = frozenset(
+    {"repair", "repair-status", "migrate", "migrate-wings", "palace", "backfill-levels"}
+)
+
+
+def _require_owners_level(command: str) -> None:
+    from .levels import LevelDenied, LevelError, require_owners
+
+    try:
+        require_owners(f"`{command}`")
+    except (LevelDenied, LevelError) as exc:
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(3)
+
+
+def _cmd_level(args):
+    from .levels_cli import cmd_level
+
+    cmd_level(args)
+
+
+def _cmd_backfill_levels(args):
+    from .levels_cli import cmd_backfill_levels
+
+    cmd_backfill_levels(args)
+
+
 def _dispatch_two_level(args, handlers) -> bool:
     """Dispatch the ``<command> <action>`` subcommands. True when handled.
 
@@ -3716,6 +3749,11 @@ def main():
         help="Storage backend (default: config/env/detected/chroma)",
     )
 
+    # --- access levels (fork): memp level show|set, memp backfill-levels -----
+    from .levels_cli import register as _register_levels
+
+    p_level = _register_levels(sub)
+
     # --- memp api surface (lazy) -------------------------------------------
     # Importing mcp_server (chromadb) costs ~0.36s; core commands must stay
     # ~0.03s (incl. `mempalace hook run`, <500ms budget). Only register the
@@ -3795,9 +3833,13 @@ def main():
             "logstream": (p_logstream, cmd_logstream),
             "artifact": (p_artifact, cmd_artifact),
             "daemon": (p_daemon, cmd_daemon),
+            "level": (p_level, _cmd_level),
         },
     ):
         return
+
+    if args.command in _OWNERS_ONLY_COMMANDS:
+        _require_owners_level(args.command)
 
     if args.command == "instructions":
         name = getattr(args, "instructions_name", None)
@@ -3845,6 +3887,7 @@ def main():
         "status": cmd_status,
         "submit": cmd_submit,
         "job": cmd_job,
+        "backfill-levels": _cmd_backfill_levels,
     }
     dispatch[args.command](args)
 

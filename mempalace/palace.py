@@ -28,6 +28,7 @@ from .backends import (
     resolve_backend_for_palace,
 )
 from .backends.embedding_wrapper import EmbeddingCollection
+from .levels import levels_active, wrap_collection
 from .collision_scan import CollisionError, assert_no_collisions, assert_no_duplicate_ids
 from .entity_detector import (
     _apply_known_systems_prepass,
@@ -381,6 +382,11 @@ def get_collection(
         collection = EmbeddingCollection(collection)
     if not _skip_identity_check:
         _enforce_embedder_identity(collection, palace_path, collection_name, create=create)
+    # Access levels: every read through this collection hides what the
+    # caller's level may not see, and every write stamps that level. A pass-
+    # through when no levels are configured (see mempalace/levels.py).
+    if levels_active():
+        return wrap_collection(collection)
     return collection
 
 
