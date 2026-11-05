@@ -1759,9 +1759,8 @@ def _ingest_level(transcript_path: str, payload_cwd: Optional[str] = None) -> Op
         return None
     folders: list[str] = []
     if transcript_path:
-        for cwd in _jsonl_cwds(transcript_path):
-            folders.append(cwd)
-            break
+        # Every folder the session worked in, not only where it started.
+        folders.extend(sorted(levels.transcript_cwds(transcript_path)))
         match = re.search(
             r"/sessions/(%2F[^/]+)/[^/]+/[^/]+\.jsonl$", transcript_path.replace("\\", "/")
         )

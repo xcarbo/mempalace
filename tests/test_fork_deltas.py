@@ -857,7 +857,7 @@ def test_collection_openers_wrap_in_the_level_filter(tmp_path, monkeypatch):
     level it was submitted with."""
     import json as _json
 
-    from mempalace import levels, mcp_server, palace, service
+    from mempalace import mcp_server, palace, service
 
     levels_file = tmp_path / "levels.json"
     levels_file.write_text(_json.dumps({"default": "team", "owners_folders": []}))
@@ -870,6 +870,6 @@ def test_collection_openers_wrap_in_the_level_filter(tmp_path, monkeypatch):
     assert "wrap_collection" in inspect.getsource(mcp_server._get_collection), (
         "FORK DELTA REVERTED: mcp_server._get_collection no longer wraps in the level filter"
     )
-    assert "caller_level(job_level(payload))" in inspect.getsource(service.execute_job), (
+    assert "stamp=job_level(payload)" in inspect.getsource(service.execute_job), (
         "FORK DELTA REVERTED: daemon jobs no longer run at their submitter's level"
     )

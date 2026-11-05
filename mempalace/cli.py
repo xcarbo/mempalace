@@ -597,7 +597,12 @@ _HUB_MINE_TIMEOUT_S = 3600.0
 
 
 def _hub_forward_disabled() -> bool:
-    return os.environ.get(_HUB_FORWARD_ENV, "").strip().lower() in {"0", "false", "no", "off"}
+    if os.environ.get(_HUB_FORWARD_ENV, "").strip().lower() in {"0", "false", "no", "off"}:
+        return True
+    # Access levels: a hub would mine at its own level, not this session's.
+    from .levels import levels_active
+
+    return levels_active()
 
 
 def _mine_args_forwardable(args, include_ignored) -> bool:

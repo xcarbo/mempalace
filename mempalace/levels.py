@@ -182,6 +182,16 @@ def load_levels_config() -> Optional[LevelsConfig]:
     try:
         st = path.stat()
     except FileNotFoundError:
+        if path.is_symlink():
+            # A link into a moved or re-cloned checkout: levels were meant to
+            # be on. Fail private (every folder owners), never silently off.
+            broken = LevelsConfig(OWNERS, [], broken=f"{path} is a broken symlink")
+            if _config_cache.get("broken_link") != str(path):
+                logger.warning(
+                    "levels file %s is a broken symlink: every folder reads as owners", path
+                )
+                _config_cache["broken_link"] = str(path)
+            return broken
         return None
     except OSError as exc:
         return LevelsConfig(OWNERS, [], broken=f"cannot stat {path}: {exc}")
@@ -298,14 +308,37 @@ def _herdr_spawn_repo(path: str) -> Optional[str]:
     return None
 
 
+_folder_cache: dict = {}
+_FOLDER_CACHE_MAX = 1024
+_FOLDER_CACHE_TTL = 5.0  # seconds: a new worktree or meta.json is seen within this
+
+
 def folder_level(path: Optional[str], config: Optional[LevelsConfig] = None) -> int:
+    """Level of a folder (cached a few seconds per path; see :func:`_folder_level`)."""
+    config = config if config is not None else load_levels_config()
+    if config is None or not path:
+        return _folder_level(path, config)
+    import time as _time
+
+    now = _time.monotonic()
+    key = (path, id(config))
+    hit = _folder_cache.get(key)
+    if hit is not None and now - hit[1] < _FOLDER_CACHE_TTL:
+        return hit[0]
+    level = _folder_level(path, config)
+    if len(_folder_cache) >= _FOLDER_CACHE_MAX:
+        _folder_cache.clear()
+    _folder_cache[key] = (level, now)
+    return level
+
+
+def _folder_level(path: Optional[str], config: Optional[LevelsConfig]) -> int:
     """Level of a folder: owners if it (or its main repo) is in an owners folder.
 
     Every form of the path is checked: as given, its main worktree root and its
     herdr-spawn ``repo``. The most private answer wins, so a worktree of an
     owners repo can never stamp team.
     """
-    config = config if config is not None else load_levels_config()
     if config is None:
         return MISSING_ACCESS_LEVEL
     if not path:
@@ -322,11 +355,101 @@ def folder_level(path: Optional[str], config: Optional[LevelsConfig] = None) -> 
 
 
 # ---------------------------------------------------------------------------
+# Level of a stored source_file (transcripts, Grok sessions, project files)
+# ---------------------------------------------------------------------------
+
+_CLAUDE_PROJECTS_RE = re.compile(r"/\.claude/projects/([^/]+)/")
+_GROK_SESSION_RE = re.compile(r"/sessions/(%2F[^/]+)/")
+_CWD_BYTES_RE = re.compile(rb'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_source_cache: dict = {}
+_SOURCE_CACHE_MAX = 4096
+
+
+def _claude_encode(path: str) -> str:
+    """Claude Code's project-folder name for a cwd: every / and . becomes -."""
+    return re.sub(r"[/.]", "-", path)
+
+
+def transcript_cwds(path: str) -> set[str]:
+    """Every ``cwd`` a JSONL transcript records, the whole file (not just the first).
+
+    A session that started in a team folder and then worked inside an owners
+    folder is owners. One regex pass over the bytes: ~20 ms for a 20 MB file.
+    """
+    try:
+        data = Path(os.path.expanduser(path)).read_bytes()
+    except OSError:
+        return set()
+    out: set[str] = set()
+    for raw in set(_CWD_BYTES_RE.findall(data)):
+        try:
+            value = json.loads(b'"' + raw + b'"')
+        except ValueError:
+            continue
+        if isinstance(value, str) and value:
+            out.add(value)
+    return out
+
+
+def source_level(source: str, config: Optional[LevelsConfig] = None) -> int:
+    """Level of the folder a stored ``source_file`` came from.
+
+    A Claude transcript counts every cwd it records (when the file is still on
+    disk) and its project-folder name: equal to an owners folder's encoding,
+    or starting with it and a dash (a subfolder or worktree, and also a
+    sibling folder whose name only extends it: counted owners, fail private).
+    A Grok session is named after its folder. An absolute path is its own
+    folder. Anything else (a label such as ``preclean-...``) is the default.
+    """
+    config = config if config is not None else load_levels_config()
+    if config is None:
+        return MISSING_ACCESS_LEVEL
+    if not source:
+        return config.default
+    norm = source.replace("\\", "/")
+    try:
+        st = os.stat(norm)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    key = (norm, stamp, id(config))
+    if key in _source_cache:
+        return _source_cache[key]
+    match = _CLAUDE_PROJECTS_RE.search(norm)
+    if match:
+        level = config.default
+        if stamp is not None:
+            for cwd in transcript_cwds(norm):
+                level = min(level, folder_level(cwd, config))
+        encoded = match.group(1)
+        for folder in config.owners_folders:
+            enc = _claude_encode(folder)
+            if encoded == enc or encoded.startswith(enc + "-"):
+                level = min(level, OWNERS)
+                break
+    else:
+        grok = _GROK_SESSION_RE.search(norm)
+        if grok:
+            from urllib.parse import unquote
+
+            level = folder_level(unquote(grok.group(1)), config)
+        elif os.path.isabs(norm):
+            level = folder_level(norm, config)
+        else:
+            level = config.default
+    if len(_source_cache) >= _SOURCE_CACHE_MAX:
+        _source_cache.clear()
+    _source_cache[key] = level
+    return level
+
+
+# ---------------------------------------------------------------------------
 # Caller level
 # ---------------------------------------------------------------------------
 
-# Per-job override (daemon jobs, the HTTP MCP per request). Unset = the process level.
-_LEVEL_OVERRIDE: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+# Per-job override (daemon jobs, the HTTP MCP per request): (read, stamp).
+# Unset = the process level.
+_LEVEL_OVERRIDE: contextvars.ContextVar[Optional[tuple[int, int]]] = contextvars.ContextVar(
     "mempalace_level_override", default=None
 )
 
@@ -351,10 +474,11 @@ def levels_active() -> bool:
 
 
 def resolve_level(cwd: Optional[str] = None, env: Optional[str] = None) -> int:
-    """Level for a session in ``cwd`` with ``MEMPALACE_LEVEL`` = ``env``.
+    """The session level to pin for ``cwd`` with ``MEMPALACE_LEVEL`` = ``env``.
 
     The more private of the two wins. ``env`` of ``None`` reads the process
-    environment; pass ``""`` for "no inherited level".
+    environment; pass ``""`` for "no inherited level". This is also the level
+    a process stamps on its writes (:func:`stamp_level`).
     """
     if env is None:
         inherited = env_level()
@@ -374,22 +498,49 @@ def _safe_cwd() -> str:
 
 
 def current_level() -> int:
-    """The caller's level: the per-job override if one is set, else the process's."""
+    """The level the caller READS at.
+
+    The per-job override if one is set. Else a pinned ``MEMPALACE_LEVEL`` is
+    authoritative: a session pinned to team that runs ``memp`` from inside an
+    owners folder still reads team, so it cannot carry owners drawers back
+    into its own team writes. With no pin, the cwd's folder level.
+    """
     override = _LEVEL_OVERRIDE.get()
     if override is not None:
-        return override
+        return override[0]
+    if not levels_active():
+        return MISSING_ACCESS_LEVEL
+    pinned = env_level()
+    if pinned is not None:
+        return pinned
+    return folder_level(_safe_cwd())
+
+
+def stamp_level() -> int:
+    """The level the caller STAMPS on writes: the more private of the pin and
+    the cwd's folder, so words written from an owners folder stay owners."""
+    override = _LEVEL_OVERRIDE.get()
+    if override is not None:
+        return override[1]
     if not levels_active():
         return MISSING_ACCESS_LEVEL
     return resolve_level()
 
 
 @contextlib.contextmanager
-def caller_level(level: Optional[int]):
-    """Run a block at ``level`` (a daemon job, one HTTP request). ``None`` = no change."""
+def caller_level(level: Optional[int], stamp: Optional[int] = None):
+    """Run a block at ``level`` (a daemon job, one HTTP request). ``None`` = no change.
+
+    ``stamp`` is the level writes in the block carry; it defaults to ``level``
+    and can only be more private. A per-request door (the team MCP) wraps each request
+    in this with the caller's level.
+    """
     if level is None:
         yield
         return
-    token = _LEVEL_OVERRIDE.set(parse_level(level))
+    read = parse_level(level)
+    write = read if stamp is None else min(read, parse_level(stamp))
+    token = _LEVEL_OVERRIDE.set((read, write))
     try:
         yield
     finally:
@@ -397,36 +548,45 @@ def caller_level(level: Optional[int]):
 
 
 def submit_level() -> Optional[int]:
-    """The level a queued write carries, or ``None`` when levels are off here."""
+    """The level a queued write stamps, or ``None`` when levels are off here."""
     if not levels_active():
         return None
-    return current_level()
+    return stamp_level()
 
 
 JOB_LEVEL_KEY = "access_level"
+JOB_READ_LEVEL_KEY = "access_read_level"
 
 
 def attach_level(payload: dict) -> dict:
-    """Put the submitter's level on a queued job (the daemon runs it at that level).
+    """Put the submitter's levels on a queued job (the daemon runs it at them).
 
-    A level already on the payload can only be made more private, never more
-    open. Levels off here: the payload is left as it is.
+    A level already on the payload can only be made more private (stamp) or
+    narrower (read), never opened. Levels off here: the payload is left as is.
     """
     own = submit_level()
     if own is None:
         return payload
+    read = current_level()
     given = payload.get(JOB_LEVEL_KEY)
     if given is not None:
         try:
             own = min(own, parse_level(given))
         except LevelError:
             pass
+    given_read = payload.get(JOB_READ_LEVEL_KEY)
+    if given_read is not None:
+        try:
+            read = max(read, parse_level(given_read))
+        except LevelError:
+            pass
     payload[JOB_LEVEL_KEY] = own
+    payload[JOB_READ_LEVEL_KEY] = read
     return payload
 
 
 def job_level(payload: dict) -> Optional[int]:
-    """The level a daemon job runs at. A job with no level runs as owners when
+    """The level a daemon job stamps at. A job with no level runs as owners when
     levels are on: what it reads it also stamps owners, so nothing leaks."""
     given = payload.get(JOB_LEVEL_KEY) if isinstance(payload, dict) else None
     if given is not None:
@@ -437,6 +597,25 @@ def job_level(payload: dict) -> Optional[int]:
     if levels_active():
         return LOWEST_LEVEL
     return None
+
+
+def job_read_level(payload: dict) -> Optional[int]:
+    """The level a daemon job reads at: its submitter's read level.
+
+    A job without one (an old client, a direct POST to /jobs) reads at team or
+    narrower: it stamps owners, but it must not see, update or delete owners
+    drawers on behalf of a submitter nobody vouched for.
+    """
+    stamp = job_level(payload)
+    if stamp is None:
+        return None
+    given = payload.get(JOB_READ_LEVEL_KEY) if isinstance(payload, dict) else None
+    if given is None:
+        return max(stamp, MISSING_ACCESS_LEVEL)
+    try:
+        return max(stamp, parse_level(given))
+    except LevelError:
+        return max(stamp, MISSING_ACCESS_LEVEL)
 
 
 def filter_needed(level: Optional[int] = None) -> bool:
@@ -460,19 +639,24 @@ def require_owners(what: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def access_where(level: Optional[int] = None) -> Optional[dict]:
+def access_where(level: Optional[int] = None, *, chroma: bool = False) -> Optional[dict]:
     """The metadata filter that keeps only drawers ``level`` may read, or None.
 
-    For team (and below) a missing ``access`` must stay visible, so the clause
-    excludes the more private levels rather than requiring ``access >= N``
-    (``$gte`` would drop every unstamped drawer). Above team, missing reads as
-    team and so is itself hidden, and ``$gte`` is exact.
+    For team (and below) a missing ``access`` must stay visible: the clause is
+    "an integer >= level, or no access at all", so a stamp that is not an
+    integer (a string written past the wrapper) is hidden, as
+    :func:`stored_access` reads it. Chroma cannot match a missing key, so there
+    the clause excludes the more private integers instead (a non-integer stamp
+    then stays visible; no fleet palace runs chroma). Above team, missing reads
+    as team and so is itself hidden, and ``$gte`` is exact.
     """
     level = current_level() if level is None else level
     if not filter_needed(level):
         return None
     if level <= MISSING_ACCESS_LEVEL:
-        return {ACCESS_KEY: {"$nin": list(range(0, level))}}
+        if chroma:
+            return {ACCESS_KEY: {"$nin": list(range(0, level))}}
+        return {"$or": [{ACCESS_KEY: {"$gte": level}}, {ACCESS_KEY: {"$eq": None}}]}
     return {ACCESS_KEY: {"$gte": level}}
 
 
@@ -494,7 +678,7 @@ def visible(meta: Optional[dict], level: Optional[int] = None) -> bool:
 
 def stamp_value(given: Any = None, level: Optional[int] = None) -> int:
     """The ``access`` a write stores: the writer's level, or a more private given one."""
-    level = current_level() if level is None else level
+    level = stamp_level() if level is None else level
     if given is None:
         return level
     try:
@@ -532,6 +716,10 @@ class LevelFilteredCollection:
 
     def __init__(self, inner):
         self._inner = inner
+        self._chroma = _is_chroma(inner)
+
+    def _where(self) -> Optional[dict]:
+        return access_where(chroma=self._chroma)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -574,36 +762,36 @@ class LevelFilteredCollection:
     # --- reads -----------------------------------------------------------------
 
     def query(self, **kwargs):
-        clause = access_where()
+        clause = self._where()
         if clause:
             kwargs["where"] = and_where(kwargs.get("where"), clause)
         return self._inner.query(**kwargs)
 
     def get(self, **kwargs):
-        clause = access_where()
+        clause = self._where()
         if clause:
             kwargs["where"] = and_where(kwargs.get("where"), clause)
         return self._inner.get(**kwargs)
 
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         return self._inner.lexical_search(
-            query=query, n_results=n_results, where=and_where(where, access_where())
+            query=query, n_results=n_results, where=and_where(where, self._where())
         )
 
     def facet_counts(self, field: str, where: Optional[dict] = None, limit: int = 1000):
-        return self._inner.facet_counts(field, where=and_where(where, access_where()), limit=limit)
+        return self._inner.facet_counts(field, where=and_where(where, self._where()), limit=limit)
 
     def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
-        return self._inner.get_all_metadata(where=and_where(where, access_where()))
+        return self._inner.get_all_metadata(where=and_where(where, self._where()))
 
     def count(self) -> int:
-        clause = access_where()
+        clause = self._where()
         if not clause:
             return self._inner.count()
         return self._visible_count(clause)
 
     def estimated_count(self) -> int:
-        clause = access_where()
+        clause = self._where()
         if not clause:
             return self._inner.estimated_count()
         return self._visible_count(clause)
@@ -631,8 +819,27 @@ class LevelFilteredCollection:
 
     def _plan_writes(self, ids, metadatas, *, content_changes: bool):
         """Return (keep_index_list, new_metadatas) for a write at the caller's level."""
-        level = current_level()
+        level = current_level()  # what the writer can see
+        stamp = stamp_level()  # what it stamps
         existing = self._existing_meta(ids)
+        config = load_levels_config()
+        source_override: dict[str, Optional[int]] = {}
+
+        def row_stamp(meta: dict) -> int:
+            # The folder the words came from counts too: a team-folder mine of
+            # ~/code/llcsetup still stamps owners. And a source a `level set`
+            # made more private keeps that for its new chunks and closets.
+            out = stamp
+            source = meta.get("source_file") or meta.get("source_path")
+            if isinstance(source, str) and source:
+                if config is not None:
+                    out = min(out, source_level(source, config))
+                if source not in source_override:
+                    source_override[source] = self._override_level(source)
+                if source_override[source] is not None:
+                    out = min(out, source_override[source])
+            return out
+
         keep: list[int] = []
         new_metas: list[dict] = []
         skipped = 0
@@ -647,7 +854,7 @@ class LevelFilteredCollection:
                 # writer explicitly asks for something more private.
                 access = stored_access(old)
                 if ACCESS_KEY in given:
-                    access = min(access, stamp_value(given[ACCESS_KEY], level))
+                    access = min(access, stamp_value(given[ACCESS_KEY], stamp))
                 given[ACCESS_KEY] = access
                 given[ACCESS_SRC_KEY] = OVERRIDE_SRC
             elif old is not None and not content_changes:
@@ -655,15 +862,29 @@ class LevelFilteredCollection:
                 # (only ever made more private by an explicit value).
                 access = stored_access(old)
                 if ACCESS_KEY in given:
-                    access = min(access, stamp_value(given[ACCESS_KEY], level))
+                    access = min(access, stamp_value(given[ACCESS_KEY], stamp))
                 given[ACCESS_KEY] = access
             else:
-                given[ACCESS_KEY] = stamp_value(given.get(ACCESS_KEY), level)
+                given[ACCESS_KEY] = stamp_value(given.get(ACCESS_KEY), row_stamp(given))
             keep.append(idx)
             new_metas.append(given)
         if skipped:
             logger.info("levels: skipped %d write(s) to drawers hidden at level %s", skipped, level)
         return keep, new_metas
+
+    def _override_level(self, source: str) -> Optional[int]:
+        """Most private ``level set`` override among a source's stored rows, or None."""
+        try:
+            got = self._inner.get(
+                where={"$and": [{"source_file": source}, {ACCESS_SRC_KEY: OVERRIDE_SRC}]},
+                include=["metadatas"],
+            )
+        except Exception:
+            return None
+        metas = got.get("metadatas") or []
+        if not metas:
+            return None
+        return min(stored_access(m) for m in metas)
 
     @staticmethod
     def _pick(values, keep):
@@ -719,7 +940,7 @@ class LevelFilteredCollection:
         )
 
     def delete(self, *, ids=None, where=None):
-        clause = access_where()
+        clause = self._where()
         if not clause:
             return self._inner.delete(ids=ids, where=where)
         if ids is not None:
@@ -747,6 +968,17 @@ class LevelFilteredCollection:
             metadatas=[{ACCESS_KEY: level, ACCESS_SRC_KEY: OVERRIDE_SRC}] * len(visible_ids),
         )
         return len(visible_ids)
+
+
+def _is_chroma(collection) -> bool:
+    """True when a (possibly wrapped) collection is ChromaDB-backed."""
+    seen = 0
+    while collection is not None and seen < 8:
+        if "chroma" in type(collection).__module__.lower() or "Chroma" in type(collection).__name__:
+            return True
+        collection = collection.__dict__.get("_inner") if hasattr(collection, "__dict__") else None
+        seen += 1
+    return False
 
 
 def wrap_collection(collection):
@@ -895,6 +1127,27 @@ def drawer_access_lookup(ids: list[str], palace_path: Optional[str] = None) -> d
 # ---------------------------------------------------------------------------
 
 
+def _transcript_first_cwd(path: str) -> Optional[str]:
+    """The first ``cwd`` recorded in a JSONL transcript (first 200 lines), or None."""
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= 200:
+                    return None
+                if '"cwd"' not in line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue
+                cwd = data.get("cwd") if isinstance(data, dict) else None
+                if isinstance(cwd, str) and cwd:
+                    return cwd
+    except OSError:
+        return None
+    return None
+
+
 def _main(argv: Optional[list[str]] = None) -> int:
     """Print the level number for a folder (stdlib only, ~30 ms; for hooks).
 
@@ -908,11 +1161,20 @@ def _main(argv: Optional[list[str]] = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_resolve = sub.add_parser("resolve", help="print the session level for a folder")
     p_resolve.add_argument("--cwd", default=None)
+    p_resolve.add_argument(
+        "--transcript",
+        default=None,
+        help="also count the folder a session transcript started in (its first cwd)",
+    )
     args = parser.parse_args(argv)
     try:
         if not levels_active():
             return 0
-        print(resolve_level(args.cwd))
+        level = resolve_level(args.cwd)
+        start = _transcript_first_cwd(args.transcript) if args.transcript else None
+        if start:
+            level = min(level, folder_level(start))
+        print(level)
         return 0
     except LevelError as exc:
         print(f"mempalace.levels: {exc}", file=sys.stderr)

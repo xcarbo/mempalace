@@ -1934,6 +1934,7 @@ _MAX_RESULTS = 100  # upper bound for search/list limit params
 
 
 _metadata_cache_level = None
+_metadata_cache_lock = threading.Lock()
 
 
 def _get_cached_metadata(col, where=None):
@@ -1945,18 +1946,20 @@ def _get_cached_metadata(col, where=None):
     global _metadata_cache, _metadata_cache_time, _metadata_cache_level
     now = time.time()
     level = _levels.current_level() if _levels.levels_active() else None
-    if (
-        where is None
-        and _metadata_cache is not None
-        and _metadata_cache_level == level
-        and (now - _metadata_cache_time) < _METADATA_CACHE_TTL
-    ):
-        return _metadata_cache
+    with _metadata_cache_lock:
+        if (
+            where is None
+            and _metadata_cache is not None
+            and _metadata_cache_level == level
+            and (now - _metadata_cache_time) < _METADATA_CACHE_TTL
+        ):
+            return _metadata_cache
     result = _fetch_all_metadata(col, where=where)
     if where is None:
-        _metadata_cache = result
-        _metadata_cache_time = now
-        _metadata_cache_level = level
+        with _metadata_cache_lock:
+            _metadata_cache = result
+            _metadata_cache_time = now
+            _metadata_cache_level = level
     return result
 
 
@@ -3294,7 +3297,9 @@ def tool_add_drawer(
                 documents=[content],
                 metadatas=[{**base_meta, "chunk_index": 0}],
             )
-            inserted = col.get(ids=[drawer_id], include=[])
+            # Past the level filter: a writer may stamp more privately than it
+            # reads (a team pin writing from an owners folder). Ids only.
+            inserted = _levels.unwrap_collection(col).get(ids=[drawer_id], include=[])
             if not _get_result_ids(inserted):
                 raise RuntimeError(
                     "Drawer write was acknowledged but the new ID is not readable. "
@@ -3349,7 +3354,7 @@ def tool_add_drawer(
         col.upsert(**upsert_kwargs)
         # Probe the LAST chunk id, not the first — its presence confirms
         # the whole batch landed, not just the leading row.
-        inserted = col.get(ids=[chunk_ids[-1]], include=[])
+        inserted = _levels.unwrap_collection(col).get(ids=[chunk_ids[-1]], include=[])
         if not _get_result_ids(inserted):
             raise RuntimeError(
                 "Drawer write was acknowledged but the new ID is not readable. "
@@ -8372,6 +8377,10 @@ def _hub_proxy_target():
     """Return (base_url, headers) for a live hub serving our palace, or None."""
     global _hub_proxy_announced
     if _truthy_env_off(_HUB_FORWARD_ENV):
+        return None
+    if _levels.levels_active():
+        # The hub answers at its own process level and the forwarded request
+        # carries none, so with access levels on every request is served here.
         return None
     try:
         from . import server_registry

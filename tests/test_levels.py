@@ -28,6 +28,15 @@ OWNERS_WORD = "zanzibarquill"
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _fresh_level_caches():
+    levels._folder_cache.clear()
+    levels._source_cache.clear()
+    yield
+    levels._folder_cache.clear()
+    levels._source_cache.clear()
+
+
 @pytest.fixture
 def folders(tmp_path):
     code = tmp_path / "code"
@@ -225,6 +234,7 @@ def test_a_herdr_spawn_worktree_resolves_through_its_meta_repo(tmp_path, levels_
     (run / "meta.json").write_text(json.dumps({"repo": str(folders["owners"])}))
     assert levels.folder_level(str(run / "worktree")) == levels.OWNERS
     (run / "meta.json").write_text(json.dumps({"repo": str(folders["team"])}))
+    levels._folder_cache.clear()
     assert levels.folder_level(str(run / "worktree")) == levels.TEAM
 
 
@@ -364,10 +374,15 @@ def test_team_kg_hides_facts_from_owners_drawers(palace, monkeypatch):
         "Buyout", "governed_by", OWNERS_WORD, source_drawer_id=palace["owners_id"]
     )
     mcp_server.tool_kg_add(f"action:{palace['owners_id']}", "belongs_to", "wing_llcsetup")
-    mcp_server.tool_kg_add("Portal", "built_with", "SvelteKit", source_drawer_id=palace["team_id"])
-    mcp_server.tool_kg_add("Team", "meets_on", "Mondays")
+    # A fact with no drawer behind it, written by an owners session: owners.
+    mcp_server.tool_kg_add("LLC", "banks_with", "Quillbank")
     assert OWNERS_WORD in _dump(mcp_server.tool_kg_query("Buyout"))
     _as_team(monkeypatch, palace)
+    mcp_server.tool_kg_add("Portal", "built_with", "SvelteKit", source_drawer_id=palace["team_id"])
+    mcp_server.tool_kg_add("Team", "meets_on", "Mondays")
+    assert "Quillbank" not in _dump(mcp_server.tool_kg_query("LLC"))
+    stats = _dump(mcp_server.tool_kg_stats())
+    assert "banks_with" not in stats and "governed_by" not in stats and "built_with" in stats
     assert OWNERS_WORD not in _dump(mcp_server.tool_kg_query("Buyout"))
     assert "wing_llcsetup" not in _dump(mcp_server.tool_kg_timeline())
     assert OWNERS_WORD not in _dump(mcp_server.tool_kg_timeline())
@@ -789,3 +804,231 @@ def test_level_set_by_wing_and_room_and_by_ids_file(palace, monkeypatch, capsys,
     # A team re-mine/re-write of an overridden drawer cannot make it team again:
     # it is hidden, so the write is skipped.
     assert "LLC terms" not in _dump(mcp_server.tool_search("LLC terms forgepoint"))
+
+
+# ---------------------------------------------------------------------------
+# review fixes: the pin caps reads; broken link fails private
+# ---------------------------------------------------------------------------
+
+
+def test_a_team_pin_still_reads_team_inside_an_owners_folder(palace, monkeypatch):
+    from mempalace import mcp_server
+
+    monkeypatch.setenv("MEMPALACE_LEVEL", "team")
+    _as_owners(monkeypatch, palace)
+    assert levels.current_level() == levels.TEAM
+    assert levels.stamp_level() == levels.OWNERS
+    assert "member buyouts" not in _dump(mcp_server.tool_search(OWNERS_WORD))
+    assert "llcsetup" not in _dump(mcp_server.tool_list_wings())
+    # What it writes from the owners folder is still stamped owners.
+    r = mcp_server.tool_add_drawer(wing="w", room="r", content="written from inside llcsetup")
+    assert r.get("success"), r
+    assert _raw_meta(palace["palace_path"], r["drawer_id"])["access"] == levels.OWNERS
+
+
+def test_a_job_keeps_its_submitters_read_cap(palace, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_LEVEL", "team")
+    _as_owners(monkeypatch, palace)
+    payload = levels.attach_level({})
+    assert payload["access_level"] == levels.OWNERS
+    assert payload["access_read_level"] == levels.TEAM
+    assert levels.job_read_level(payload) == levels.TEAM
+    with levels.caller_level(levels.job_read_level(payload), stamp=levels.job_level(payload)):
+        assert levels.current_level() == levels.TEAM and levels.stamp_level() == levels.OWNERS
+
+
+def test_a_broken_levels_symlink_fails_private(tmp_path, monkeypatch, folders):
+    link = tmp_path / "levels.json"
+    link.symlink_to(tmp_path / "moved-away" / "palace-levels.json")
+    monkeypatch.setenv("MEMPALACE_LEVELS_FILE", str(link))
+    monkeypatch.delenv("MEMPALACE_LEVEL", raising=False)
+    assert levels.levels_active()
+    monkeypatch.chdir(folders["team"])
+    assert levels.current_level() == levels.OWNERS  # reads everything...
+    assert levels.stamp_level() == levels.OWNERS  # ...and stamps owners: nothing leaks
+
+
+def test_writes_from_an_owners_folder_under_a_team_pin_succeed(palace, monkeypatch):
+    from mempalace import mcp_server
+
+    monkeypatch.setenv("MEMPALACE_LEVEL", "team")
+    _as_owners(monkeypatch, palace)
+    d = mcp_server.tool_diary_write("claude", "diary from inside llcsetup under a team pin")
+    assert d.get("success"), d
+    u = mcp_server.tool_update_drawer(palace["team_id"], content="rewritten from inside llcsetup")
+    assert u.get("success"), u
+    # The rewrite carries owners words now, so it is owners and gone from team view.
+    assert _raw_meta(palace["palace_path"], palace["team_id"])["access"] == levels.OWNERS
+
+
+# ---------------------------------------------------------------------------
+# review fixes (fork): source folder, transcripts, odd stamps, jobs, tunnels
+# ---------------------------------------------------------------------------
+
+
+def test_mining_an_owners_folder_from_a_team_cwd_stamps_owners(palace, monkeypatch):
+    import yaml
+
+    from mempalace.miner import mine
+    from mempalace.palace import get_closets_collection, get_collection
+
+    project = palace["folders"]["owners"] / "more"
+    project.mkdir()
+    (project / "terms.md").write_text(("# Terms\n\nCapital calls are due in thirty days.\n\n") * 8)
+    with open(project / "mempalace.yaml", "w") as f:
+        yaml.dump({"wing": "llcsetup", "rooms": [{"name": "general", "description": "all"}]}, f)
+    _as_team(monkeypatch, palace)  # a cron job or Gen in a team folder
+    mine(str(project), palace["palace_path"])
+    drawers = levels.unwrap_collection(get_collection(palace["palace_path"], create=False))
+    metas = drawers.get(where={"wing": "llcsetup"}, include=["metadatas"])["metadatas"]
+    mined = [m for m in metas if "terms.md" in str(m.get("source_file"))]
+    assert mined and {m["access"] for m in mined} == {levels.OWNERS}
+    closets = levels.unwrap_collection(get_closets_collection(palace["palace_path"], create=False))
+    cl = closets.get(include=["metadatas"])["metadatas"]
+    assert cl and {m["access"] for m in cl if "terms.md" in str(m.get("source_file"))} == {
+        levels.OWNERS
+    }
+
+
+def test_a_transcript_that_visits_an_owners_folder_is_owners(palace, monkeypatch, tmp_path):
+    from mempalace import hooks_cli
+
+    t = tmp_path / "t.jsonl"
+    lines = [{"type": "user", "cwd": str(palace["folders"]["team"])}] * 300
+    lines.append({"type": "user", "cwd": str(palace["folders"]["owners"])})
+    t.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+    _as_team(monkeypatch, palace)
+    assert hooks_cli._ingest_level(str(t)) == levels.OWNERS
+    enc = str(palace["folders"]["team"]).replace("/", "-").replace(".", "-")
+    proj = tmp_path / ".claude" / "projects" / enc
+    proj.mkdir(parents=True)
+    (proj / "s.jsonl").write_text(t.read_text())
+    assert levels.source_level(str(proj / "s.jsonl")) == levels.OWNERS
+
+
+def test_a_string_stamp_is_hidden_from_team(palace, monkeypatch):
+    from mempalace.palace import get_collection
+
+    raw = levels.unwrap_collection(get_collection(palace["palace_path"], create=False))
+    raw.upsert(
+        ids=["odd1", "odd2"],
+        documents=["odd stamp owners words", "odd stamp string one"],
+        metadatas=[
+            {"wing": "w", "room": "r", "access": "owners"},
+            {"wing": "w", "room": "r", "access": "1"},
+        ],
+    )
+    _as_team(monkeypatch, palace)
+    col = get_collection(palace["palace_path"], create=False)
+    assert not col.get(ids=["odd1", "odd2"], include=[])["ids"]
+    assert "odd stamp" not in _dump(col.get(include=["documents"]))
+
+
+def test_a_job_with_no_level_cannot_touch_owners_drawers(palace, monkeypatch):
+    from mempalace.service import execute_job
+
+    _as_team(monkeypatch, palace)
+    result = execute_job(
+        "mcp_tool",
+        {
+            "name": "mempalace_delete_drawer",
+            "arguments": {"drawer_id": palace["owners_id"]},
+            "palace_path": palace["palace_path"],
+        },
+    )
+    assert not result.get("success", True) or result.get("error"), result
+    assert _raw_meta(palace["palace_path"], palace["owners_id"]) is not None
+    result = execute_job(
+        "mcp_tool",
+        {
+            "name": "mempalace_add_drawer",
+            "arguments": {"wing": "w", "room": "r", "content": "levelless job words"},
+            "palace_path": palace["palace_path"],
+        },
+    )
+    drawer_id = (result.get("result") or result).get("drawer_id")
+    assert _raw_meta(palace["palace_path"], drawer_id)["access"] == levels.OWNERS
+
+
+def test_new_chunks_of_an_overridden_source_keep_the_override(palace, monkeypatch, capsys):
+    from mempalace.palace import get_collection
+
+    _as_team(monkeypatch, palace)
+    src = str(palace["folders"]["team"] / "plan.md")
+    col = get_collection(palace["palace_path"], create=False)
+    col.upsert(
+        ids=["p0"],
+        documents=["plan part zero"],
+        metadatas=[{"wing": "w", "room": "r", "source_file": src}],
+    )
+    assert (
+        _memp(["level", "set", "--source", src, "owners"], monkeypatch, palace["palace_path"]) == 0
+    )
+    capsys.readouterr()
+    # A re-mine by a team process adds chunk 1: it must not come out team.
+    col.upsert(
+        ids=["p1"],
+        documents=["plan part one"],
+        metadatas=[{"wing": "w", "room": "r", "source_file": src}],
+    )
+    assert _raw_meta(palace["palace_path"], "p1")["access"] == levels.OWNERS
+
+
+def test_tunnels_from_hidden_drawers_or_owners_sessions_stay_hidden(palace, monkeypatch):
+    from mempalace import mcp_server
+
+    _as_team(monkeypatch, palace)
+    team_two = mcp_server.tool_add_drawer(
+        wing="forgepoint", room="ops", content="ops runbook for the team"
+    )
+    _as_owners(monkeypatch, palace)
+    mcp_server.tool_add_drawer(
+        wing="forgepoint", room="acquisition", content="buyout of a vendor, owners"
+    )
+    # Same wing as team drawers, but the room holds only owners drawers.
+    mcp_server.tool_create_tunnel(
+        "forgepoint", "acquisition", "forgepoint", "ops", label="owners label A"
+    )
+    _as_team(monkeypatch, palace)
+    mcp_server.tool_create_tunnel(
+        "forgepoint",
+        "ops",
+        "forgepoint",
+        "portal",
+        label="team label B",
+        source_drawer_id=team_two["drawer_id"],
+    )
+    listed = _dump(mcp_server.tool_list_tunnels())
+    assert "owners label A" not in listed and "acquisition" not in listed
+    assert "team label B" in listed
+
+
+def test_hub_forwarding_is_off_with_levels(palace, monkeypatch):
+    from mempalace import cli, mcp_server
+
+    assert cli._hub_forward_disabled()
+    assert mcp_server._hub_proxy_target() is None
+
+
+def test_chroma_raw_bm25_fallback_filters(monkeypatch, palace_path, levels_file, folders):
+    from mempalace.palace import get_collection
+    from mempalace.searcher import _bm25_only_via_sqlite
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "chroma")
+    monkeypatch.chdir(folders["owners"])
+    col = get_collection(palace_path, create=True)
+    col.upsert(
+        ids=["o1"],
+        documents=[f"owners {OWNERS_WORD} words"],
+        metadatas=[{"wing": "llcsetup", "room": "r"}],
+    )
+    monkeypatch.chdir(folders["team"])
+    col.upsert(
+        ids=["t1"],
+        documents=[f"team words near {OWNERS_WORD}x"],
+        metadatas=[{"wing": "forgepoint", "room": "r"}],
+    )
+    out = _bm25_only_via_sqlite(OWNERS_WORD, palace_path, n_results=10)
+    assert "llcsetup" not in _dump(out)
+    monkeypatch.chdir(folders["owners"])
+    assert "llcsetup" in _dump(_bm25_only_via_sqlite(OWNERS_WORD, palace_path, n_results=10))

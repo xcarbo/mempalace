@@ -159,6 +159,9 @@ def select_kg(src_kg, wings, drawer_ids):
     return list(triples.values()), entities
 
 
+_OPTIONAL_KG_COLUMNS = frozenset({"access"})
+
+
 def copy_kg(dest_kg, triples, entities):
     """Insert by column NAME: a positional copy between KGs whose columns were
     added in a different order puts values in the wrong columns."""
@@ -168,12 +171,14 @@ def copy_kg(dest_kg, triples, entities):
     def insert(table, rows):
         cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
         if rows:
-            missing = set(cols) - set(rows[0])
+            # ``access`` (palace access levels) is newer than most source
+            # KGs; a fact copied without one reads as team, like a drawer.
+            missing = set(cols) - set(rows[0]) - _OPTIONAL_KG_COLUMNS
             if missing:
                 sys.exit(f"source {table} lacks columns {sorted(missing)}")
         con.executemany(
             f"INSERT OR IGNORE INTO {table} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
-            [[row[c] for c in cols] for row in rows],
+            [[row[c] if c in row else None for c in cols] for row in rows],
         )
 
     with con:

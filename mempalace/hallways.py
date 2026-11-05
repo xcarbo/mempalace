@@ -282,6 +282,12 @@ def compute_hallways_for_wing(
     # canonicalize the (a, b) vs (b, a) symmetry.
     pair_counts: dict[tuple[str, str], int] = defaultdict(int)
     pair_rooms: dict[tuple[str, str], set[str]] = defaultdict(set)
+    # Access levels: a pair is as private as the most private drawer it was
+    # seen in, so an owners drawer's entity names never reach a team caller.
+    pair_access: dict[tuple[str, str], int] = {}
+    from . import levels as _levels
+
+    levels_on = _levels.levels_active()
 
     for meta in metadatas:
         if not isinstance(meta, dict):
@@ -306,6 +312,9 @@ def compute_hallways_for_wing(
                 continue
             key = tuple(sorted([a, b]))
             pair_counts[key] += 1
+            if levels_on:
+                lvl = _levels.stored_access(meta)
+                pair_access[key] = min(pair_access.get(key, lvl), lvl)
             if room_str:
                 pair_rooms[key].add(room_str)
 
@@ -358,6 +367,8 @@ def compute_hallways_for_wing(
             "created_at": created_at,
             "created_by": "auto",
         }
+        if key in pair_access:
+            record["access_level"] = pair_access[key]
         # Apply preserved dynamics if this entity pair existed in the
         # prior wing snapshot. Then initialize any still-missing fields
         # (the new-pair case + the legacy-record case both land cleanly).
@@ -398,7 +409,18 @@ def list_hallways(wing: Optional[str] = None, config=None, col=None) -> list[dic
             hidden = _levels.hidden_wings(col)
         except Exception:
             return []
-        all_hallways = [h for h in all_hallways if h.get("wing") not in hidden]
+        level = _levels.current_level()
+
+        def _ok(h: dict) -> bool:
+            stamped = h.get("access_level")
+            if stamped is None:
+                return True
+            try:
+                return int(stamped) >= level
+            except (TypeError, ValueError):
+                return False
+
+        all_hallways = [h for h in all_hallways if h.get("wing") not in hidden and _ok(h)]
     if wing is None:
         return list(all_hallways)
     return [h for h in all_hallways if h.get("wing") == wing]

@@ -8,11 +8,9 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from collections import Counter, defaultdict
 from typing import Optional
-from urllib.parse import unquote
 
 from . import levels
 
@@ -154,7 +152,8 @@ def _cmd_show(args):
         _fail(str(exc))
     active = levels.levels_active()
     folder = levels.folder_level(cwd, config) if config is not None else None
-    level = levels.resolve_level(cwd) if active else None
+    stamp = levels.resolve_level(cwd) if active else None
+    level = (env if env is not None else folder) if active else None
     out = {
         "active": active,
         "levels_file": str(path),
@@ -165,6 +164,8 @@ def _cmd_show(args):
         "env_level": levels.level_label(env) if env is not None else None,
         "level": levels.level_label(level) if level is not None else None,
         "level_number": level,
+        "stamp_level": levels.level_label(stamp) if stamp is not None else None,
+        "stamp_level_number": stamp,
     }
     if args.json:
         print(json.dumps(out, indent=2))
@@ -173,7 +174,7 @@ def _cmd_show(args):
         print("levels: off (no levels file, no MEMPALACE_LEVEL): every drawer is readable")
         print(f"  levels file: {path} (absent)")
         return
-    print(f"level: {out['level']} ({level})")
+    print(f"level: {out['level']} ({level}) reads; writes stamp {out['stamp_level']} ({stamp})")
     print(f"  folder {cwd}: {out['folder_level'] or 'n/a (no levels file)'}")
     print(f"  MEMPALACE_LEVEL: {out['env_level'] or 'unset'}")
     print(
@@ -337,75 +338,6 @@ def _restamp_closets(palace: str, sources: set) -> int:
 # backfill-levels
 # ---------------------------------------------------------------------------
 
-_CLAUDE_PROJECTS_RE = re.compile(r"/\.claude/projects/([^/]+)/")
-_GROK_SESSION_RE = re.compile(r"/sessions/(%2F[^/]+)/")
-
-
-def _claude_encode(path: str) -> str:
-    """Claude Code's project-folder name for a cwd: every / and . becomes -."""
-    return re.sub(r"[/.]", "-", path)
-
-
-class _SourceClassifier:
-    """Folder level of a stored ``source_file`` (cached per transcript folder)."""
-
-    def __init__(self, config: levels.LevelsConfig):
-        self.config = config
-        self.encoded_owners = sorted(
-            {_claude_encode(f) for f in config.owners_folders}, key=len, reverse=True
-        )
-        self._cache: dict[str, int] = {}
-
-    def level(self, source: str) -> int:
-        if not source:
-            return self.config.default
-        norm = source.replace("\\", "/")
-        match = _CLAUDE_PROJECTS_RE.search(norm)
-        if match:
-            return self._claude_transcript_level(norm, match.group(1))
-        match = _GROK_SESSION_RE.search(norm)
-        if match:
-            return levels.folder_level(unquote(match.group(1)), self.config)
-        return levels.folder_level(norm, self.config)
-
-    def _claude_transcript_level(self, path: str, encoded: str) -> int:
-        key = f"{encoded}|{path}"
-        if key in self._cache:
-            return self._cache[key]
-        level = self.config.default
-        cwd = _first_cwd(path)
-        if cwd:
-            level = levels.folder_level(cwd, self.config)
-        # The folder name alone: equal to an owners folder, or one that starts
-        # with it and a dash (a subfolder or worktree, and also a sibling
-        # folder whose name only extends it: counted owners, fail private).
-        for enc in self.encoded_owners:
-            if encoded == enc or encoded.startswith(enc + "-"):
-                level = min(level, levels.OWNERS)
-                break
-        self._cache[key] = level
-        return level
-
-
-def _first_cwd(path: str) -> Optional[str]:
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            for i, line in enumerate(fh):
-                if i >= 200:
-                    return None
-                if '"cwd"' not in line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except ValueError:
-                    continue
-                cwd = data.get("cwd") if isinstance(data, dict) else None
-                if isinstance(cwd, str) and cwd:
-                    return cwd
-    except OSError:
-        return None
-    return None
-
 
 def cmd_backfill_levels(args):
     config = levels.load_levels_config()
@@ -426,7 +358,6 @@ def cmd_backfill_levels(args):
             "MEMPALACE_LEVEL=owners",
             code=3,
         )
-    classifier = _SourceClassifier(config)
     owners_wings = set(config.owners_wings)
     palace = _palace_path(args)
     report: dict = {"palace": palace, "dry_run": bool(args.dry_run), "collections": {}}
@@ -447,7 +378,7 @@ def cmd_backfill_levels(args):
             if meta.get(levels.ACCESS_SRC_KEY) == levels.OVERRIDE_SRC:
                 reasons["override kept"] += 1
             else:
-                by_folder = classifier.level(str(meta.get("source_file") or ""))
+                by_folder = levels.source_level(str(meta.get("source_file") or ""), config)
                 by_wing = levels.OWNERS if wing in owners_wings else config.default
                 want = min(by_folder, by_wing)
                 if want < stored:

@@ -587,6 +587,9 @@ def create_tunnel(
         tunnel["source"]["drawer_id"] = source_drawer_id
     if target_drawer_id:
         tunnel["target"]["drawer_id"] = target_drawer_id
+    if _levels.levels_active():
+        # Access level of the session that made it: its label is its words.
+        tunnel[_TUNNEL_LEVEL_KEY] = _levels.stamp_level()
 
     # Serialize the load → mutate → save cycle. Without this, two concurrent
     # create_tunnel calls can both read the same snapshot and the later
@@ -609,6 +612,12 @@ def create_tunnel(
                 # and future schema expansion can't drop a field by accident.
                 _dyn_fields = ("strength", "stability", "last_activated", "access_count")
                 tunnel.update({k: existing[k] for k in _dyn_fields if k in existing})
+                if existing.get(_TUNNEL_LEVEL_KEY) is not None:
+                    # Re-creating never opens a tunnel up.
+                    tunnel[_TUNNEL_LEVEL_KEY] = min(
+                        int(existing[_TUNNEL_LEVEL_KEY]),
+                        int(tunnel.get(_TUNNEL_LEVEL_KEY, existing[_TUNNEL_LEVEL_KEY])),
+                    )
                 initialize_dynamics_fields(tunnel)
                 existing.clear()
                 existing.update(tunnel)
@@ -645,30 +654,58 @@ def list_tunnels(wing: str = None, col=None):
     return _drop_hidden_tunnels(tunnels, col)
 
 
-def _drop_hidden_tunnels(tunnels, col=None):
-    """Hide tunnels that touch a wing the caller cannot see (access levels).
+_TUNNEL_LEVEL_KEY = "access_level"
 
-    Fails closed: if the palace cannot be read to tell which wings are
-    visible, no tunnel is shown.
+
+def _drop_hidden_tunnels(tunnels, col=None):
+    """Hide tunnels the caller may not see (access levels).
+
+    A tunnel is hidden when it was made at a more private level than the
+    caller's, when either end names a drawer the caller cannot see, or when
+    either end's wing/room holds no drawer the caller can see. Fails closed: if
+    the palace cannot be read, no tunnel is shown.
     """
     if not tunnels or not _levels.filter_needed():
         return tunnels
+    level = _levels.current_level()
     try:
         col = col or _get_collection()
         if col is None:
             return []
-        hidden = {_normalize_wing(w) for w in _levels.hidden_wings(col)}
+        filtered = _levels.wrap_collection(col)
+        room_seen: dict = {}
+
+        def end_visible(end: dict) -> bool:
+            drawer_id = end.get("drawer_id")
+            if drawer_id and not filtered.get(ids=[drawer_id], include=[])["ids"]:
+                return False
+            wing, room = end.get("wing"), end.get("room")
+            if not wing or not room or str(room).startswith(TOPIC_ROOM_PREFIX):
+                # Topic tunnels: synthetic rooms; judge by the wing alone.
+                key = (wing, None)
+                where = {"wing": wing}
+            else:
+                key = (wing, room)
+                where = {"$and": [{"wing": wing}, {"room": room}]}
+            if key not in room_seen:
+                room_seen[key] = bool(filtered.get(where=where, limit=1, include=[])["ids"])
+            return room_seen[key]
+
+        out = []
+        for t in tunnels:
+            stamped = t.get(_TUNNEL_LEVEL_KEY)
+            if stamped is not None:
+                try:
+                    if int(stamped) < level:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            if end_visible(t.get("source") or {}) and end_visible(t.get("target") or {}):
+                out.append(t)
+        return out
     except Exception:
         logger.warning("level filter could not read the palace; hiding all tunnels")
         return []
-    if not hidden:
-        return tunnels
-    return [
-        t
-        for t in tunnels
-        if _normalize_wing((t.get("source") or {}).get("wing")) not in hidden
-        and _normalize_wing((t.get("target") or {}).get("wing")) not in hidden
-    ]
 
 
 def delete_tunnel(tunnel_id: str):

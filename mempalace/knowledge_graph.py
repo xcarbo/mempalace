@@ -201,6 +201,10 @@ class KnowledgeGraph:
             conn.execute("ALTER TABLE triples ADD COLUMN source_drawer_id TEXT")
         if "adapter_name" not in existing:
             conn.execute("ALTER TABLE triples ADD COLUMN adapter_name TEXT")
+        if "access" not in existing:
+            # Access level of the session that wrote the fact (levels.py);
+            # NULL = written before levels, read as team.
+            conn.execute("ALTER TABLE triples ADD COLUMN access INTEGER")
 
     def _conn(self):
         if self._connection is None:
@@ -216,10 +220,29 @@ class KnowledgeGraph:
     # ``ids -> {id: level}`` to override the palace lookup (tests, replicas).
     access_resolver = None
 
+    def _stamp_access(self, conn, triple_id: str) -> None:
+        """Stamp a new fact with its writer's level (only when levels are on)."""
+        if not _levels.levels_active():
+            return
+        conn.execute(
+            "UPDATE triples SET access = ? WHERE id = ?", (_levels.stamp_level(), triple_id)
+        )
+
+    @staticmethod
+    def _row_access_ok(row, level: int) -> bool:
+        keys = row.keys()
+        if "access" not in keys or row["access"] is None:
+            return True
+        try:
+            return int(row["access"]) >= level
+        except (TypeError, ValueError):
+            return False
+
     def _visible_fact_rows(self, rows, name_fields):
         if not rows or not _levels.filter_needed():
             return rows
         level = _levels.current_level()
+        rows = [row for row in rows if self._row_access_ok(row, level)]
         refs_per_row = []
         all_refs: set = set()
         for row in rows:
@@ -372,6 +395,7 @@ class KnowledgeGraph:
                         adapter_name,
                     ),
                 )
+                self._stamp_access(conn, triple_id)
                 return triple_id
 
     def invalidate(self, subject: str, predicate: str, obj: str, ended: str = None):
@@ -523,6 +547,7 @@ class KnowledgeGraph:
                         adapter_name,
                     ),
                 )
+                self._stamp_access(conn, triple_id)
                 return triple_id
 
     # ── Query operations ──────────────────────────────────────────────────
@@ -739,6 +764,8 @@ class KnowledgeGraph:
                 )
 
     def stats(self):
+        if _levels.filter_needed():
+            return self._stats_visible()
         with self._lock:
             conn = self._conn()
             entities = conn.execute("SELECT COUNT(*) as cnt FROM entities").fetchone()["cnt"]
@@ -759,6 +786,28 @@ class KnowledgeGraph:
             "current_facts": current,
             "expired_facts": expired,
             "relationship_types": predicates,
+        }
+
+    def _stats_visible(self):
+        """``stats`` over the facts this caller may see (access levels on)."""
+        with self._lock:
+            rows = (
+                self._conn()
+                .execute(
+                    "SELECT t.*, s.name AS sub_name, o.name AS obj_name FROM triples t "
+                    "JOIN entities s ON t.subject = s.id JOIN entities o ON t.object = o.id"
+                )
+                .fetchall()
+            )
+        rows = self._visible_fact_rows(rows, ("sub_name", "obj_name"))
+        current = sum(1 for r in rows if r["valid_to"] is None)
+        entities = {r["subject"] for r in rows} | {r["object"] for r in rows}
+        return {
+            "entities": len(entities),
+            "triples": len(rows),
+            "current_facts": current,
+            "expired_facts": len(rows) - current,
+            "relationship_types": sorted({r["predicate"] for r in rows}),
         }
 
     # ── Seed from known facts ─────────────────────────────────────────────
