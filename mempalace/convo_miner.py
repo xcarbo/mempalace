@@ -999,30 +999,38 @@ def mine_convos(
     MempalaceConfig inside :func:`_mine_convos_impl` so `config.json`
     governs both this path and the project-file miner in `miner.py`.
     """
-    if dry_run:
-        return _mine_convos_impl(
-            convo_dir,
-            palace_path,
-            wing=wing,
-            agent=agent,
-            limit=limit,
-            dry_run=dry_run,
-            extract_mode=extract_mode,
-            include_subagents=include_subagents,
-        )
+    # Here, not at module top, so importing convo_miner doesn't load miner.
+    from .miner import _cleanup_mine_pid_file
 
-    with contextlib.ExitStack() as held:
-        return _mine_convos_impl(
-            convo_dir,
-            palace_path,
-            wing=wing,
-            agent=agent,
-            limit=limit,
-            dry_run=dry_run,
-            extract_mode=extract_mode,
-            include_subagents=include_subagents,
-            take_write_lock=lambda: held.enter_context(mine_palace_lock(palace_path)),
-        )
+    try:
+        if dry_run:
+            return _mine_convos_impl(
+                convo_dir,
+                palace_path,
+                wing=wing,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                extract_mode=extract_mode,
+                include_subagents=include_subagents,
+            )
+
+        with contextlib.ExitStack() as held:
+            return _mine_convos_impl(
+                convo_dir,
+                palace_path,
+                wing=wing,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                extract_mode=extract_mode,
+                include_subagents=include_subagents,
+                take_write_lock=lambda: held.enter_context(mine_palace_lock(palace_path)),
+            )
+    finally:
+        # A hook-spawned mine removes its own PID slot on every exit path, so
+        # the hook never mistakes a dead (or reused) PID for a running mine.
+        _cleanup_mine_pid_file()
 
 
 def _handle_dedup_skips(

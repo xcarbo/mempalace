@@ -1864,36 +1864,42 @@ def mine(
     ``MEMPALACE_MAX_CHUNKS_PER_FILE`` or ``MAX_CHUNKS_PER_FILE``; ``0``
     disables the cap entirely (#1455).
     """
-    if dry_run:
-        return _mine_impl(
-            project_dir,
-            palace_path,
-            wing_override=wing_override,
-            agent=agent,
-            limit=limit,
-            dry_run=dry_run,
-            respect_gitignore=respect_gitignore,
-            include_ignored=include_ignored,
-            files=files,
-            max_chunks_per_file=max_chunks_per_file,
-        )
+    try:
+        if dry_run:
+            return _mine_impl(
+                project_dir,
+                palace_path,
+                wing_override=wing_override,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                respect_gitignore=respect_gitignore,
+                include_ignored=include_ignored,
+                files=files,
+                max_chunks_per_file=max_chunks_per_file,
+            )
 
-    # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
-    # message and exit non-zero. In-process callers (tests, library users) that
-    # expect to coexist with another writer should handle the exception.
-    with mine_palace_lock(palace_path):
-        return _mine_impl(
-            project_dir,
-            palace_path,
-            wing_override=wing_override,
-            agent=agent,
-            limit=limit,
-            dry_run=dry_run,
-            respect_gitignore=respect_gitignore,
-            include_ignored=include_ignored,
-            files=files,
-            max_chunks_per_file=max_chunks_per_file,
-        )
+        # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
+        # message and exit non-zero. In-process callers (tests, library users) that
+        # expect to coexist with another writer should handle the exception.
+        with mine_palace_lock(palace_path):
+            return _mine_impl(
+                project_dir,
+                palace_path,
+                wing_override=wing_override,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                respect_gitignore=respect_gitignore,
+                include_ignored=include_ignored,
+                files=files,
+                max_chunks_per_file=max_chunks_per_file,
+            )
+    finally:
+        # The hook-side PID slot must go on every exit, including a busy
+        # palace: MineAlreadyRunning is raised before _mine_impl (and its own
+        # finally) runs.
+        _cleanup_mine_pid_file()
 
 
 def _mine_impl(
