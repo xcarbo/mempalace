@@ -45,3 +45,7 @@ whats-next*.md
 
 # fleet: the real server list is private (~/.config/mempalace/fleet.servers.json)
 scripts/fleet.servers.json
+
+# orc rules (symlink to claude-mech) and orc briefs, both untracked
+CLAUDE.local.md
+/.briefs/
