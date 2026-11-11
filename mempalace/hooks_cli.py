@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, unquote
 
+from mempalace._proc import safe_child_env
 from mempalace.config import MempalaceConfig
 from mempalace.write_routing import (
     ResolvedWriteRoutingPolicy,
@@ -531,7 +532,10 @@ def _spawn_mine(cmd: list) -> bool:
     if pid_file is None:
         _log(f"Skipping mine: target already running ({' '.join(cmd[-3:])})")
         return False
-    child_env = os.environ.copy()
+    # Not os.environ.copy(): the child runs ``-m mempalace`` in the session's
+    # folder, and without PYTHONSAFEPATH a mempalace checkout there is imported
+    # instead of the installed code.
+    child_env = safe_child_env()
     child_env[_MINE_PID_FILE_ENV] = str(pid_file)
     with open(log_path, "a") as log_f:
         try:
@@ -946,6 +950,7 @@ def _mine_sync():
                     ],
                     stdout=log_f,
                     stderr=log_f,
+                    env=safe_child_env(),
                     timeout=60,
                     # Windows: hide the conhost window this sync mine would
                     # otherwise flash on every fire. Mirrors the async paths

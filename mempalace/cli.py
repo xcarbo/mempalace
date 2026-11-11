@@ -39,6 +39,7 @@ import sys
 import warnings
 from pathlib import Path
 
+from ._proc import safe_child_env
 from .config import MempalaceConfig
 from .version import __version__
 
@@ -2642,7 +2643,7 @@ def cmd_serve(args):
 
     # Build the child environment. Token rides in the env (never argv) so it
     # stays out of the process table.
-    env = dict(os.environ)
+    env = safe_child_env()
     env["MEMPALACE_PALACE_PATH"] = palace_path
     if backend:
         env["MEMPALACE_BACKEND"] = str(backend).strip().lower()

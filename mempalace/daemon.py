@@ -28,6 +28,7 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlparse
 
+from ._proc import safe_child_env
 from .config import MempalaceConfig
 from .palace import resolve_backend_name
 
@@ -1511,7 +1512,7 @@ def start_daemon(
     ]
     if backend:
         cmd.extend(["--backend", backend])
-    env = os.environ.copy()
+    env = safe_child_env()
     if STATE_ROOT_ENV in os.environ:
         env[STATE_ROOT_ENV] = os.environ[STATE_ROOT_ENV]
     kwargs = _detached_kwargs(sd / "daemon.log")
