@@ -61,6 +61,7 @@ from urllib.parse import urlparse  # noqa: E402
 
 from .config import (  # noqa: E402
     MempalaceConfig,
+    sanitize_kg_lookup,
     sanitize_kg_value,
     sanitize_name,
     sanitize_content,
@@ -4290,7 +4291,7 @@ def _update_drawer_locked(drawer_id, content, wing, room, if_unchanged):
 def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
     """Query the knowledge graph for an entity's relationships."""
     try:
-        entity = sanitize_kg_value(entity, "entity")
+        entity = sanitize_kg_lookup(entity, "entity")
         as_of = sanitize_iso_temporal(as_of, "as_of")
     except ValueError as e:
         return {"error": str(e)}
@@ -4370,9 +4371,9 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
     the form ``YYYY-MM-DDTHH:MM:SSZ``.
     """
     try:
-        subject = sanitize_kg_value(subject, "subject")
+        subject = sanitize_kg_lookup(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
-        object = sanitize_kg_value(object, "object")
+        object = sanitize_kg_lookup(object, "object")
         ended = sanitize_iso_temporal(ended, "ended")
     except ValueError as e:
         return {"success": False, "error": str(e)}
@@ -4416,9 +4417,9 @@ def tool_kg_supersede(
     (``YYYY-MM-DDTHH:MM:SSZ``) and defaults to the current UTC instant.
     """
     try:
-        subject = sanitize_kg_value(subject, "subject")
+        subject = sanitize_kg_lookup(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
-        old_object = sanitize_kg_value(old_object, "old_object")
+        old_object = sanitize_kg_lookup(old_object, "old_object")
         new_object = sanitize_kg_value(new_object, "new_object")
         at = sanitize_iso_temporal(at, "at")
     except ValueError as e:
@@ -4452,7 +4453,7 @@ def tool_kg_timeline(entity: str = None):
     """Get chronological timeline of facts, optionally for one entity."""
     if entity is not None:
         try:
-            entity = sanitize_kg_value(entity, "entity")
+            entity = sanitize_kg_lookup(entity, "entity")
         except ValueError as e:
             return {"error": str(e)}
     results = _call_kg(lambda kg: kg.timeline(entity))
