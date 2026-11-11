@@ -424,7 +424,8 @@ class GitignoreMatcher:
                 if part == "**":
                     match[i][j] = match[i][j + 1] or match[i + 1][j]
                 else:
-                    match[i][j] = fnmatch.fnmatch(segment, part) and match[i + 1][j + 1]
+                    # Table first: skip fnmatch when the rest cannot match.
+                    match[i][j] = match[i + 1][j + 1] and fnmatch.fnmatch(segment, part)
         return match[0][0]
 
 

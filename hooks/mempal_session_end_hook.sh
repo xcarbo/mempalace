@@ -7,6 +7,11 @@
 # `mempalace` start alone can exceed 1.5s, so we background the hook and return
 # immediately; the detached child finishes the save after the session has
 # exited. All logic lives in mempalace.hooks_cli for cross-harness extensibility.
+# The hook runs in the session's working directory, and `python -m` / `-c`
+# put that directory first on sys.path: a mempalace checkout (or any folder
+# holding a mempalace/ package or sqlite3.py) would be imported instead of the
+# installed code. PYTHONSAFEPATH (Python 3.11+) keeps it off.
+export PYTHONSAFEPATH=1
 run_mempalace_hook() {
   if command -v mempalace >/dev/null 2>&1; then
     exec mempalace hook run "$@"

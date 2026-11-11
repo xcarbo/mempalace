@@ -4417,7 +4417,10 @@ def tool_kg_supersede(
     (``YYYY-MM-DDTHH:MM:SSZ``) and defaults to the current UTC instant.
     """
     try:
-        subject = sanitize_kg_lookup(subject, "subject")
+        # Supersede writes ``subject`` into a new triple, so it keeps the
+        # write-side checks (length cap, bare-prefix refusal). Only the old
+        # value is a pure lookup.
+        subject = sanitize_kg_value(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
         old_object = sanitize_kg_lookup(old_object, "old_object")
         new_object = sanitize_kg_value(new_object, "new_object")

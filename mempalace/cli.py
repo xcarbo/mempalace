@@ -728,6 +728,22 @@ def _forward_mine_to_hub(args, palace_path: str) -> bool:
 
 
 def cmd_mine(args):
+    """``mempalace mine``. A hook-spawned mine removes its PID slot on every exit.
+
+    The hook passes the slot in ``MEMPALACE_MINE_PID_FILE``. ``mine()`` and
+    ``mine_convos()`` clean it up themselves, but this command can return
+    before reaching them (source adapter, hub forwarding, ``--redetect-origin``
+    failing), and each of those left a dead slot behind.
+    """
+    from .miner import _cleanup_mine_pid_file
+
+    try:
+        _cmd_mine(args)
+    finally:
+        _cleanup_mine_pid_file()
+
+
+def _cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     mode = getattr(args, "mode", None) or "projects"
     source_adapter = getattr(args, "source", None)

@@ -74,6 +74,11 @@ MEMPAL_DIR=""
 #   1. $MEMPAL_PYTHON          — explicit user override (absolute path)
 #   2. $(command -v python3)   — first python3 on the hook's PATH
 #   3. bare "python3"          — last-resort fallback (hope the PATH has it)
+# The hook runs in the session's working directory, and `python -m` / `-c`
+# put that directory first on sys.path: a mempalace checkout (or any folder
+# holding a mempalace/ package or sqlite3.py) would be imported instead of the
+# installed code. PYTHONSAFEPATH (Python 3.11+) keeps it off.
+export PYTHONSAFEPATH=1
 MEMPAL_PYTHON_BIN="${MEMPAL_PYTHON:-}"
 if [ -z "$MEMPAL_PYTHON_BIN" ] || [ ! -x "$MEMPAL_PYTHON_BIN" ]; then
     MEMPAL_PYTHON_BIN="$(command -v python3 2>/dev/null || echo python3)"

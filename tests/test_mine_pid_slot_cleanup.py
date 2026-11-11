@@ -79,3 +79,42 @@ def test_slot_of_another_process_is_left_alone(tmp_path, monkeypatch):
     (convos / "chat.txt").write_text(EXCHANGES, encoding="utf-8")
     convo_miner.mine_convos(str(convos), str(tmp_path / "palace"), wing="test_convos")
     assert slot.exists()
+
+
+def _cli_mine_args(tmp_path):
+    import argparse
+
+    return argparse.Namespace(
+        dir=str(tmp_path / "convos"),
+        palace=str(tmp_path / "palace"),
+        mode="convos",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+    )
+
+
+def test_cli_mine_removes_its_slot_when_forwarded_to_a_hub(tmp_path, own_slot, monkeypatch):
+    """``mempalace mine`` can return before mine()/mine_convos() run."""
+    from mempalace import cli
+
+    monkeypatch.setattr(cli, "_mine_args_forwardable", lambda *_a, **_k: True)
+    monkeypatch.setattr(cli, "_forward_mine_to_hub", lambda *_a, **_k: True)
+    cli.cmd_mine(_cli_mine_args(tmp_path))
+    assert not own_slot.exists()
+
+
+def test_cli_mine_removes_its_slot_when_it_fails_early(tmp_path, own_slot, monkeypatch):
+    from mempalace import cli
+
+    def boom(*_a, **_k):
+        raise RuntimeError("failed before mining")
+
+    monkeypatch.setattr(cli, "_mine_args_forwardable", boom)
+    with pytest.raises(RuntimeError):
+        cli.cmd_mine(_cli_mine_args(tmp_path))
+    assert not own_slot.exists()

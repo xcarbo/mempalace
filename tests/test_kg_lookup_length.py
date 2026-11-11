@@ -100,3 +100,17 @@ def test_lookup_still_refuses_empty_and_nul(monkeypatch, config, palace_path, kg
 
     assert "error" in tool_kg_query(entity="   ")
     assert "error" in tool_kg_query(entity="a\x00b")
+
+
+def test_supersede_subject_keeps_write_checks(monkeypatch, config, palace_path, kg):
+    """Supersede writes its subject into a new triple, so the cap and the
+    bare-prefix refusal still apply to it, even when no old fact exists."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    from mempalace.mcp_server import tool_kg_supersede
+
+    for subject in ("action:", LONG):
+        result = tool_kg_supersede(
+            subject=subject, predicate="belongs_to", old_object="wing_a", new_object="wing_b"
+        )
+        assert result["success"] is False, (subject, result)
+    assert kg.query_entity("action:") == []

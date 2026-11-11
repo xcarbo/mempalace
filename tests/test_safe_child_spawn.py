@@ -107,3 +107,17 @@ def test_daemon_start_child_env_sets_safe_path(tmp_path, monkeypatch):
         daemon.start_daemon(str(tmp_path / "palace"))
     assert seen["cmd"][1:3] == ["-m", "mempalace.daemon"]
     assert seen["env"]["PYTHONSAFEPATH"] == "1"
+
+
+@pytest.mark.parametrize(
+    "script",
+    ["mempal_save_hook.sh", "mempal_precompact_hook.sh", "mempal_session_end_hook.sh"],
+)
+def test_shipped_shell_hooks_export_safe_path(script):
+    """The shell hooks run ``python -m mempalace`` themselves, in the session folder."""
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parent.parent / "hooks" / script).read_text(encoding="utf-8")
+    export = text.index("export PYTHONSAFEPATH=1")
+    first_python = min(i for i in (text.find(" -m mempalace"), text.find(" -c ")) if i != -1)
+    assert export < first_python
