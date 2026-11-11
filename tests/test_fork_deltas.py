@@ -53,6 +53,14 @@ Register:
     when levels are on, and the daemon runs each job at its submitter's level.
     Upstream has neither; a merge that takes either function whole drops the
     filter for every caller, and only a palace with a levels file notices.
+23. Level filter read speed (``backends/sqlite_exact.py``): the ``access``
+    clause reads the indexed generated column, a where on ``access`` alone is
+    forced onto ``idx_documents_access``, a paged filtered sweep reuses one
+    sorted candidate list while the database is unchanged, and the level
+    wrapper's ``count()`` is one ``count_where`` query. Same rows either way,
+    so nothing fails: with any one gone, ``memp status`` on a levels palace
+    goes back to ~28 s and each transcript ingest to ~90 s, and the daemon
+    queue backs up behind them.
 """
 
 from __future__ import annotations
@@ -872,4 +880,54 @@ def test_collection_openers_wrap_in_the_level_filter(tmp_path, monkeypatch):
     )
     assert "stamp=job_level(payload)" in inspect.getsource(service.execute_job), (
         "FORK DELTA REVERTED: daemon jobs no longer run at their submitter's level"
+    )
+
+
+def test_the_level_filter_reads_its_index_and_pages_once(tmp_path, monkeypatch):
+    """Delta 23: a levels palace's paged sweep runs its index-only candidate
+    scan at most twice (first page, then the kept list), and count() is one
+    SQL count, not a JSON parse of every row per page."""
+    import json as _json
+
+    from mempalace import palace
+
+    levels_file = tmp_path / "levels.json"
+    levels_file.write_text(_json.dumps({"default": "team", "owners_folders": []}))
+    monkeypatch.setenv("MEMPALACE_LEVELS_FILE", str(levels_file))
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.delenv("MEMPALACE_LEVEL", raising=False)
+    col = palace.get_collection(str(tmp_path / "palace"), create=True)
+    col.add(
+        ids=[f"d{i}" for i in range(30)],
+        documents=[f"doc {i}" for i in range(30)],
+        metadatas=[{"wing": "w"} for _ in range(30)],
+        embeddings=[[1.0, float(i)] for i in range(30)],
+    )
+    inner = col.inner
+    while not hasattr(inner, "_handle"):
+        inner = inner._inner
+    statements: list[str] = []
+    inner._handle.conn.set_trace_callback(statements.append)
+    try:
+        assert col.count() == 30
+        got, offset = [], 0
+        while True:
+            page = col.get(limit=7, offset=offset, include=["metadatas"])
+            if not page["ids"]:
+                break
+            got.extend(page["ids"])
+            offset += len(page["ids"])
+    finally:
+        inner._handle.conn.set_trace_callback(None)
+    assert len(got) == 30
+    scans = [s for s in statements if s.startswith("SELECT rowid FROM documents")]
+    assert len(scans) <= 2, (
+        f"FORK DELTA REVERTED: a paged level-filtered sweep ran {len(scans)} candidate "
+        "scans for 5 pages; each one parses every row (28 s memp status on a levels palace)"
+    )
+    assert "INDEXED BY idx_documents_access" in scans[0], (
+        "FORK DELTA REVERTED: the level filter no longer reads the access index"
+    )
+    assert any(s.startswith("SELECT COUNT(*) FROM documents") for s in statements), (
+        "FORK DELTA REVERTED: the level wrapper's count() pages instead of counting in SQL"
     )

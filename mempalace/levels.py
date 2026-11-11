@@ -790,6 +790,14 @@ class LevelFilteredCollection:
             return self._inner.count()
         return self._visible_count(clause)
 
+    def count_where(self, where: Optional[dict]) -> Optional[int]:
+        # Defined here, not left to __getattr__: passed through, the inner
+        # count would include drawers this caller cannot see.
+        counter = getattr(self._inner, "count_where", None)
+        if not callable(counter):
+            return None
+        return counter(and_where(where, self._where()))
+
     def estimated_count(self) -> int:
         clause = self._where()
         if not clause:
@@ -797,6 +805,13 @@ class LevelFilteredCollection:
         return self._visible_count(clause)
 
     def _visible_count(self, clause: dict) -> int:
+        # One SQL count where the backend has it (sqlite_exact): paging the
+        # filter 10,000 rows at a time was 9 full scans for one count().
+        count_where = getattr(self._inner, "count_where", None)
+        if callable(count_where):
+            n = count_where(clause)
+            if n is not None:
+                return n
         total = 0
         offset = 0
         page = 10000

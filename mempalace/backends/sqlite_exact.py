@@ -7,6 +7,7 @@ blobs and query uses exact cosine distance over the matching collection.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import json
 import logging
@@ -244,10 +245,18 @@ _GENERATED_META_COLUMNS = ("wing", "room", "authored_at", "source_file", "parent
 # Integer-valued keys get a generated column with NO declared type (so no
 # affinity: the stored JSON value compares exactly as _matches_where sees it).
 # ``access`` is the drawer's access level (mempalace/levels.py). Built by the
-# writable open only, so the where compiler keeps reading json_extract for it:
-# a read-only open of a palace not yet upgraded has no such column. The level
-# filter is a NOT IN over every row either way; the index serves counts.
+# writable open only, so the where compiler reads the column only on a handle
+# that found it at connect (``_SQLiteExactHandle.untyped_columns``); a
+# read-only open of a palace not yet upgraded keeps json_extract. On a handle
+# that has it, a where on this key alone (the level filter with no caller
+# filter) is forced onto its index, so the filter is an index-only walk
+# instead of a JSON parse of every row (fork delta: levels read speed).
 _GENERATED_UNTYPED_COLUMNS = ("access",)
+# How often a handle whose palace lacks an untyped column or its index looks
+# again (``_SQLiteExactHandle.maybe_refresh_schema``).
+_SCHEMA_RECHECK_SECONDS = 30.0
+# Filters whose sorted candidate rowids a handle keeps for paged sweeps.
+_PAGE_CANDIDATE_SLOTS = 4
 
 # JSON path keys we can quote safely inside ``$."<key>"``. A double quote or
 # backslash would need JSON-path escaping SQLite does not define; those keys
@@ -259,7 +268,9 @@ _SCALAR_TYPES = (str, int, float, bool, type(None))
 _ORDERED_OPS = {"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<="}
 
 
-def _compile_where(where: Optional[dict], prefix: str = "") -> tuple[str, list]:
+def _compile_where(
+    where: Optional[dict], prefix: str = "", columns: frozenset = frozenset()
+) -> tuple[str, list]:
     """Compile a chroma-style ``where`` dict to a SQL predicate over ``documents``.
 
     Returns ``(sql, params)``. The predicate is semantically identical to
@@ -270,45 +281,92 @@ def _compile_where(where: Optional[dict], prefix: str = "") -> tuple[str, list]:
     scan, so translation failure is a slow path, never a behavior change.
 
     ``prefix`` qualifies column references (e.g. ``"d."``) for use in joins.
+    ``columns`` names the ``_GENERATED_UNTYPED_COLUMNS`` this palace has
+    built; those keys read the column instead of parsing ``metadata_json``.
     """
     params: list = []
-    sql = _compile_where_node(where or {}, prefix, params)
+    sql = _compile_where_node(where or {}, prefix, params, columns)
     return sql, params
 
 
-def _compile_where_node(node: dict, prefix: str, params: list) -> str:
+def _where_keys(where: Optional[dict]) -> set:
+    """Every metadata key a ``where`` dict references (operators excluded)."""
+    keys: set = set()
+    if not isinstance(where, dict):
+        return keys
+    for key, expected in where.items():
+        if key in ("$and", "$or"):
+            for clause in expected or []:
+                keys |= _where_keys(clause)
+        else:
+            keys.add(key)
+    return keys
+
+
+def _index_hint(where: Optional[dict], where_document: Optional[dict], indexed: frozenset) -> str:
+    """``INDEXED BY`` for a where on one indexed untyped column alone, else "".
+
+    The planner has no ANALYZE stats and, given the level filter's
+    ``(access >= ? AND typeof(access) ...) OR access IS NULL``, walks the
+    (collection_id) index and computes the virtual column from every row's
+    JSON (~0.1 s per call on 88k rows, ~1 s on a loaded server). Forced onto
+    the column's index the same predicate never reads a row (~5-16 ms). Only
+    a where on that one key gets the hint: any other key (source_file, wing)
+    has a more selective index the planner already picks, and a
+    ``where_document`` filter has its own cost the hint must not decide.
+    """
+    if where_document is not None:
+        return ""
+    keys = _where_keys(where)
+    if len(keys) == 1:
+        (key,) = keys
+        if key in indexed:
+            return f"INDEXED BY idx_documents_{key} "
+    return ""
+
+
+def _compile_where_node(node: dict, prefix: str, params: list, columns: frozenset) -> str:
     if not isinstance(node, dict):
         raise _WhereNotTranslatable("where clause must be a dict")
     parts: list[str] = []
     for key, expected in node.items():
         if key == "$and":
-            sub = [_compile_where_node(clause, prefix, params) for clause in expected or []]
+            sub = [
+                _compile_where_node(clause, prefix, params, columns) for clause in expected or []
+            ]
             parts.append("(" + " AND ".join(sub) + ")" if sub else "1")
             continue
         if key == "$or":
-            sub = [_compile_where_node(clause, prefix, params) for clause in expected or []]
+            sub = [
+                _compile_where_node(clause, prefix, params, columns) for clause in expected or []
+            ]
             parts.append("(" + " OR ".join(sub) + ")" if sub else "0")
             continue
         if key.startswith("$"):
             raise UnsupportedFilterError(f"operator {key!r} not supported by sqlite_exact")
         if isinstance(expected, dict):
             for op, operand in expected.items():
-                parts.append(_compile_where_op(key, op, operand, prefix, params))
+                parts.append(_compile_where_op(key, op, operand, prefix, params, columns))
         else:
-            parts.append(_compile_where_op(key, "$eq", expected, prefix, params))
+            parts.append(_compile_where_op(key, "$eq", expected, prefix, params, columns))
     if not parts:
         return "1"
     return "(" + " AND ".join(parts) + ")"
 
 
-def _compile_where_op(key: str, op: str, operand, prefix: str, params: list) -> str:
+def _compile_where_op(
+    key: str, op: str, operand, prefix: str, params: list, columns: frozenset = frozenset()
+) -> str:
     if not _SAFE_JSON_KEY_RE.match(key):
         raise _WhereNotTranslatable(f"key {key!r} cannot be quoted in a JSON path")
+    # An untyped generated column IS json_extract(metadata_json, '$."key"'),
+    # stored in its index, so reading it is the same value without the parse.
+    untyped_column = key in columns
 
     def value_expr() -> str:
         # Each call emits one occurrence of the value expression, appending its
         # path parameter in the same left-to-right order SQLite binds ``?``s.
-        if key in _GENERATED_META_COLUMNS:
+        if key in _GENERATED_META_COLUMNS or untyped_column:
             return f"{prefix}{key}"
         params.append(f'$."{key}"')
         return f"json_extract({prefix}metadata_json, ?)"
@@ -351,6 +409,13 @@ def _compile_where_op(key: str, op: str, operand, prefix: str, params: list) -> 
         if isinstance(operand, (int, float)) and not isinstance(operand, bool):
             # Python raises TypeError (→ no match) comparing str/list/None to a
             # number; json_type gates SQL to the same numeric-only domain.
+            if untyped_column:
+                # json_extract turns JSON true/false into integer 1/0 and
+                # objects/arrays into text, so on the column this is the same
+                # domain, read from the index.
+                sql = f"(typeof({prefix}{key}) IN ('integer','real') AND {prefix}{key} {sql_op} ?)"
+                params.append(operand)
+                return sql
             sql = (
                 f"({type_expr()} IN ('integer','real','true','false') "
                 f"AND {value_expr()} {sql_op} ?)"
@@ -527,6 +592,42 @@ class _SQLiteExactHandle:
         # (collection_id, dim) → _VectorCache. Shared by every collection
         # object on this palace; guarded by ``lock``.
         self.vec_caches: dict[tuple[int, int], _VectorCache] = {}
+        # The _GENERATED_UNTYPED_COLUMNS this file has, and those with their
+        # index. Read at connect (``refresh_schema``): a palace not yet
+        # upgraded has neither, and the where compiler then parses the JSON.
+        self.untyped_columns: frozenset = frozenset()
+        self.indexed_untyped: frozenset = frozenset()
+        self.schema_checked_at = 0.0
+        # Sorted candidate rowids of paged filtered sweeps, kept while the
+        # database is unchanged; guarded by ``lock`` (see ``_rows``).
+        self.page_candidates: collections.OrderedDict = collections.OrderedDict()
+
+    def maybe_refresh_schema(self) -> None:
+        """Re-read the schema now and then until every untyped column is indexed.
+
+        A read-only handle opened before a writer upgraded the file (the
+        ALTER, then a CREATE INDEX that takes seconds on a big palace) would
+        otherwise keep the slow JSON path for the life of the process.
+        """
+        if len(self.indexed_untyped) == len(_GENERATED_UNTYPED_COLUMNS):
+            return
+        if time.monotonic() - self.schema_checked_at < _SCHEMA_RECHECK_SECONDS:
+            return
+        self.refresh_schema()
+
+    def refresh_schema(self) -> None:
+        self.schema_checked_at = time.monotonic()
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_xinfo(documents)").fetchall()}
+        names = {
+            row[0]
+            for row in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'documents'"
+            ).fetchall()
+        }
+        self.untyped_columns = frozenset(c for c in _GENERATED_UNTYPED_COLUMNS if c in cols)
+        self.indexed_untyped = frozenset(
+            c for c in self.untyped_columns if f"idx_documents_{c}" in names
+        )
 
 
 class SQLiteExactCollection(BaseCollection):
@@ -562,6 +663,7 @@ class SQLiteExactCollection(BaseCollection):
         serialization = self._write_lock() if write else self._handle.lock
         with serialization:
             self._ensure_open()
+            self._handle.maybe_refresh_schema()
             cur = self._handle.conn.cursor()
             try:
                 yield cur
@@ -876,7 +978,7 @@ class SQLiteExactCollection(BaseCollection):
         compiled = True
         try:
             if where is not None:
-                sql_part, w_params = _compile_where(where)
+                sql_part, w_params = _compile_where(where, columns=self._handle.untyped_columns)
                 compiled_clauses.append(sql_part)
                 compiled_params.extend(w_params)
             if where_document is not None:
@@ -915,19 +1017,25 @@ class SQLiteExactCollection(BaseCollection):
             # ~600 ms on a 110k-row wing before slicing to 10 rows. Fetch
             # only the rowids (narrow, index-only where possible), take the
             # page in Python (rowid order), then hydrate just the page rows.
-            cand = [
-                row[0]
-                for row in cur.execute(
-                    "SELECT rowid FROM documents WHERE collection_id = ?"
-                    + "".join(f" AND ({clause})" for clause in compiled_clauses),
-                    params,
-                ).fetchall()
-            ]
-            cand.sort()
-            if offset:
-                cand = cand[offset:]
-            if limit is not None:
-                cand = cand[:limit]
+            #
+            # A paged sweep (status, prefetch_mined_set, the dedup scan) asks
+            # for every page of the same filter in turn, and each page used
+            # to re-run the full candidate scan: O(pages x rows), 97 scans of
+            # 88k rows for one mine under the level filter (fork delta: levels
+            # read speed). The sorted rowids are kept on the handle and reused
+            # while the database is unchanged: data_version moves when another
+            # connection commits, total_changes when this one writes. Only a
+            # page past the first is kept (a one-off first page leaves
+            # nothing behind), as an int64 array so a page is a view, and only
+            # the last few filters, so readers sharing the handle (the API,
+            # the daemon) do not evict each other mid-sweep.
+            hint = _index_hint(where, where_document, self._handle.indexed_untyped)
+            cand_sql = f"SELECT rowid FROM documents {hint}WHERE collection_id = ?" + "".join(
+                f" AND ({clause})" for clause in compiled_clauses
+            )
+            cand = self._page_candidates(cur, cand_sql, params, keep=bool(offset))
+            first = offset or 0
+            cand = (cand[first:] if limit is None else cand[first : first + limit]).tolist()
             rows = []
             for start in range(0, len(cand), 900):
                 chunk = cand[start : start + 900]
@@ -1012,6 +1120,31 @@ class SQLiteExactCollection(BaseCollection):
             if limit is not None:
                 out = out[:limit]
         return out
+
+    def _page_candidates(self, cur, cand_sql: str, params: list, *, keep: bool) -> np.ndarray:
+        """Sorted rowids for ``cand_sql``, from the handle's cache when the
+        database has not changed since they were read. ``keep`` stores them."""
+        state = (
+            cur.execute("PRAGMA data_version").fetchone()[0],
+            self._handle.conn.total_changes,
+        )
+        cache_key = (cand_sql, tuple(params))
+        cache = self._handle.page_candidates
+        cached = cache.get(cache_key)
+        if cached is not None and cached[0] == state:
+            cache.move_to_end(cache_key)
+            return cached[1]
+        found = cur.execute(cand_sql, params).fetchall()
+        cand = np.fromiter((row[0] for row in found), dtype=np.int64, count=len(found))
+        cand.sort()
+        if keep:
+            cache[cache_key] = (state, cand)
+            cache.move_to_end(cache_key)
+            while len(cache) > _PAGE_CANDIDATE_SLOTS:
+                cache.popitem(last=False)
+        elif cached is not None:
+            del cache[cache_key]
+        return cand
 
     # ------------------------------------------------------------------
     # Vector cache (the matmul query path)
@@ -1200,15 +1333,16 @@ class SQLiteExactCollection(BaseCollection):
         clauses: list[str] = []
         params: list = []
         if where is not None:
-            sql, w_params = _compile_where(where)
+            sql, w_params = _compile_where(where, columns=self._handle.untyped_columns)
             clauses.append(sql)
             params.extend(w_params)
         if where_document is not None:
             sql, d_params = _compile_where_document(where_document)
             clauses.append(sql)
             params.extend(d_params)
+        hint = _index_hint(where, where_document, self._handle.indexed_untyped)
         rows = cur.execute(
-            "SELECT rowid FROM documents WHERE collection_id = ? AND dim = ? AND "
+            f"SELECT rowid FROM documents {hint}WHERE collection_id = ? AND dim = ? AND "
             + " AND ".join(f"({c})" for c in clauses),
             (collection_id, dim, *params),
         ).fetchall()
@@ -1242,7 +1376,7 @@ class SQLiteExactCollection(BaseCollection):
             filter_clauses: list[str] = []
             filter_params: list = []
             if where is not None:
-                sql_part, w_params = _compile_where(where)
+                sql_part, w_params = _compile_where(where, columns=self._handle.untyped_columns)
                 filter_clauses.append(sql_part)
                 filter_params.extend(w_params)
             if where_document is not None:
@@ -1565,6 +1699,30 @@ class SQLiteExactCollection(BaseCollection):
             ).fetchone()
             return int(row[0]) if row else 0
 
+    def count_where(self, where: Optional[dict]) -> Optional[int]:
+        """``COUNT(*)`` of the rows matching ``where``, or ``None`` when the
+        filter cannot be compiled (the caller then counts by paging).
+
+        The level filter's ``count()`` used to page ``get(include=[])``
+        10,000 rows at a time, a full JSON scan per page; on its own index
+        this is one index-only walk.
+        """
+        if where is None:
+            return self.count()
+        _validate_where(where)
+        try:
+            where_sql, where_params = _compile_where(where, columns=self._handle.untyped_columns)
+        except _WhereNotTranslatable:
+            return None
+        hint = _index_hint(where, None, self._handle.indexed_untyped)
+        with self._cursor() as cur:
+            collection_id = self._collection_id(cur)
+            row = cur.execute(
+                f"SELECT COUNT(*) FROM documents {hint}WHERE collection_id = ? AND ({where_sql})",
+                (collection_id, *where_params),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         _validate_where(where)
         with self._cursor() as cur:
@@ -1724,7 +1882,9 @@ class SQLiteExactCollection(BaseCollection):
            383 ms against the fallback's 1,236 ms.
         """
         try:
-            where_sql, where_params = _compile_where(where, prefix="d.")
+            where_sql, where_params = _compile_where(
+                where, prefix="d.", columns=self._handle.untyped_columns
+            )
         except _WhereNotTranslatable:
             return None
         try:
@@ -1996,6 +2156,7 @@ class SQLiteExactBackend(BaseBackend):
 
                         with short_writer_palace_lock(palace_path):
                             self._init_schema(conn)
+                    handle.refresh_schema()
             except BaseException:
                 conn.close()
                 raise
