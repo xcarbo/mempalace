@@ -543,6 +543,76 @@ _BATCH_REF_FIELDS = {
 }
 
 
+def _arg_names(accepted: str, required: str) -> tuple[frozenset[str], frozenset[str]]:
+    return frozenset(accepted.split()), frozenset(required.split())
+
+
+# Arg names each batch tool's handler takes, and those it needs (no default).
+# A static table keeps `memp submit` off the mcp_server import;
+# tests/test_batch.py pins it to the handler signatures. An unknown or missing
+# arg is refused before step 1, instead of a TypeError after earlier steps
+# were already filed.
+_BATCH_ARGS = {
+    "mempalace_add_drawer": _arg_names(
+        "wing room content source_file added_by", "wing room content"
+    ),
+    "mempalace_update_drawer": _arg_names("drawer_id content wing room if_unchanged", "drawer_id"),
+    "mempalace_kg_add": _arg_names(
+        "subject predicate object valid_from valid_to source_closet source_file source_drawer_id",
+        "subject predicate object",
+    ),
+    "mempalace_kg_invalidate": _arg_names(
+        "subject predicate object ended", "subject predicate object"
+    ),
+    "mempalace_diary_write": _arg_names("agent_name entry topic wing", "agent_name entry"),
+    "mempalace_checkpoint": _arg_names("items diary dedup_threshold added_by", "items"),
+}
+
+_STEP_KEYS = frozenset({"tool", "id", "args", "on_conflict"})
+
+# drawer-edit's own keys, which it resolves and strips before `memp submit`.
+# Seen here, the batch skipped drawer-edit or put a key in the wrong place.
+_DRAWER_EDIT = "send the batch with `drawer-edit submit`, which resolves it"
+_HELPER_KEY_HINTS = {
+    "verbatim": (
+        "'verbatim' is a drawer-edit step key: put it on the step beside 'tool', "
+        f"not in 'args', and {_DRAWER_EDIT}"
+    ),
+    "edits": f"'edits' is a drawer-edit step key: {_DRAWER_EDIT}",
+    "content_file": f"'content_file' is a drawer-edit key: {_DRAWER_EDIT}",
+}
+
+
+def _hinted(message: str, key: str) -> str:
+    hint = _HELPER_KEY_HINTS.get(key)
+    return f"{message}; {hint}" if hint else message
+
+
+def _check_batch_step(i: int, tool: str, step: dict[str, Any], args: dict[str, Any]) -> None:
+    for key in step:
+        if key not in _STEP_KEYS:
+            raise ValueError(
+                _hinted(
+                    f"step {i}: unknown step key {key!r} ({', '.join(sorted(_STEP_KEYS))})", key
+                )
+            )
+    if tool not in _BATCH_ARGS:  # no table entry: the handler checks at run time
+        return
+    accepted, required = _BATCH_ARGS[tool]
+    short = tool.removeprefix("mempalace_")
+    for name in args:
+        if name not in accepted:
+            raise ValueError(
+                _hinted(
+                    f"step {i}: {short} has no arg {name!r} (accepts: {', '.join(sorted(accepted))})",
+                    name,
+                )
+            )
+    missing = sorted(n for n in required if args.get(n) is None)
+    if missing:
+        raise ValueError(f"step {i}: {short} needs arg {', '.join(map(repr, missing))}")
+
+
 def batch_tool_name(name: str) -> str:
     """``add-drawer`` / ``add_drawer`` / ``mempalace_add_drawer`` -> the MCP name."""
     name = str(name or "").strip().replace("-", "_")
@@ -573,6 +643,7 @@ def validate_batch(payload: dict[str, Any]) -> list[dict[str, Any]]:
         args = step.get("args") or {}
         if not isinstance(args, dict):
             raise ValueError(f"step {i}: 'args' must be an object")
+        _check_batch_step(i, tool, step, args)
         step_id = step.get("id")
         if step_id is not None:
             if not isinstance(step_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", step_id):

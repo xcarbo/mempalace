@@ -26,6 +26,10 @@ def batch_palace(monkeypatch, config, palace_path, kg):
     return palace_path
 
 
+def _kg(subject):
+    return {"tool": "kg-add", "args": {"subject": subject, "predicate": "p", "object": "o"}}
+
+
 def _drawer(wing="proj", room="decisions", content="We chose the shared queue."):
     return {"tool": "add-drawer", "args": {"wing": wing, "room": room, "content": content}}
 
@@ -40,7 +44,7 @@ def _drawer(wing="proj", room="decisions", content="We chose the shared queue.")
         ({"steps": [{"tool": "delete-drawer", "args": {"drawer_id": "x"}}]}, "not batchable"),
         ({"steps": [{"tool": "search", "args": {}}]}, "not batchable"),
         (
-            {"steps": [{"tool": "kg-add", "args": {"subject": "${d1.drawer_id}"}}]},
+            {"steps": [_kg("${d1.drawer_id}")]},
             "names no earlier step",
         ),
         ({"steps": [{**_drawer(), "id": "a"}, {**_drawer(), "id": "a"}]}, "used twice"),
@@ -50,6 +54,78 @@ def _drawer(wing="proj", room="decisions", content="We chose the shared queue.")
 def test_validate_batch_refuses(payload, message):
     with pytest.raises(ValueError, match=message):
         service.validate_batch(payload)
+
+
+def test_validate_batch_refuses_verbatim_inside_args_with_the_step_key_hint():
+    # /preclean put drawer-edit's step key in args on two machines; the
+    # handler raised a TypeError mid-batch after earlier steps were filed.
+    step = {**_drawer(), "args": {**_drawer()["args"], "verbatim": True}}
+    with pytest.raises(ValueError) as exc:
+        service.validate_batch({"steps": [_drawer(), step]})
+    message = str(exc.value)
+    assert "step 2" in message and "'verbatim'" in message
+    assert "beside 'tool'" in message and "not in 'args'" in message
+
+
+@pytest.mark.parametrize(
+    "step, message",
+    [
+        (
+            {"tool": "kg-add", "args": {"subject": "a", "predicate": "b", "objct": "c"}},
+            r"step 1: kg_add has no arg 'objct' \(accepts: object, predicate, ",
+        ),
+        (
+            {"tool": "add-drawer", "args": {"wing": "proj", "room": "decisions"}},
+            r"step 1: add_drawer needs arg 'content'",
+        ),
+        ({"tool": "update-drawer", "args": {"content": "x"}}, "needs arg 'drawer_id'"),
+        ({"tool": "add-drawer", "args": {"wing": "p"}}, "needs arg 'content', 'room'"),
+        (
+            {"tool": "add-drawer", "args": {"wing": "p", "room": "r", "content": None}},
+            "needs arg 'content'",
+        ),
+        (
+            {**_drawer(), "on_conflct": "park"},
+            r"unknown step key 'on_conflct' \(args, id, on_conflict, tool\)",
+        ),
+        (
+            {"tool": "update-drawer", "args": {"drawer_id": "x"}, "edits": [{"status": "done"}]},
+            "'edits' is a drawer-edit step key: send the batch with `drawer-edit submit`",
+        ),
+        (
+            {"tool": "add-drawer", "args": {"wing": "p", "room": "r", "content_file": "f.md"}},
+            "'content_file' is a drawer-edit key",
+        ),
+    ],
+)
+def test_validate_batch_refuses_unknown_and_missing_args(step, message):
+    with pytest.raises(ValueError, match=message):
+        service.validate_batch({"steps": [step]})
+
+
+def test_batch_arg_table_matches_the_handlers():
+    # The table keeps `memp submit` off the mcp_server import; it must not
+    # drift from what run_batch actually calls.
+    import inspect
+
+    for tool in service.BATCH_TOOLS:
+        params = inspect.signature(mcp_server.TOOLS[tool]["handler"]).parameters.values()
+        assert not any(p.kind is p.VAR_KEYWORD for p in params), tool
+        accepted = {p.name for p in params}
+        required = {p.name for p in params if p.default is p.empty}
+        assert service._BATCH_ARGS[tool] == (frozenset(accepted), frozenset(required)), tool
+
+
+def test_a_bad_arg_fails_the_batch_before_step_one_with_nothing_written(batch_palace):
+    # An older client may have queued it without the submit-time check.
+    seeded = service.run_batch({"palace_path": batch_palace, "steps": [_drawer(wing="other")]})
+    assert seeded["success"] is True, seeded  # the palace exists, so an empty list means empty
+    bad = {**_drawer(content="never filed"), "args": {**_drawer()["args"], "verbatim": True}}
+    result = service.run_batch({"palace_path": batch_palace, "steps": [_drawer(), bad]})
+    assert result["success"] is False and result["exit_code"] == 2, result
+    assert "'verbatim'" in result["error"]
+    listed = mcp_server.tool_list_drawers(wing="proj")
+    assert "error" not in listed and listed["drawers"] == [], listed
 
 
 def test_batch_tool_names_accept_the_cli_spelling():
@@ -188,7 +264,7 @@ def _step(content="We chose the shared queue.", **kw):
     "steps, message",
     [
         (
-            [_step(id="d1"), {"tool": "kg-add", "args": {"subject": "${d1.drawerid}"}}],
+            [_step(id="d1"), _kg("${d1.drawerid}")],
             "no field 'drawerid'",
         ),
         (
@@ -199,7 +275,7 @@ def _step(content="We chose the shared queue.", **kw):
                     "args": {"drawer_id": "x", "content": "y", "if_unchanged": "0" * 64},
                     "on_conflict": "park",
                 },
-                {"tool": "kg-add", "args": {"subject": "${r.drawer_id}"}},
+                _kg("${r.drawer_id}"),
             ],
             "may be parked",
         ),
@@ -217,7 +293,7 @@ def test_a_bad_reference_at_run_time_fails_with_the_done_list(batch_palace, monk
     result = service.run_batch(
         {
             "palace_path": batch_palace,
-            "steps": [_step(id="d1"), {"tool": "kg-add", "args": {"subject": "${d1.nope}"}}],
+            "steps": [_step(id="d1"), _kg("${d1.nope}")],
         }
     )
     assert result["success"] is False
@@ -236,7 +312,7 @@ def test_a_handler_exception_mid_batch_records_what_was_written(batch_palace, mo
             "palace_path": batch_palace,
             "steps": [
                 _step(id="d1"),
-                {"tool": "kg-add", "args": {"subject": "action:${d1.drawer_id}"}},
+                _kg("action:${d1.drawer_id}"),
                 _step(content="never reached"),
             ],
         }
